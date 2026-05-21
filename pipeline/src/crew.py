@@ -381,11 +381,9 @@ If question {mq} is truly not on this page, respond: {{"number": "{mq}", "statem
     def _parse_history_scoring(self, extraction: dict) -> list[dict]:
         """Parse scoring table from last page for History exams.
 
-        The scoring page typically has a table with columns:
-        Grupo | item number | Cotação
-        e.g.: "I  1.  13" or "II  2.  20"
+        Handles vertical table format where each cell is on its own line:
+        I\nII\nII\n...\n1.\n1.\n2.\n...\n13\n14\n20\n...
         """
-        # Get last 2 pages text (scoring might span)
         pages = extraction.get("pages", [])
         if not pages:
             return []
@@ -393,110 +391,91 @@ If question {mq} is truly not on this page, respond: {{"number": "{mq}", "statem
         scoring_text = ""
         for p in pages[-2:]:
             text = p.get("text", "")
-            if "cotaç" in text.lower() or "pontu" in text.lower():
+            if "cotaç" in text.lower():
                 scoring_text = text
                 break
-
         if not scoring_text:
             return []
 
         results = []
-        roman_map = {"I": "grupo_i", "II": "grupo_ii", "III": "grupo_iii", "IV": "grupo_iv", "V": "grupo_v"}
+        roman_map = {"I": "grupo_i", "II": "grupo_ii", "III": "grupo_iii", "IV": "grupo_iv"}
+        lines = [l.strip() for l in scoring_text.split("\n") if l.strip()]
 
-        # Strategy 1: Look for patterns like "Grupo\nI\nII\n..." followed by items and points
-        # Parse the tabular structure: group headers, item numbers, and points
-        lines = scoring_text.split("\n")
+        # Strategy: collect consecutive roman numerals, then items, then points
+        # The table appears as vertical columns: groups block, items block, points block
+        groups_seq = []
+        items_seq = []
+        points_seq = []
 
-        # Try to find rows with: Roman numeral + item number + points
-        # Pattern: "I" or "II" etc on one line, then "1." on next, then "13" etc
-        # Or inline: "I  1.  13"
-        current_group = None
-        for line in lines:
-            line = line.strip()
-            # Check if line is just a group identifier
-            group_match = re.match(r'^(I{1,3}V?|IV|V?I{0,3})$', line)
-            if group_match and group_match.group(1) in roman_map:
-                current_group = roman_map[group_match.group(1)]
-                continue
+        i = 0
+        # Find start: look for "Grupo" or "Subtotal" header before the roman numerals
+        while i < len(lines):
+            if lines[i].lower() in ("grupo", "subtotal", "grupo subtotal"):
+                i += 1
+                break
+            i += 1
 
-            # Check for inline: "Grupo I  1.  13" or "I  1.  13  14  20"
-            # Or just item+points on a line when we know the group
-            if current_group:
-                # Find item numbers on this line
-                items = re.findall(r'(\d+)\.', line)
-                if items:
-                    # This might be a row of item numbers — points will be on another line
-                    pass
+        # Skip any non-roman lines (e.g. "Subtotal")
+        while i < len(lines) and lines[i] not in roman_map:
+            i += 1
 
-        # Strategy 2: More robust — find all (group, item, points) triples
-        # Look for the structured table pattern in the raw text
-        # Common format: columns of Group/Item/Points
-        # Try regex for "Grupo X  N.  PP" or tabular extraction
-
-        # Parse the scoring section looking for group+item+points patterns
-        # The text often has: "I\n1.\nCotação (em pontos)\n13\n14\n20..."
-        # Or: "Grupo  I  II  II  II  II  III  III  III  IV  IV"
-        #     "       1.  1.  2.  3.  4.  1.   3.   4.  1.  3."
-        #     "       13  14  20  20  13  20   20   15  26  13"
-
-        # Find the groups row, items row, and points row
-        groups_row = []
-        items_row = []
-        points_row = []
-
-        for i, line in enumerate(lines):
-            # Detect a line that's mostly roman numerals (groups row)
-            romans_found = re.findall(r'\b(I{1,3}V?|IV)\b', line)
-            if len(romans_found) >= 3:
-                groups_row = romans_found
-                # Next lines should have items and points
-                for j in range(i + 1, min(i + 5, len(lines))):
-                    next_line = lines[j].strip()
-                    nums = re.findall(r'(\d+)', next_line)
-                    if nums and not items_row:
-                        # Check if these are item numbers (1-5 range) or points (10-30 range)
-                        avg = sum(int(n) for n in nums) / len(nums)
-                        if avg < 6:
-                            items_row = nums
-                        else:
-                            points_row = nums
-                    elif nums and items_row and not points_row:
-                        points_row = nums
+        # Collect roman numerals
+        while i < len(lines):
+            line = lines[i]
+            if line in roman_map:
+                groups_seq.append(line)
+                i += 1
+            else:
                 break
 
-        if groups_row and items_row and points_row:
-            # Align the three rows
-            n = min(len(groups_row), len(items_row), len(points_row))
+        # Collect item numbers (N. format)
+        while i < len(lines):
+            line = lines[i]
+            m = re.match(r'^(\d+)\.$', line)
+            if m:
+                items_seq.append(m.group(1))
+                i += 1
+            else:
+                break
+
+        # Skip "Cotação (em pontos)" header
+        while i < len(lines) and not re.match(r'^\d+$', lines[i]):
+            i += 1
+
+        # Collect points
+        while i < len(lines):
+            line = lines[i]
+            if re.match(r'^\d+$', line):
+                val = int(line)
+                if 5 <= val <= 200:
+                    points_seq.append(val)
+                else:
+                    break
+                i += 1
+            else:
+                break
+
+        # Align the three sequences
+        n = min(len(groups_seq), len(items_seq), len(points_seq))
+        if n >= 3:
             for k in range(n):
-                gid = roman_map.get(groups_row[k])
+                gid = roman_map.get(groups_seq[k])
                 if gid:
-                    try:
-                        pts = int(points_row[k])
-                        if 5 <= pts <= 50:
-                            results.append({"question": items_row[k], "points": pts, "group": gid})
-                    except (ValueError, IndexError):
-                        pass
+                    results.append({"question": items_seq[k], "points": points_seq[k], "group": gid})
 
-        if results:
-            return results
-
-        # Strategy 3: Fallback — find individual "N. ... PP" patterns near group context
-        current_group = None
-        for line in lines:
-            line_stripped = line.strip()
-            gm = re.search(r'[Gg]rupo\s+(I{1,3}V?|IV)', line_stripped)
-            if gm:
-                current_group = roman_map.get(gm.group(1))
-            if current_group:
-                # "1. ... 13" or "2. ... 20"
-                score_match = re.findall(r'(\d+)\.\s*[.\s…·]*\s*(\d+)', line_stripped)
-                for item, pts_str in score_match:
-                    try:
-                        pts = int(pts_str)
-                        if 5 <= pts <= 50:
-                            results.append({"question": item, "points": pts, "group": current_group})
-                    except ValueError:
-                        pass
+        # Also parse optional items section (e.g. "Grupo I\n2.\nGrupo III\n2.\n5.\n...")
+        if "Destes" in scoring_text or "contribuem" in scoring_text:
+            optional_group = None
+            for j in range(i, len(lines)):
+                line = lines[j]
+                gm = re.match(r'^Grupo\s+(I{1,3}V?|IV)$', line, re.IGNORECASE)
+                if gm:
+                    optional_group = roman_map.get(gm.group(1))
+                    continue
+                item_m = re.match(r'^(\d+)\.$', line)
+                if item_m and optional_group:
+                    # Optional items are 13 points each (standard for Portuguese national exams)
+                    results.append({"question": item_m.group(1), "points": 13, "group": optional_group})
 
         return results
 

@@ -8,9 +8,9 @@ from collections import defaultdict
 
 
 # ── Patterns ──────────────────────────────────────────────────────
-_GROUP_PATTERN = re.compile(r'[Gg]rupo\s+(I{1,3}V?|IV|V?I{0,3})\b')
+_GROUP_PATTERN = re.compile(r'grupo\s+(I{1,3}V?|IV)\b', re.IGNORECASE)
 _DOC_LABEL_PATTERN = re.compile(
-    r'[Dd]ocumento\s+(\d+)\s*(?:\(([^)]+)\))?', re.IGNORECASE
+    r'documento\s+(\d+)\s*(?:\(([^)]+)\))?', re.IGNORECASE
 )
 _SOURCE_REF_PATTERNS = [
     re.compile(r'[Dd]ocumento\s+(\d+)', re.IGNORECASE),
@@ -104,6 +104,11 @@ def _build_page_group_map(extraction: dict | None, questions: list[dict]) -> dic
         text = page_texts[page_num]
         # Skip cover/instructions (typically pages 1-3)
         if page_num <= 2:
+            continue
+        # Skip scoring page (contains COTAÇÕES table with group references)
+        if "cotaç" in text.lower() or "cotaçõ" in text.lower():
+            if current_group:
+                page_group_map[page_num] = current_group
             continue
 
         match = _GROUP_PATTERN.search(text)
@@ -323,6 +328,19 @@ def _resolve_scoped_refs(questions: list[dict], sources: list[dict]):
 
         if source_refs:
             q["sourceRefs"] = source_refs
+
+    # Fallback: if a group has exactly 1 source and questions have no refs, auto-associate
+    group_sources = defaultdict(list)
+    for s in sources:
+        group_sources[s["groupId"]].append(s)
+
+    for q in questions:
+        if q.get("sourceRefs"):
+            continue
+        gid = q.get("groupId")
+        if gid and len(group_sources.get(gid, [])) == 1:
+            sole_source = group_sources[gid][0]
+            q["sourceRefs"] = [{"sourceId": sole_source["sourceId"], "childId": None, "mode": "full_group"}]
 
 
 # ══════════════════════════════════════════════════════════════════

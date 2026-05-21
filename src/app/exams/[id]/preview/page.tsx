@@ -43,29 +43,38 @@ export default function PreviewPage() {
   // Get images for current question
   const getImages = (q: Question): string[] => {
     const urls: string[] = [];
-    const allRefs = [...(q.imageRefs || []), ...(q.assetRefs || [])];
 
-    // From sourceRefs
+    // From sourceRefs (best source for History — full document crops)
     if (q.sourceRefs && q.sourceRefs.length > 0) {
       for (const ref of q.sourceRefs) {
         const src = data.sources?.find(s => s.sourceId === ref.sourceId);
-        if (src?.crops?.full?.url) { urls.push(src.crops.full.url); continue; }
-        if (src?.assetRefs) allRefs.push(...src.assetRefs);
-        const sg = data.sourceGroups?.find(g => g.id === ref.sourceId);
-        if (sg?.crops?.context?.url) urls.push(sg.crops.context.url);
-        if (ref.childId) allRefs.push(ref.childId);
-        else if (sg?.children) allRefs.push(...sg.children);
+        if (src?.crops?.full?.url) {
+          urls.push(src.crops.full.url);
+        } else if (src) {
+          // Prefer embedded_image on the source page, then asset crops
+          const page = src.pageStart;
+          const embedded = data.assets.find(a => a.page === page && a.type === 'embedded_image' && a.crop?.url);
+          if (embedded?.crop?.url) {
+            urls.push(embedded.crop.url);
+          } else if (src.assetRefs) {
+            for (const aId of src.assetRefs) {
+              const asset = data.assets.find(a => a.id === aId);
+              const url = asset?.crops?.context?.url || asset?.crop?.url;
+              if (url) urls.push(url);
+            }
+          }
+        }
       }
     }
 
-    // From asset refs
-    const seen = new Set<string>();
+    if (urls.length > 0) return [...new Set(urls)];
+
+    // From direct asset refs (imageRefs, assetRefs)
+    const allRefs = [...(q.imageRefs || []), ...(q.assetRefs || [])];
     for (const refId of allRefs) {
-      if (seen.has(refId)) continue;
-      seen.add(refId);
       const asset = data.assets.find(a => a.id === refId);
       if (!asset) continue;
-      const url = asset.crops?.context?.url || asset.crops?.visual?.url || asset.crop?.url;
+      const url = asset.crops?.context?.url || asset.crop?.url;
       if (url) urls.push(url);
     }
     return [...new Set(urls)];
@@ -83,26 +92,22 @@ export default function PreviewPage() {
 
     if (imgs.length > 0) return [...new Set(imgs)];
 
-    // Fallback: find sources in the same group on pages BEFORE this question
+    // Fallback: find sources in the same group (full document crops)
     if (q.groupId && data.sources) {
-      const groupSources = data.sources.filter(s => s.groupId === q.groupId && s.pageStart && s.pageStart < (q.sourcePage || 999));
+      const groupSources = data.sources.filter(s =>
+        s.groupId === q.groupId && s.pageStart && s.pageStart < (q.sourcePage || 999)
+      );
       for (const src of groupSources) {
-        if (src.crops?.full?.url) imgs.push(src.crops.full.url);
+        if (src.crops?.full?.url) {
+          imgs.push(src.crops.full.url);
+        } else {
+          // Prefer embedded_image on source page
+          const embedded = data.assets.find(a => a.page === src.pageStart && a.type === 'embedded_image' && a.crop?.url);
+          if (embedded?.crop?.url) imgs.push(embedded.crop.url);
+        }
       }
     }
-    if (imgs.length > 0) return [...new Set(imgs)];
 
-    // Fallback: assets on same page or adjacent source pages
-    const qPage = q.sourcePage || 0;
-    const nearPages = [qPage, qPage - 1, qPage - 2];
-    for (const p of nearPages) {
-      const pageAssets = data.assets.filter(a => a.page === p && a.type !== 'embedded_image');
-      for (const a of pageAssets) {
-        const url = a.crops?.context?.url || a.crop?.url;
-        if (url) imgs.push(url);
-      }
-      if (imgs.length > 0) break;
-    }
     return [...new Set(imgs)];
   };
 
