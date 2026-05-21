@@ -1,44 +1,41 @@
-"""Source grouping: group-scoped document/source detection and question linking.
+"""Source grouping v2: deterministic group/source detection for History exams.
 
-For History (and similar document-heavy exams):
-- Detects Grupo I/II/III/IV from page text
-- Creates Source entities per document within each group
-- Assigns composite questionIds (grupo_i_q1, grupo_ii_q1, etc.)
-- Resolves "documento 1" references WITHIN the current group scope
-- Handles composite documents (image sets A/B/C/D) as parent+children
+Core principle: scan ALL pages to build page→group map FIRST, then detect
+documents within each group, then assign questions, then resolve refs.
 """
 import re
+from collections import defaultdict
 
 
-# ── Group detection from raw page text ────────────────────────────
-_GROUP_PATTERN = re.compile(
-    r'(?:^|\n)\s*[Gg]rupo\s+(I{1,3}V?|IV|V?I{0,3})\b', re.MULTILINE
-)
-
-_ROMAN_TO_INT = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5}
-
+# ── Patterns ──────────────────────────────────────────────────────
+_GROUP_PATTERN = re.compile(r'[Gg]rupo\s+(I{1,3}V?|IV|V?I{0,3})\b')
 _DOC_LABEL_PATTERN = re.compile(
     r'[Dd]ocumento\s+(\d+)\s*(?:\(([^)]+)\))?', re.IGNORECASE
 )
-
-# Patterns for question items in History exams
-_ITEM_PATTERN = re.compile(
-    r'(?:^|\n)\s*(\d+)\.\s+', re.MULTILINE
-)
-
-# Source reference patterns (resolved within group scope)
 _SOURCE_REF_PATTERNS = [
     re.compile(r'[Dd]ocumento\s+(\d+)', re.IGNORECASE),
     re.compile(r'[Dd]oc\.?\s*(\d+)', re.IGNORECASE),
 ]
 _CHILD_REF_PATTERN = re.compile(r'[Ii]magem\s+([A-Z])', re.IGNORECASE)
-_LINE_REF_PATTERN = re.compile(r'[Ll]inhas?\s+(\d+(?:\s*[-–a]\s*\d+)?)', re.IGNORECASE)
+
+_ROMAN_MAP = {"I": "i", "II": "ii", "III": "iii", "IV": "iv", "V": "v"}
 
 
-def apply_source_grouping(output: dict, subject_profile: dict) -> dict:
-    """Main entry point: detect groups, sources, assign composite IDs, link refs.
+def _roman_to_id(roman: str) -> str:
+    return _ROMAN_MAP.get(roman.strip(), roman.strip().lower())
 
-    For non-source-grouping subjects, returns output unchanged.
+
+# ══════════════════════════════════════════════════════════════════
+# PUBLIC API
+# ══════════════════════════════════════════════════════════════════
+
+def apply_source_grouping(output: dict, subject_profile: dict, extraction: dict = None) -> dict:
+    """Main entry: detect groups, sources, composite IDs, sourceRefs.
+
+    Args:
+        output: assembled exam output (questions, assets)
+        subject_profile: from subjects.py
+        extraction: raw PDF extraction with ALL page texts
     """
     if not subject_profile.get("has_source_grouping"):
         return output
@@ -46,220 +43,268 @@ def apply_source_grouping(output: dict, subject_profile: dict) -> dict:
     questions = output.get("questions", [])
     assets = output.get("assets", [])
 
-    # Detect if this is a group-structured exam (Grupo I, II, III...)
-    # by checking if questions already have group field from vision extraction
-    has_explicit_groups = any(q.get("group") for q in questions)
+    # ── Step 1: Build page→group map from ALL pages ───────────────
+    page_group_map = _build_page_group_map(extraction, questions)
 
-    if not has_explicit_groups:
-        # Try to detect groups from page raw text
-        _detect_groups_from_text(questions, output)
-
-    has_groups = any(q.get("group") for q in questions)
-    if not has_groups:
-        # Not a grouped exam — fall back to simple source page detection
+    if not page_group_map:
         return _simple_source_grouping(output, assets, questions)
 
-    # ── Group-scoped processing ───────────────────────────────────
-    # Step 1: Assign groupId to all questions
-    _assign_group_ids(questions)
+    # ── Step 2: Assign group to every question ────────────────────
+    _assign_groups_from_map(questions, page_group_map)
 
-    # Step 2: Generate composite questionIds
+    has_groups = any(q.get("groupId") for q in questions)
+    if not has_groups:
+        return _simple_source_grouping(output, assets, questions)
+
+    # ── Step 3: Generate composite questionIds ────────────────────
     _assign_composite_ids(questions)
 
-    # Step 3: Detect source documents per group from assets
-    sources = _detect_sources_per_group(assets, questions)
+    # ── Step 4: Detect sources per group ──────────────────────────
+    sources = _detect_sources(assets, questions, page_group_map, extraction)
 
-    # Step 4: Resolve question sourceRefs within group scope
+    # ── Step 5: Resolve sourceRefs by text within group ───────────
     _resolve_scoped_refs(questions, sources)
 
     output["sources"] = sources
     return output
 
 
-def _detect_groups_from_text(questions: list[dict], output: dict):
-    """Detect group assignments from sourceTextRaw and page ordering."""
-    # Build page→group mapping by scanning all page texts in order
-    page_group = {}
+# ══════════════════════════════════════════════════════════════════
+# STEP 1: Page → Group Map
+# ══════════════════════════════════════════════════════════════════
+
+def _build_page_group_map(extraction: dict | None, questions: list[dict]) -> dict[int, str]:
+    """Scan ALL page texts to build {page_number: groupId}.
+
+    Groups propagate forward: once 'Grupo II' is seen, all subsequent
+    pages belong to Grupo II until 'Grupo III' appears.
+    """
+    page_texts: dict[int, str] = {}
+
+    # Primary source: extraction pages (has ALL pages including source pages)
+    if extraction and extraction.get("pages"):
+        for p in extraction["pages"]:
+            page_texts[p["page"]] = p.get("text", "")
+
+    # Fallback: sourceTextRaw from questions (only question pages)
+    if not page_texts:
+        for q in questions:
+            pg = q.get("sourcePage", 0)
+            if pg and q.get("sourceTextRaw"):
+                page_texts[pg] = q["sourceTextRaw"]
+
+    if not page_texts:
+        return {}
+
+    # Scan pages in order, detect group headers
+    page_group_map: dict[int, str] = {}
     current_group = None
 
-    # Get all unique pages from questions, sorted
-    all_pages = sorted({q.get("sourcePage", 0) for q in questions})
+    for page_num in sorted(page_texts.keys()):
+        text = page_texts[page_num]
+        # Skip cover/instructions (typically pages 1-3)
+        if page_num <= 2:
+            continue
 
-    # Also check sourceTextRaw from questions (contains full page text)
-    page_texts = {}
-    for q in questions:
-        page = q.get("sourcePage", 0)
-        if page and q.get("sourceTextRaw"):
-            page_texts[page] = q["sourceTextRaw"]
+        match = _GROUP_PATTERN.search(text)
+        if match:
+            roman = match.group(1)
+            current_group = f"grupo_{_roman_to_id(roman)}"
 
-    for page in sorted(page_texts.keys()):
-        text = page_texts[page]
-        group_match = _GROUP_PATTERN.search(text)
-        if group_match:
-            current_group = f"Grupo {group_match.group(1)}"
         if current_group:
-            page_group[page] = current_group
+            page_group_map[page_num] = current_group
 
-    # Assign groups to questions based on their page
-    current_group = None
-    for q in sorted(questions, key=lambda x: (x.get("sourcePage", 0), x.get("number", ""))):
-        page = q.get("sourcePage", 0)
-        if page in page_group:
-            current_group = page_group[page]
-        if current_group and not q.get("group"):
-            q["group"] = current_group
+    return page_group_map
 
 
-def _assign_group_ids(questions: list[dict]):
-    """Convert group labels to normalized groupIds."""
+# ══════════════════════════════════════════════════════════════════
+# STEP 2: Assign groups to questions
+# ══════════════════════════════════════════════════════════════════
+
+def _assign_groups_from_map(questions: list[dict], page_group_map: dict[int, str]):
+    """Assign groupId and group label to each question from the page map."""
     for q in questions:
-        group = q.get("group")
-        if group:
-            # "Grupo II" → "grupo_ii"
-            q["groupId"] = group.lower().replace(" ", "_")
+        page = q.get("sourcePage", 0)
+        gid = page_group_map.get(page)
+        if gid:
+            q["groupId"] = gid
+            # "grupo_ii" → "Grupo II"
+            roman = gid.replace("grupo_", "").upper()
+            q["group"] = f"Grupo {roman}"
 
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 3: Composite IDs
+# ══════════════════════════════════════════════════════════════════
 
 def _assign_composite_ids(questions: list[dict]):
-    """Replace simple q1/q2 IDs with grupo_i_q1, grupo_ii_q1, etc."""
+    """Replace q1/q2 IDs with grupo_i_q1, grupo_ii_q1, etc."""
+    old_to_new: dict[str, str] = {}
+
     for q in questions:
-        group_id = q.get("groupId")
+        gid = q.get("groupId")
         number = q.get("number", "")
-        if group_id and number:
-            new_id = f"{group_id}_q{number.replace('.', '_')}"
-            old_id = q["questionId"]
-            q["questionId"] = new_id
-            q["displayNumber"] = f"{q.get('group', '')}, item {number}"
-            # Update parent/child references
-            for other in questions:
-                if other.get("parentQuestion") == old_id:
-                    other["parentQuestion"] = new_id
-                other["subQuestions"] = [
-                    new_id if s == old_id else s for s in other.get("subQuestions", [])
-                ]
+        if not gid or not number:
+            continue
+        new_id = f"{gid}_q{number.replace('.', '_')}"
+        old_to_new[q["questionId"]] = new_id
+        q["questionId"] = new_id
+        q["displayNumber"] = f"{q.get('group', '')}, item {number}"
+
+    # Update parent/child references
+    for q in questions:
+        if q.get("parentQuestion") in old_to_new:
+            q["parentQuestion"] = old_to_new[q["parentQuestion"]]
+        q["subQuestions"] = [old_to_new.get(s, s) for s in q.get("subQuestions", [])]
 
 
-def _detect_sources_per_group(assets: list[dict], questions: list[dict]) -> list[dict]:
-    """Detect source documents from assets, scoped by group.
+# ══════════════════════════════════════════════════════════════════
+# STEP 4: Detect sources per group
+# ══════════════════════════════════════════════════════════════════
 
-    Assets on pages without questions that fall between group boundaries
-    are assigned to the group whose questions follow them.
-    """
+def _detect_sources(assets: list[dict], questions: list[dict],
+                    page_group_map: dict[int, str], extraction: dict | None) -> list[dict]:
+    """Detect source documents from page text and assets, scoped by group."""
     sources = []
     pages_with_questions = {q["sourcePage"] for q in questions}
 
-    # Build group page ranges: which pages belong to which group
-    group_pages = {}  # groupId → list of question pages
-    for q in questions:
-        gid = q.get("groupId")
-        if gid:
-            group_pages.setdefault(gid, []).append(q["sourcePage"])
+    # Get page texts for document label detection
+    page_texts: dict[int, str] = {}
+    if extraction and extraction.get("pages"):
+        for p in extraction["pages"]:
+            page_texts[p["page"]] = p.get("text", "")
 
-    # Sort groups by their first page
-    sorted_groups = sorted(group_pages.items(), key=lambda x: min(x[1]))
+    # Find source pages (pages with group but no questions)
+    source_pages = sorted(
+        pg for pg, gid in page_group_map.items()
+        if pg not in pages_with_questions
+    )
 
-    # For each asset on a non-question page, assign to the group whose questions come after
-    source_assets = [a for a in assets if a["page"] not in pages_with_questions
-                     and a.get("type") != "embedded_image"]
+    # For each source page, detect document labels from text
+    # Track doc numbering per group
+    group_doc_counter: dict[str, int] = defaultdict(int)
+    # Track which doc numbers we've seen explicitly in text per group
+    group_explicit_docs: dict[str, dict[int, int]] = defaultdict(dict)  # gid → {doc_num: page}
 
-    for asset in source_assets:
-        page = asset["page"]
-        assigned_group = None
-        for gid, pages in sorted_groups:
-            if page < min(pages):
-                # This asset page is before this group's questions
-                assigned_group = gid
-                break
-            elif page <= max(pages):
-                assigned_group = gid
-                break
-        if not assigned_group and sorted_groups:
-            # After all groups — assign to last
-            assigned_group = sorted_groups[-1][0]
+    for page in source_pages:
+        gid = page_group_map.get(page)
+        if not gid:
+            continue
 
-        if assigned_group:
-            asset["_groupId"] = assigned_group
+        text = page_texts.get(page, "")
+        # Find explicit "Documento N" labels in page text
+        doc_matches = list(_DOC_LABEL_PATTERN.finditer(text))
 
-    # Group source assets by (groupId, page) and try to detect document labels
-    from collections import defaultdict
-    group_page_assets = defaultdict(list)
-    for a in source_assets:
-        gid = a.get("_groupId")
-        if gid:
-            group_page_assets[(gid, a["page"])].append(a)
+        if doc_matches:
+            for m in doc_matches:
+                doc_num = int(m.group(1))
+                if doc_num not in group_explicit_docs[gid]:
+                    group_explicit_docs[gid][doc_num] = page
+        else:
+            # No explicit label — this page has source material without "Documento N"
+            # (e.g. Grupo I just has an image without labeling it "Documento 1")
+            group_doc_counter[gid] += 1
+            implicit_num = group_doc_counter[gid]
+            # Only add if we haven't seen explicit docs for this group yet
+            if not group_explicit_docs[gid]:
+                group_explicit_docs[gid][implicit_num] = page
+
+    # Also check question pages for documents (some docs appear on same page as questions)
+    for page in sorted(pages_with_questions):
+        gid = page_group_map.get(page)
+        if not gid:
+            continue
+        text = page_texts.get(page, "")
+        for m in _DOC_LABEL_PATTERN.finditer(text):
+            doc_num = int(m.group(1))
+            if doc_num not in group_explicit_docs[gid]:
+                group_explicit_docs[gid][doc_num] = page
 
     # Build Source entities
-    doc_counter = defaultdict(int)  # groupId → next doc number
-    for (gid, page), page_assets in sorted(group_page_assets.items()):
-        doc_counter[gid] += 1
-        doc_num = doc_counter[gid]
+    for gid in sorted(set(page_group_map.values())):
+        docs = group_explicit_docs.get(gid, {})
+        for doc_num in sorted(docs.keys()):
+            page = docs[doc_num]
+            source_id = f"{gid}_documento_{doc_num}"
 
-        # Try to infer label from asset descriptions
-        label = _infer_doc_label(page_assets, doc_num)
-        kind = _infer_doc_kind(page_assets)
+            # Find assets on this page
+            page_assets = [a for a in assets
+                           if a.get("page") == page and a.get("type") != "embedded_image"]
 
-        source_id = f"{gid}_documento_{doc_num}"
+            # Determine kind and children
+            kind = _infer_kind(page_assets, page_texts.get(page, ""))
+            children = []
 
-        # Detect children (A, B, C, D sub-images)
-        children = []
-        if len(page_assets) > 1 and kind == "image_set":
-            for i, a in enumerate(sorted(page_assets, key=lambda x: x.get("id", ""))):
-                letter = chr(ord('a') + i)
-                child_id = f"{source_id}_{letter}"
-                children.append(child_id)
-                a["parentAssetId"] = source_id
+            # Multiple visual assets on same page → image_set with children
+            if len(page_assets) > 1:
+                kind = "image_set"
+                for i, a in enumerate(sorted(page_assets, key=lambda x: x.get("id", ""))):
+                    letter = chr(ord('a') + i)
+                    child_id = f"{source_id}_{letter}"
+                    children.append(child_id)
+                    a["parentAssetId"] = source_id
 
-        source = {
-            "sourceId": source_id,
-            "groupId": gid,
-            "label": label,
-            "kind": kind,
-            "pageStart": page,
-            "pageEnd": page,
-            "description": _build_source_description(page_assets),
-            "children": children,
-            "assetRefs": [a["id"] for a in page_assets],
-        }
-        sources.append(source)
+            # Infer label from page text
+            text = page_texts.get(page, "")
+            label = f"Documento {doc_num}"
+            for m in _DOC_LABEL_PATTERN.finditer(text):
+                if int(m.group(1)) == doc_num and m.group(2):
+                    label = f"Documento {doc_num} ({m.group(2)})"
+                    break
+
+            source = {
+                "sourceId": source_id,
+                "groupId": gid,
+                "label": label,
+                "kind": kind,
+                "pageStart": page,
+                "pageEnd": page,
+                "description": _build_description(page_assets, text),
+                "children": children,
+                "assetRefs": [a["id"] for a in page_assets],
+            }
+            sources.append(source)
 
     return sources
 
 
+# ══════════════════════════════════════════════════════════════════
+# STEP 5: Resolve sourceRefs
+# ══════════════════════════════════════════════════════════════════
+
 def _resolve_scoped_refs(questions: list[dict], sources: list[dict]):
-    """Resolve 'documento 1', 'imagem B' references within the question's group."""
-    # Index sources by (groupId, doc_number)
-    source_index = {}
+    """Resolve 'documento 1', 'imagem B' in question text within its group."""
+    # Index: (groupId, doc_num_str) → source
+    source_index: dict[tuple[str, str], dict] = {}
     for s in sources:
-        gid = s["groupId"]
-        num_match = re.search(r'(\d+)$', s["sourceId"])
-        if num_match:
-            source_index[(gid, num_match.group(1))] = s
+        m = re.search(r'_(\d+)$', s["sourceId"])
+        if m:
+            source_index[(s["groupId"], m.group(1))] = s
 
     for q in questions:
-        text = (q.get("statement") or "") + " " + (q.get("sourceTextRaw") or "")
-        if not text.strip():
-            continue
-
         gid = q.get("groupId")
         if not gid:
             continue
 
+        # Use statement only (not sourceTextRaw which has the whole page)
+        text = q.get("statement") or ""
+        if not text.strip():
+            continue
+
         source_refs = []
-
-        # Find document references
         doc_nums = set()
-        for pattern in _SOURCE_REF_PATTERNS:
-            doc_nums.update(pattern.findall(text))
+        for pat in _SOURCE_REF_PATTERNS:
+            doc_nums.update(pat.findall(text))
 
-        # Find child references (imagem A, B, etc.)
         child_letters = [c.upper() for c in _CHILD_REF_PATTERN.findall(text)]
 
-        for doc_num in doc_nums:
+        for doc_num in sorted(doc_nums):
             source = source_index.get((gid, doc_num))
             if not source:
                 continue
 
             if child_letters and source["children"]:
-                # Specific child references
+                # Check which children are referenced
                 for letter in child_letters:
                     child_id = f"{source['sourceId']}_{letter.lower()}"
                     if child_id in source["children"]:
@@ -268,71 +313,64 @@ def _resolve_scoped_refs(questions: list[dict], sources: list[dict]):
                             "childId": child_id,
                             "mode": "specific_child",
                         })
-                # If ALL children referenced, also add full_group
-                all_letters = {chr(ord('a') + i).upper() for i in range(len(source["children"]))}
-                if set(child_letters) >= all_letters:
+                # If ALL children referenced → full_group
+                n_children = len(source["children"])
+                all_letters = {chr(ord('a') + i).upper() for i in range(n_children)}
+                if all_letters and set(child_letters) >= all_letters:
                     source_refs.insert(0, {"sourceId": source["sourceId"], "childId": None, "mode": "full_group"})
             else:
-                # Full document reference
                 source_refs.append({"sourceId": source["sourceId"], "childId": None, "mode": "full_group"})
 
         if source_refs:
             q["sourceRefs"] = source_refs
 
 
+# ══════════════════════════════════════════════════════════════════
+# FALLBACK for non-grouped exams
+# ══════════════════════════════════════════════════════════════════
+
 def _simple_source_grouping(output: dict, assets: list[dict], questions: list[dict]) -> dict:
-    """Fallback: simple source page detection for non-grouped exams."""
+    """Fallback for exams without Grupo structure."""
     pages_with_questions = {q["sourcePage"] for q in questions}
     source_pages = {a["page"] for a in assets
                     if a["page"] not in pages_with_questions
                     and a.get("type") != "embedded_image"}
-
     if not source_pages:
         return output
 
-    # Build source groups per page (legacy behavior)
     source_groups = []
     for page in sorted(source_pages):
         page_assets = [a for a in assets if a["page"] == page and a.get("type") != "embedded_image"]
         if not page_assets:
             continue
-        group_id = f"source_group_p{page}"
+        gid = f"source_group_p{page}"
         source_groups.append({
-            "id": group_id,
-            "type": "source_group",
-            "sourceType": "mixed",
-            "page": page,
-            "label": _infer_doc_label(page_assets, 0),
-            "description": _build_source_description(page_assets),
-            "children": [a["id"] for a in page_assets],
-            "crops": None,
+            "id": gid, "type": "source_group", "sourceType": "mixed",
+            "page": page, "label": f"Documento p{page}",
+            "description": _build_description(page_assets, ""),
+            "children": [a["id"] for a in page_assets], "crops": None,
         })
         for a in page_assets:
-            a["parentAssetId"] = group_id
+            a["parentAssetId"] = gid
 
     output["sourceGroups"] = source_groups
     return output
 
 
-# ── Helpers ───────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════
 
-def _infer_doc_label(assets: list[dict], doc_num: int) -> str:
-    """Infer document label from asset descriptions."""
-    for a in assets:
-        desc = a.get("description", "")
-        match = _DOC_LABEL_PATTERN.search(desc)
-        if match:
-            label = f"Documento {match.group(1)}"
-            if match.group(2):
-                label += f" ({match.group(2)})"
-            return label
-    return f"Documento {doc_num}" if doc_num else "Documento"
+def _infer_kind(assets: list[dict], page_text: str) -> str:
+    """Infer document kind from assets and page text."""
+    if not assets:
+        # No visual assets — likely a text source
+        if re.search(r'[Dd]ocumento\s+\d+', page_text):
+            return "text_source"
+        return "image"
 
-
-def _infer_doc_kind(assets: list[dict]) -> str:
-    """Infer document kind from asset types."""
     types = {a.get("type", "") for a in assets}
-    if len(assets) > 1 and all(t in ("image", "historical_source", "map") for t in types):
+    if len(assets) > 1:
         return "image_set"
     if "table" in types:
         return "table"
@@ -342,17 +380,18 @@ def _infer_doc_kind(assets: list[dict]) -> str:
         return "map"
     if "text_source" in types or "document_excerpt" in types:
         return "text_source"
-    if len(assets) == 1:
-        t = assets[0].get("type", "")
-        if t in ("image", "historical_source"):
-            return "image"
-        return t or "mixed"
-    return "mixed"
+    # For History, single visual assets are historical images regardless of detected type
+    return "image"
 
 
-def _build_source_description(assets: list[dict]) -> str:
-    """Build description from asset list."""
+def _build_description(assets: list[dict], page_text: str) -> str:
+    """Build description from assets or page text."""
     descs = [a.get("description", "") for a in assets if a.get("description")]
     if descs:
         return "; ".join(descs[:3])
-    return f"{len(assets)} elemento(s) documental(is)"
+    # Try first meaningful line from page text
+    for line in page_text.split("\n"):
+        line = line.strip()
+        if len(line) > 20 and not line.startswith("Prova"):
+            return line[:200]
+    return f"{len(assets)} elemento(s)"

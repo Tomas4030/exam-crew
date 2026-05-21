@@ -121,7 +121,7 @@ Text:
 
         # Step 3.5: Source grouping (for History, Portuguese, etc.)
         report_progress("source_grouping", "Detecting source/document pages")
-        output = apply_source_grouping(output, subject_profile)
+        output = apply_source_grouping(output, subject_profile, extraction)
 
         # Step 3.5b: Normalize (deterministic corrections)
         report_progress("normalize", "Applying deterministic corrections")
@@ -378,6 +378,128 @@ If question {mq} is truly not on this page, respond: {{"number": "{mq}", "statem
             "points": None,
         }
 
+    def _parse_history_scoring(self, extraction: dict) -> list[dict]:
+        """Parse scoring table from last page for History exams.
+
+        The scoring page typically has a table with columns:
+        Grupo | item number | Cotação
+        e.g.: "I  1.  13" or "II  2.  20"
+        """
+        # Get last 2 pages text (scoring might span)
+        pages = extraction.get("pages", [])
+        if not pages:
+            return []
+
+        scoring_text = ""
+        for p in pages[-2:]:
+            text = p.get("text", "")
+            if "cotaç" in text.lower() or "pontu" in text.lower():
+                scoring_text = text
+                break
+
+        if not scoring_text:
+            return []
+
+        results = []
+        roman_map = {"I": "grupo_i", "II": "grupo_ii", "III": "grupo_iii", "IV": "grupo_iv", "V": "grupo_v"}
+
+        # Strategy 1: Look for patterns like "Grupo\nI\nII\n..." followed by items and points
+        # Parse the tabular structure: group headers, item numbers, and points
+        lines = scoring_text.split("\n")
+
+        # Try to find rows with: Roman numeral + item number + points
+        # Pattern: "I" or "II" etc on one line, then "1." on next, then "13" etc
+        # Or inline: "I  1.  13"
+        current_group = None
+        for line in lines:
+            line = line.strip()
+            # Check if line is just a group identifier
+            group_match = re.match(r'^(I{1,3}V?|IV|V?I{0,3})$', line)
+            if group_match and group_match.group(1) in roman_map:
+                current_group = roman_map[group_match.group(1)]
+                continue
+
+            # Check for inline: "Grupo I  1.  13" or "I  1.  13  14  20"
+            # Or just item+points on a line when we know the group
+            if current_group:
+                # Find item numbers on this line
+                items = re.findall(r'(\d+)\.', line)
+                if items:
+                    # This might be a row of item numbers — points will be on another line
+                    pass
+
+        # Strategy 2: More robust — find all (group, item, points) triples
+        # Look for the structured table pattern in the raw text
+        # Common format: columns of Group/Item/Points
+        # Try regex for "Grupo X  N.  PP" or tabular extraction
+
+        # Parse the scoring section looking for group+item+points patterns
+        # The text often has: "I\n1.\nCotação (em pontos)\n13\n14\n20..."
+        # Or: "Grupo  I  II  II  II  II  III  III  III  IV  IV"
+        #     "       1.  1.  2.  3.  4.  1.   3.   4.  1.  3."
+        #     "       13  14  20  20  13  20   20   15  26  13"
+
+        # Find the groups row, items row, and points row
+        groups_row = []
+        items_row = []
+        points_row = []
+
+        for i, line in enumerate(lines):
+            # Detect a line that's mostly roman numerals (groups row)
+            romans_found = re.findall(r'\b(I{1,3}V?|IV)\b', line)
+            if len(romans_found) >= 3:
+                groups_row = romans_found
+                # Next lines should have items and points
+                for j in range(i + 1, min(i + 5, len(lines))):
+                    next_line = lines[j].strip()
+                    nums = re.findall(r'(\d+)', next_line)
+                    if nums and not items_row:
+                        # Check if these are item numbers (1-5 range) or points (10-30 range)
+                        avg = sum(int(n) for n in nums) / len(nums)
+                        if avg < 6:
+                            items_row = nums
+                        else:
+                            points_row = nums
+                    elif nums and items_row and not points_row:
+                        points_row = nums
+                break
+
+        if groups_row and items_row and points_row:
+            # Align the three rows
+            n = min(len(groups_row), len(items_row), len(points_row))
+            for k in range(n):
+                gid = roman_map.get(groups_row[k])
+                if gid:
+                    try:
+                        pts = int(points_row[k])
+                        if 5 <= pts <= 50:
+                            results.append({"question": items_row[k], "points": pts, "group": gid})
+                    except (ValueError, IndexError):
+                        pass
+
+        if results:
+            return results
+
+        # Strategy 3: Fallback — find individual "N. ... PP" patterns near group context
+        current_group = None
+        for line in lines:
+            line_stripped = line.strip()
+            gm = re.search(r'[Gg]rupo\s+(I{1,3}V?|IV)', line_stripped)
+            if gm:
+                current_group = roman_map.get(gm.group(1))
+            if current_group:
+                # "1. ... 13" or "2. ... 20"
+                score_match = re.findall(r'(\d+)\.\s*[.\s…·]*\s*(\d+)', line_stripped)
+                for item, pts_str in score_match:
+                    try:
+                        pts = int(pts_str)
+                        if 5 <= pts <= 50:
+                            results.append({"question": item, "points": pts, "group": current_group})
+                    except ValueError:
+                        pass
+
+        return results
+
     def _extract_metadata(self, page_results: list[dict], extraction: dict) -> dict:
         """Extract metadata deterministically from raw PDF text (pages 1-2)."""
         metadata = {
@@ -463,8 +585,21 @@ If question {mq} is truly not on this page, respond: {{"number": "{mq}", "statem
                 if not number:
                     continue
 
-                is_sub = "." in number
+                # For source-grouping subjects (History etc.), don't create sub-questions
+                # I/II/III/IV and a/b/c/d inside statements are NOT sub-questions
+                has_source_grouping = subject_profile.get("has_source_grouping", False) if subject_profile else False
+                is_sub = "." in number and not has_source_grouping
                 parent_num = number.split(".")[0] if is_sub else None
+
+                # For History: flatten "2.1" → just "2" (it's the same question)
+                if has_source_grouping and "." in number:
+                    # Skip sub-items entirely — they're part of the parent question
+                    base_num = number.split(".")[0]
+                    # Check if we already have this base number on this page
+                    if any(eq.get("number") == base_num and eq.get("sourcePage") == page_num
+                           for eq in all_questions):
+                        continue
+                    number = base_num
 
                 # Generate unique ID
                 q_id = f"q{number.replace('.', '_')}"
@@ -752,19 +887,41 @@ If question {mq} is truly not on this page, respond: {{"number": "{mq}", "statem
                 # Accept both 'question' and 'number' keys from model
                 q_num = str(score.get("question") or score.get("number") or "").strip()
                 pts = score.get("points") or score.get("cotacao") or score.get("score")
+                # Also accept group key for History scoring
+                group = score.get("group") or score.get("grupo") or ""
                 if q_num and pts is not None:
                     try:
                         pts = int(float(str(pts)))
                     except (ValueError, TypeError):
                         continue
                     if pts > 0:
-                        scoring_entries.append({"question": q_num, "points": pts})
+                        scoring_entries.append({"question": q_num, "points": pts, "group": str(group)})
+
+        # ── History scoring: parse from last page text by group+item ──
+        has_source_grouping = subject_profile.get("has_source_grouping", False) if subject_profile else False
+        if has_source_grouping:
+            history_scores = self._parse_history_scoring(extraction)
+            if history_scores:
+                scoring_entries = history_scores  # Override with deterministic parse
 
         # Apply scoring to questions — try multiple matching strategies
         for entry in scoring_entries:
             q_num = entry["question"]
             pts = entry["points"]
+            entry_group = entry.get("group", "")
             matched = False
+
+            # Strategy 0: match by groupId + number (for History)
+            if entry_group:
+                for q in all_questions:
+                    q_group = q.get("groupId") or q.get("group", "")
+                    if q["number"] == q_num and entry_group.lower() in q_group.lower() and q.get("points") is None:
+                        q["points"] = pts
+                        matched = True
+                        break
+                if matched:
+                    continue
+
             # Strategy 1: exact match
             for q in all_questions:
                 if q["number"] == q_num and q.get("points") is None:

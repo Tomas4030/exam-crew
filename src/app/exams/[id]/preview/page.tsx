@@ -11,7 +11,7 @@ interface Asset {
   crops?: { context?: CropInfo; visual?: CropInfo; full?: CropInfo };
   crop?: CropInfo;
 }
-interface Source { sourceId: string; groupId?: string; label?: string; crops?: { full?: CropInfo }; assetRefs?: string[]; }
+interface Source { sourceId: string; groupId?: string; label?: string; pageStart?: number; crops?: { full?: CropInfo }; assetRefs?: string[]; }
 interface Question {
   questionId: string; number: string; type: string; statement: string;
   options?: Option[]; group?: string; groupId?: string; displayNumber?: string;
@@ -46,13 +46,11 @@ export default function PreviewPage() {
     const allRefs = [...(q.imageRefs || []), ...(q.assetRefs || [])];
 
     // From sourceRefs
-    if (q.sourceRefs) {
+    if (q.sourceRefs && q.sourceRefs.length > 0) {
       for (const ref of q.sourceRefs) {
-        // Check sources
         const src = data.sources?.find(s => s.sourceId === ref.sourceId);
         if (src?.crops?.full?.url) { urls.push(src.crops.full.url); continue; }
         if (src?.assetRefs) allRefs.push(...src.assetRefs);
-        // Check sourceGroups
         const sg = data.sourceGroups?.find(g => g.id === ref.sourceId);
         if (sg?.crops?.context?.url) urls.push(sg.crops.context.url);
         if (ref.childId) allRefs.push(ref.childId);
@@ -68,25 +66,42 @@ export default function PreviewPage() {
       const asset = data.assets.find(a => a.id === refId);
       if (!asset) continue;
       const url = asset.crops?.context?.url || asset.crops?.visual?.url || asset.crop?.url;
-      if (url && asset.crops?.context?.status !== 'failed') urls.push(url);
+      if (url) urls.push(url);
     }
     return [...new Set(urls)];
   };
 
-  // Also get images from parent question if this is a sub-question
+  // Get images including group-based source lookup
   const getAllImages = (q: Question): string[] => {
-    const imgs = getImages(q);
+    let imgs = getImages(q);
+
+    // Inherit from parent question
     if (q.parentQuestion) {
       const parent = data.questions.find(p => p.questionId === q.parentQuestion);
-      if (parent) imgs.unshift(...getImages(parent));
+      if (parent) imgs = [...getImages(parent), ...imgs];
     }
-    // If no direct refs, check if there's an asset on the same page
-    if (imgs.length === 0) {
-      const pageAssets = data.assets.filter(a => a.page === q.sourcePage && a.type !== 'embedded_image');
+
+    if (imgs.length > 0) return [...new Set(imgs)];
+
+    // Fallback: find sources in the same group on pages BEFORE this question
+    if (q.groupId && data.sources) {
+      const groupSources = data.sources.filter(s => s.groupId === q.groupId && s.pageStart && s.pageStart < (q.sourcePage || 999));
+      for (const src of groupSources) {
+        if (src.crops?.full?.url) imgs.push(src.crops.full.url);
+      }
+    }
+    if (imgs.length > 0) return [...new Set(imgs)];
+
+    // Fallback: assets on same page or adjacent source pages
+    const qPage = q.sourcePage || 0;
+    const nearPages = [qPage, qPage - 1, qPage - 2];
+    for (const p of nearPages) {
+      const pageAssets = data.assets.filter(a => a.page === p && a.type !== 'embedded_image');
       for (const a of pageAssets) {
         const url = a.crops?.context?.url || a.crop?.url;
-        if (url && a.crops?.context?.status !== 'failed') imgs.push(url);
+        if (url) imgs.push(url);
       }
+      if (imgs.length > 0) break;
     }
     return [...new Set(imgs)];
   };
