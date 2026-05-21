@@ -16,6 +16,7 @@ interface Question {
   questionId: string; number: string; type: string; statement: string;
   options?: Option[]; group?: string; groupId?: string; displayNumber?: string;
   imageRefs?: string[]; assetRefs?: string[]; sourceRefs?: { sourceId: string; childId?: string; mode: string }[];
+  media?: { type: string; url: string; sourceId?: string; label?: string }[];
   points?: number; sourcePage?: number; parentQuestion?: string | null; isGroup?: boolean;
 }
 interface ExamData {
@@ -40,75 +41,79 @@ export default function PreviewPage() {
   const current = questions[selected];
   if (!current) return <div className="p-8">Sem perguntas.</div>;
 
+  // Get best URL for an asset (embedded > visual > context)
+  const getBestUrl = (asset?: Asset): string | null => {
+    if (!asset) return null;
+    // Embedded images are always clean (extracted directly from PDF)
+    if (asset.type === 'embedded_image' && asset.crop?.url) return asset.crop.url;
+    // Visual crop (clean isolated figure)
+    if (asset.crops?.visual?.status === 'success' && asset.crops.visual.url) return asset.crops.visual.url;
+    // Context crop only if successful
+    if (asset.crops?.context?.status === 'success' && asset.crops.context.url) return asset.crops.context.url;
+    // Generic crop fallback
+    if (asset.crop?.status === 'success' && asset.crop.url) return asset.crop.url;
+    return null;
+  };
+
   // Get images for current question
-  const getImages = (q: Question): string[] => {
+  const getAllImages = (q: Question): string[] => {
+    // Priority 1: question.media (resolved by backend)
+    if (q.media && q.media.length > 0) {
+      return q.media.map(m => m.url).filter(Boolean);
+    }
+
     const urls: string[] = [];
 
-    // From sourceRefs (best source for History — full document crops)
+    // Priority 2: sourceRefs → find assets (prefer embedded)
     if (q.sourceRefs && q.sourceRefs.length > 0) {
       for (const ref of q.sourceRefs) {
         const src = data.sources?.find(s => s.sourceId === ref.sourceId);
-        if (src?.crops?.full?.url) {
-          urls.push(src.crops.full.url);
-        } else if (src) {
-          // Prefer embedded_image on the source page, then asset crops
-          const page = src.pageStart;
-          const embedded = data.assets.find(a => a.page === page && a.type === 'embedded_image' && a.crop?.url);
-          if (embedded?.crop?.url) {
-            urls.push(embedded.crop.url);
-          } else if (src.assetRefs) {
-            for (const aId of src.assetRefs) {
-              const asset = data.assets.find(a => a.id === aId);
-              const url = asset?.crops?.context?.url || asset?.crop?.url;
-              if (url) urls.push(url);
-            }
+        if (!src) continue;
+
+        // Specific child
+        if (ref.childId && src.assetRefs?.length) {
+          const letter = ref.childId.split('_').pop() || 'a';
+          const idx = letter.charCodeAt(0) - 'a'.charCodeAt(0);
+          const asset = data.assets.find(a => a.id === src.assetRefs![idx]);
+          const url = getBestUrl(asset);
+          if (url) { urls.push(url); continue; }
+        }
+
+        // Full source — show asset images
+        if (src.assetRefs?.length) {
+          for (const aId of src.assetRefs) {
+            const asset = data.assets.find(a => a.id === aId);
+            const url = getBestUrl(asset);
+            if (url) urls.push(url);
+          }
+          if (urls.length > 0) continue;
+        }
+
+        // Last resort: source full crop
+        if (src.crops?.full?.url) urls.push(src.crops.full.url);
+      }
+    }
+    if (urls.length > 0) return [...new Set(urls)];
+
+    // Priority 3: direct refs
+    for (const refId of [...(q.imageRefs || []), ...(q.assetRefs || [])]) {
+      const url = getBestUrl(data.assets.find(a => a.id === refId));
+      if (url) urls.push(url);
+    }
+    if (urls.length > 0) return [...new Set(urls)];
+
+    // Priority 4: group fallback
+    if (q.groupId && data.sources) {
+      for (const src of data.sources.filter(s => s.groupId === q.groupId && (s.pageStart || 0) < (q.sourcePage || 999))) {
+        if (src.assetRefs?.length) {
+          for (const aId of src.assetRefs) {
+            const url = getBestUrl(data.assets.find(a => a.id === aId));
+            if (url) urls.push(url);
           }
         }
       }
     }
-
-    if (urls.length > 0) return [...new Set(urls)];
-
-    // From direct asset refs (imageRefs, assetRefs)
-    const allRefs = [...(q.imageRefs || []), ...(q.assetRefs || [])];
-    for (const refId of allRefs) {
-      const asset = data.assets.find(a => a.id === refId);
-      if (!asset) continue;
-      const url = asset.crops?.context?.url || asset.crop?.url;
-      if (url) urls.push(url);
-    }
     return [...new Set(urls)];
-  };
-
-  // Get images including group-based source lookup
-  const getAllImages = (q: Question): string[] => {
-    let imgs = getImages(q);
-
-    // Inherit from parent question
-    if (q.parentQuestion) {
-      const parent = data.questions.find(p => p.questionId === q.parentQuestion);
-      if (parent) imgs = [...getImages(parent), ...imgs];
-    }
-
-    if (imgs.length > 0) return [...new Set(imgs)];
-
-    // Fallback: find sources in the same group (full document crops)
-    if (q.groupId && data.sources) {
-      const groupSources = data.sources.filter(s =>
-        s.groupId === q.groupId && s.pageStart && s.pageStart < (q.sourcePage || 999)
-      );
-      for (const src of groupSources) {
-        if (src.crops?.full?.url) {
-          imgs.push(src.crops.full.url);
-        } else {
-          // Prefer embedded_image on source page
-          const embedded = data.assets.find(a => a.page === src.pageStart && a.type === 'embedded_image' && a.crop?.url);
-          if (embedded?.crop?.url) imgs.push(embedded.crop.url);
-        }
-      }
-    }
-
-    return [...new Set(imgs)];
   };
 
   const images = getAllImages(current);

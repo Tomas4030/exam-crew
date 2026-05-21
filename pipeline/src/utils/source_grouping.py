@@ -65,6 +65,9 @@ def apply_source_grouping(output: dict, subject_profile: dict, extraction: dict 
     # ── Step 5: Resolve sourceRefs by text within group ───────────
     _resolve_scoped_refs(questions, sources)
 
+    # ── Step 6: Generate media field on questions ─────────────────
+    _generate_media(questions, sources, assets, output.get("exam_id", ""))
+
     output["sources"] = sources
     return output
 
@@ -232,9 +235,12 @@ def _detect_sources(assets: list[dict], questions: list[dict],
             page = docs[doc_num]
             source_id = f"{gid}_documento_{doc_num}"
 
-            # Find assets on this page
-            page_assets = [a for a in assets
-                           if a.get("page") == page and a.get("type") != "embedded_image"]
+            # Find assets on this page — prefer embedded (clean PDF images)
+            embedded = [a for a in assets
+                        if a.get("page") == page and a.get("type") == "embedded_image"]
+            detected = [a for a in assets
+                        if a.get("page") == page and a.get("type") != "embedded_image"]
+            page_assets = embedded if embedded else detected
 
             # Determine kind and children
             kind = _infer_kind(page_assets, page_texts.get(page, ""))
@@ -413,3 +419,102 @@ def _build_description(assets: list[dict], page_text: str) -> str:
         if len(line) > 20 and not line.startswith("Prova"):
             return line[:200]
     return f"{len(assets)} elemento(s)"
+
+
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 6: Link embedded images to sources
+# ══════════════════════════════════════════════════════════════════
+
+def _link_embedded_images(assets: list[dict], sources: list[dict]):
+    """Replace bbox-crop assetRefs with embedded_image assets when available.
+
+    Embedded images are the real raster images extracted from the PDF —
+    much better quality than bbox-estimated context crops for paintings,
+    caricatures, photos, etc.
+    """
+    # Index embedded images by page
+    embedded_by_page: dict[int, list[dict]] = defaultdict(list)
+    for a in assets:
+        if a.get("type") == "embedded_image" and a.get("crop", {}).get("url"):
+            embedded_by_page[a["page"]].append(a)
+
+    for source in sources:
+        page = source.get("pageStart")
+        if not page:
+            continue
+
+        page_embedded = sorted(embedded_by_page.get(page, []), key=lambda a: a["id"])
+        if not page_embedded:
+            continue
+
+        # If source is image_set and embedded count matches children count, map 1:1
+        if source["kind"] == "image_set" and source["children"]:
+            if len(page_embedded) == len(source["children"]):
+                source["assetRefs"] = [e["id"] for e in page_embedded]
+                source["_embedded"] = True
+        # Single image source: use the embedded image
+        elif source["kind"] == "image" and len(page_embedded) >= 1:
+            source["assetRefs"] = [page_embedded[0]["id"]]
+            source["_embedded"] = True
+
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 7: Generate media field on questions
+# ══════════════════════════════════════════════════════════════════
+
+def _generate_media(questions: list[dict], sources: list[dict], assets: list[dict], exam_id: str):
+    """Generate a `media` list on each question with resolved final asset URLs.
+
+    This is the single source of truth for what the frontend/importer should display.
+    """
+    asset_map = {a["id"]: a for a in assets}
+
+    def _get_url(asset_id: str) -> str | None:
+        a = asset_map.get(asset_id)
+        if not a:
+            return None
+        return a.get("crop", {}).get("url") or a.get("crops", {}).get("context", {}).get("url")
+
+    source_map = {s["sourceId"]: s for s in sources}
+
+    for q in questions:
+        media = []
+
+        if q.get("sourceRefs"):
+            for ref in q["sourceRefs"]:
+                src = source_map.get(ref.get("sourceId", ""))
+                if not src:
+                    continue
+
+                if ref.get("childId") and src.get("assetRefs"):
+                    # Specific child — find by letter index
+                    letter = (ref["childId"].split("_")[-1] or "a")
+                    idx = ord(letter[0]) - ord('a') if letter.isalpha() else 0
+                    if 0 <= idx < len(src["assetRefs"]):
+                        url = _get_url(src["assetRefs"][idx])
+                        if url:
+                            media.append({"type": "image", "url": url, "sourceId": src["sourceId"], "label": f"Imagem {letter.upper()}"})
+                elif src.get("assetRefs"):
+                    # Full source — show all assets
+                    for i, aid in enumerate(src["assetRefs"]):
+                        url = _get_url(aid)
+                        if url:
+                            letter = chr(ord('a') + i)
+                            label = src.get("label", "")
+                            if len(src["assetRefs"]) > 1:
+                                label = f"{label} - {letter.upper()}" if label else letter.upper()
+                            media.append({"type": "image", "url": url, "sourceId": src["sourceId"], "label": label})
+                elif src.get("crops", {}).get("full", {}).get("url"):
+                    # Text source with full crop
+                    media.append({"type": "document", "url": src["crops"]["full"]["url"], "sourceId": src["sourceId"], "label": src.get("label", "")})
+
+        # Fallback: direct assetRefs/imageRefs
+        if not media:
+            for aid in (q.get("imageRefs", []) + q.get("assetRefs", [])):
+                url = _get_url(aid)
+                if url:
+                    media.append({"type": "image", "url": url, "assetId": aid})
+
+        if media:
+            q["media"] = media
