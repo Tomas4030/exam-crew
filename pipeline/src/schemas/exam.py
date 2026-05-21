@@ -67,6 +67,30 @@ class AssetCrops(BaseModel):
     visual: CropInfo = CropInfo()
 
 
+class SourceRef(BaseModel):
+    """Reference from a question to a source group or specific child."""
+    sourceId: str
+    childId: Optional[str] = None
+    mode: str = "full_group"  # full_group | specific_child
+
+
+class Source(BaseModel):
+    """A semantic document/source within a group (e.g. 'Documento 1' of Grupo II).
+
+    Separate from physical assets: a Source is the logical entity,
+    assets are the physical crops/images that represent it.
+    """
+    sourceId: str  # e.g. "grupo_ii_documento_1"
+    groupId: str  # e.g. "grupo_ii"
+    label: str  # e.g. "Documento 1"
+    kind: str = "image"  # image_set | text_source | caricature | table | graph | map | mixed
+    pageStart: int = 0
+    pageEnd: Optional[int] = None
+    description: str = ""
+    children: list[str] = Field(default_factory=list)  # child sourceIds for composite docs
+    assetRefs: list[str] = Field(default_factory=list)  # physical asset IDs
+
+
 class Asset(BaseModel):
     id: str
     type: AssetType
@@ -77,11 +101,42 @@ class Asset(BaseModel):
     linkedQuestions: list[str] = Field(default_factory=list)
     hallucination_risk: bool = False
     crops: Optional[AssetCrops] = None
+    # Source grouping fields
+    parentAssetId: Optional[str] = None  # If this is a child of a source_group
+
+
+class SourceGroup(BaseModel):
+    """A document/source group that contains multiple related assets."""
+    id: str
+    type: str = "source_group"
+    sourceType: str = "image_set"  # image_set | text_document | map_set | mixed
+    page: int
+    label: str = ""
+    description: str = ""
+    children: list[str] = Field(default_factory=list)
+    crops: Optional[AssetCrops] = None
+
+
+class MathSpan(BaseModel):
+    plain: str
+    latex: str
+    confidence: float = 0.9
+
+
+class TextQuality(BaseModel):
+    status: str = "pending"  # ok | needs_review | failed
+    source: str = "pdf_text_raw"  # vision_latex_normalized | pdf_text_raw | manual_fallback
+    hasCorruptChars: bool = False
+    hasLatex: bool = False
+    mathHeavy: bool = False
+    requiresMathReview: bool = False
+    checks: dict[str, bool] = Field(default_factory=dict)
 
 
 class Option(BaseModel):
     letter: str
     text: str
+    latex: Optional[str] = None
 
 
 class Warning(BaseModel):
@@ -105,12 +160,22 @@ class Question(BaseModel):
     type: QuestionType
     sourcePage: int
     statement: str
+    statementPlain: Optional[str] = None
+    statementLatex: Optional[str] = None
+    sourceTextRaw: Optional[str] = None
+    mathSpans: list[MathSpan] = Field(default_factory=list)
+    textQuality: Optional[TextQuality] = None
     options: list[Option] = []
     # Asset references
     imageRefs: list[str] = []
     tableRefs: list[str] = []
     assetRefs: list[str] = Field(default_factory=list, description="All asset IDs this question depends on")
+    sourceRefs: list[SourceRef] = Field(default_factory=list, description="References to source groups/documents")
     # Structure
+    groupId: Optional[str] = None  # e.g. "grupo_ii" — scopes this question
+    group: Optional[str] = None  # e.g. "Grupo I", "Grupo II"
+    displayNumber: Optional[str] = None  # e.g. "Grupo II, item 1"
+    section: Optional[str] = None  # e.g. "Parte A", "Parte B"
     parentQuestion: Optional[str] = None
     subQuestions: list[str] = []
     sectionId: Optional[str] = None
@@ -161,6 +226,8 @@ class ExamOutput(BaseModel):
     needsHumanReview: bool = True
     metadata: ExamMetadata = ExamMetadata()
     sections: list[Section] = []
+    sources: list[Source] = Field(default_factory=list)
+    sourceGroups: list[SourceGroup] = Field(default_factory=list)
     assets: list[Asset] = []
     questions: list[Question] = []
     warnings: list[Warning] = []

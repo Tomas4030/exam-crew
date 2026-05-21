@@ -23,6 +23,9 @@ def normalize(output: dict) -> dict:
     # ── 1. Reassociate figures by statement mentions ─────────────
     _repair_figure_associations(questions, assets)
 
+    # ── 1b. Resolve source group references in questions ─────────
+    _resolve_source_refs(questions, output.get("sourceGroups", []))
+
     # ── 2. Normalize bbox_estimate → bbox ────────────────────────
     for asset in assets:
         if asset.get("bbox_estimate") and not asset.get("bbox"):
@@ -145,3 +148,69 @@ def _remove_roman_numeral_questions(questions: list[dict]):
     # Remove in reverse order to preserve indices
     for i in reversed(to_remove):
         questions.pop(i)
+
+
+def _resolve_source_refs(questions: list[dict], source_groups: list[dict]):
+    """Resolve remaining textual references (documento X, imagem B) to sourceRefs.
+
+    This complements source_grouping.py — catches any references that the
+    source_grouping step might have missed (e.g. questions added during retry).
+    """
+    if not source_groups:
+        return
+
+    # Build lookup
+    group_by_doc_num: dict[str, dict] = {}
+    for sg in source_groups:
+        num_match = re.search(r'(\d+)', sg.get("label", ""))
+        if num_match:
+            group_by_doc_num[num_match.group(1)] = sg
+
+    for q in questions:
+        # Skip if already has sourceRefs
+        if q.get("sourceRefs"):
+            continue
+
+        text = (q.get("statement") or "") + " " + (q.get("rawText") or "")
+        if not text.strip():
+            continue
+
+        # Check for document references
+        doc_nums = re.findall(r'[Dd]ocumento\s+(\d+)', text)
+        doc_nums += re.findall(r'[Dd]oc\.?\s*(\d+)', text)
+
+        source_refs = []
+        for doc_num in set(doc_nums):
+            sg = group_by_doc_num.get(doc_num)
+            if not sg:
+                continue
+
+            # Check for specific child references
+            child_letters = re.findall(r'[Ii]magem\s+([A-Z])', text, re.IGNORECASE)
+            child_letters += re.findall(r'[Ff]igura\s+([A-Z])', text, re.IGNORECASE)
+            child_letters = list(set(c.upper() for c in child_letters))
+
+            if child_letters:
+                for letter in child_letters:
+                    child_id = _find_child_in_group(sg, letter)
+                    if child_id:
+                        source_refs.append({"sourceId": sg["id"], "childId": child_id, "mode": "specific_child"})
+                        if child_id not in q.get("assetRefs", []):
+                            q.setdefault("assetRefs", []).append(child_id)
+            else:
+                source_refs.append({"sourceId": sg["id"], "childId": None, "mode": "full_group"})
+
+            if sg["id"] not in q.get("assetRefs", []):
+                q.setdefault("assetRefs", []).append(sg["id"])
+
+        if source_refs:
+            q["sourceRefs"] = source_refs
+
+
+def _find_child_in_group(source_group: dict, letter: str) -> str | None:
+    """Find a child ID by letter in a source group."""
+    letter_lower = letter.lower()
+    for child_id in source_group.get("children", []):
+        if f"_{letter_lower}_" in child_id or child_id.endswith(f"_{letter_lower}"):
+            return child_id
+    return None

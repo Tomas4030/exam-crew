@@ -59,6 +59,11 @@ def validate_and_fix(output: dict) -> dict:
 
     # ── Rule 4: Asset references exist ───────────────────────────
     asset_ids = {a["id"] for a in assets}
+    # Also accept sourceGroup IDs and source IDs as valid references
+    for sg in output.get("sourceGroups", []):
+        asset_ids.add(sg.get("id", ""))
+    for src in output.get("sources", []):
+        asset_ids.add(src.get("sourceId", ""))
     for q in questions:
         for ref_list_name in ("imageRefs", "tableRefs", "assetRefs"):
             for ref in q.get(ref_list_name, []):
@@ -73,14 +78,16 @@ def validate_and_fix(output: dict) -> dict:
             warnings.append({"type": "broken_parent", "message": f"Q{q['number']} references parent '{parent}' which doesn't exist", "questionId": q["questionId"]})
 
     # ── Rule 6: Question number gaps ─────────────────────────────
-    # Groups count as valid main questions
+    # If questions have group/section fields, skip gap detection (History-style exams
+    # have repeated numbering across groups: Grupo I Q1-5, Grupo II Q1-3, etc.)
+    has_groups = any(q.get("group") or q.get("groupId") for q in questions)
     main_numbers = sorted(set(
         int(q["number"]) for q in questions
         if q["number"].isdigit() and (
             not q.get("parentQuestion") or q.get("isGroup")
         )
     ))
-    if main_numbers:
+    if not has_groups and main_numbers:
         # Always start from 1 — if Q1 is missing, detect it
         expected = list(range(1, main_numbers[-1] + 1))
         missing = [n for n in expected if n not in main_numbers]
@@ -111,9 +118,25 @@ def validate_and_fix(output: dict) -> dict:
         warnings.append({"type": "estimated_bbox_only", "message": f"{len(estimated_only)} assets have estimated bbox only — crop may need verification"})
 
     # ── Rule 9: Hallucination detection ──────────────────────────
+    # Build set of assets that belong to source groups (not hallucinations)
+    source_group_children = set()
+    for sg in output.get("sourceGroups", []):
+        source_group_children.update(sg.get("children", []))
+        source_group_children.add(sg.get("id", ""))
+    # Also include assets referenced by Source entities
+    for src in output.get("sources", []):
+        source_group_children.update(src.get("assetRefs", []))
+    # Also detect assets with parentAssetId
+    for asset in assets:
+        if asset.get("parentAssetId"):
+            source_group_children.add(asset["id"])
+
     for asset in assets:
         if asset.get("type") in ("embedded_image",):
             continue  # Real images from PDF are never hallucinated
+        # Skip assets that are part of source groups
+        if asset["id"] in source_group_children:
+            continue
         # Check if any question references this asset
         aid = asset["id"]
         referenced = any(
@@ -123,8 +146,14 @@ def validate_and_fix(output: dict) -> dict:
         if not referenced:
             # Check linkedQuestions
             if not asset.get("linkedQuestions"):
-                asset["hallucination_risk"] = True
-                warnings.append({"type": "possible_hallucination", "message": f"Asset '{aid}' (page {asset.get('page')}) not referenced by any question", "assetId": aid})
+                # Check if it's on a source page (page with no questions)
+                pages_with_questions = {q["sourcePage"] for q in questions}
+                if asset.get("page") not in pages_with_questions:
+                    # Source material on a document page — not hallucination
+                    warnings.append({"type": "source_asset_pending_reference", "message": f"Asset '{aid}' (page {asset.get('page')}) is on a source page — pending question linkage", "assetId": aid})
+                else:
+                    asset["hallucination_risk"] = True
+                    warnings.append({"type": "possible_hallucination", "message": f"Asset '{aid}' (page {asset.get('page')}) not referenced by any question", "assetId": aid})
 
     # ── Rule 10: Merge assetRefs from imageRefs + tableRefs ──────
     for q in questions:
@@ -226,6 +255,10 @@ def validate_and_fix(output: dict) -> dict:
     has_wrong_refs = any(w["type"] == "wrong_asset_reference" for w in warnings)
     has_missing_table = any(w["type"] == "missing_table_data" for w in warnings)
     has_math_review = any(q.get("mathHeavy") and q.get("needsHumanReview") for q in questions)
+    has_text_quality_issue = any(
+        q.get("textQuality", {}).get("status") == "needs_review" and q.get("textQuality", {}).get("requiresMathReview")
+        for q in questions
+    )
     any_review = any(q.get("needsHumanReview") for q in questions)
 
     # Check: real main questions (digit numbers, no parent) with points:null
@@ -240,7 +273,8 @@ def validate_and_fix(output: dict) -> dict:
         })
 
     # Check: mainQuestions count mismatch (expected = max question number)
-    if main_numbers:
+    # Skip for grouped exams where numbering resets per group
+    if main_numbers and not has_groups:
         expected_count = main_numbers[-1]  # e.g. if max is 15, expect 15 main questions
         actual_count = len(main_numbers)
         if actual_count != expected_count:
@@ -262,6 +296,8 @@ def validate_and_fix(output: dict) -> dict:
     elif has_missing_points or not no_high_warnings:
         output["processingStatus"] = "needs_review"
     elif has_hallucinations or has_broken_refs or has_wrong_refs or has_missing_table:
+        output["processingStatus"] = "needs_review"
+    elif has_text_quality_issue:
         output["processingStatus"] = "needs_review"
     elif has_math_review or any_review:
         output["processingStatus"] = "completed_with_warnings"

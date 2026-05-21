@@ -8,7 +8,9 @@ from .tools.vision_tool import analyze_exam_pages
 from .utils.progress import report_progress
 from .utils.validator import validate_and_fix
 from .utils.normalizer import normalize
+from .utils.math_normalize import math_normalize
 from .utils.subjects import detect_subject, is_formula_page
+from .utils.source_grouping import apply_source_grouping
 
 
 class ExamProcessingCrew:
@@ -99,7 +101,7 @@ Text:
         # Step 3: Assemble
         report_progress("assemble", "Building structured output")
         self._last_page_results = page_results  # Store for retry scoring re-application
-        output = self._assemble_output(extraction, page_results)
+        output = self._assemble_output(extraction, page_results, subject_profile)
         output["metadata"]["subject"] = subject_key.replace("_", " ").title() if subject_key != "unknown" else None
         output["metadata"]["formula_pages"] = formula_pages
 
@@ -117,7 +119,11 @@ Text:
                         asset["rows"] = table_data.get("rows", [])
                         report_progress("table", f"Extracted {len(asset['rows'])} rows from {asset['id']}")
 
-        # Step 3.5: Normalize (deterministic corrections)
+        # Step 3.5: Source grouping (for History, Portuguese, etc.)
+        report_progress("source_grouping", "Detecting source/document pages")
+        output = apply_source_grouping(output, subject_profile)
+
+        # Step 3.5b: Normalize (deterministic corrections)
         report_progress("normalize", "Applying deterministic corrections")
         output = normalize(output)
 
@@ -128,6 +134,10 @@ Text:
         output["_pdf_path"] = self.pdf_path
         output = crop_assets(output, extraction, crop_output_dir)
         output.pop("_pdf_path", None)
+
+        # Step 3.8: Math normalization (LaTeX, textQuality)
+        report_progress("math_normalize", "Normalizing mathematical text")
+        output = math_normalize(output, extraction)
 
         # Step 4: Validate
         report_progress("validate", "Running post-processing validation")
@@ -407,13 +417,16 @@ If question {mq} is truly not on this page, respond: {{"number": "{mq}", "statem
 
         return metadata
 
-    def _assemble_output(self, extraction: dict, page_results: list[dict]) -> dict:
+    def _assemble_output(self, extraction: dict, page_results: list[dict], subject_profile: dict = None) -> dict:
         """Combine extraction data + vision results into final ExamOutput."""
         all_questions = []
         all_assets = []
         all_warnings = []
         seen_ids = set()
         group_questions = {}  # track parent groups
+
+        # Build raw text lookup per page (for sourceTextRaw)
+        _page_raw_text = {p["page"]: p.get("text", "") for p in extraction.get("pages", [])}
 
         # Extract metadata
         metadata = self._extract_metadata(page_results, extraction)
@@ -600,6 +613,7 @@ If question {mq} is truly not on this page, respond: {{"number": "{mq}", "statem
                     "type": q.get("type", "open_answer"),
                     "sourcePage": page_num,
                     "statement": statement,
+                    "sourceTextRaw": _page_raw_text.get(page_num, ""),
                     "rawText": q.get("rawText") or None,
                     "blanks": q.get("blanks") or None,
                     "options": q.get("options", []),
@@ -708,11 +722,13 @@ If question {mq} is truly not on this page, respond: {{"number": "{mq}", "statem
                 asset["bbox_estimate"] = {"x_pct": 5, "y_pct": 20, "w_pct": 90, "h_pct": 30}
 
         # ── Fix 6: Sequence check — emit warnings for missing questions ────
+        # Skip for source-grouping subjects (History, etc.) where numbering resets per group
+        has_source_grouping = subject_profile.get("has_source_grouping", False) if subject_profile else False
         main_numbers = sorted(set(
             int(q["number"]) for q in all_questions
             if q["number"].isdigit() and not q.get("parentQuestion")
         ))
-        if main_numbers:
+        if main_numbers and not has_source_grouping:
             # Always start from 1
             for expected_num in range(1, main_numbers[-1] + 1):
                 if expected_num not in main_numbers:

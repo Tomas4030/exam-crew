@@ -7,6 +7,7 @@ SUBJECT_PROFILES = {
         "formula_sheet_hint": "formulário",  # text to detect formula pages
         "latex_heavy": True,
         "has_excerpts": False,
+        "has_source_grouping": False,
         "question_types": ["multiple_choice", "open_answer", "calculation", "proof", "multi_blank_choice"],
     },
     "fisica_quimica": {
@@ -15,6 +16,7 @@ SUBJECT_PROFILES = {
         "formula_sheet_hint": "formulário",
         "latex_heavy": True,
         "has_excerpts": False,
+        "has_source_grouping": False,
         "question_types": ["multiple_choice", "open_answer", "calculation"],
     },
     "portugues": {
@@ -22,6 +24,7 @@ SUBJECT_PROFILES = {
         "has_formula_sheet": False,
         "latex_heavy": False,
         "has_excerpts": True,
+        "has_source_grouping": True,
         "question_types": ["multiple_choice", "open_answer", "essay", "short_answer"],
     },
     "historia_a": {
@@ -29,6 +32,7 @@ SUBJECT_PROFILES = {
         "has_formula_sheet": False,
         "latex_heavy": False,
         "has_excerpts": True,
+        "has_source_grouping": True,
         "question_types": ["document_analysis", "short_answer", "essay"],
     },
     "biologia_geologia": {
@@ -36,13 +40,31 @@ SUBJECT_PROFILES = {
         "has_formula_sheet": False,
         "latex_heavy": False,
         "has_excerpts": False,
+        "has_source_grouping": False,
         "question_types": ["multiple_choice", "open_answer", "classification", "ordering"],
+    },
+    "geografia_a": {
+        "keywords": ["geografia a", "geografia", "719"],
+        "has_formula_sheet": False,
+        "latex_heavy": False,
+        "has_excerpts": True,
+        "has_source_grouping": True,
+        "question_types": ["multiple_choice", "open_answer", "document_analysis"],
+    },
+    "filosofia": {
+        "keywords": ["filosofia", "714"],
+        "has_formula_sheet": False,
+        "latex_heavy": False,
+        "has_excerpts": True,
+        "has_source_grouping": True,
+        "question_types": ["multiple_choice", "open_answer", "essay"],
     },
     "unknown": {
         "keywords": [],
         "has_formula_sheet": False,
         "latex_heavy": False,
         "has_excerpts": False,
+        "has_source_grouping": False,
         "question_types": ["multiple_choice", "open_answer"],
     },
 }

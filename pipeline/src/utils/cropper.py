@@ -574,6 +574,40 @@ def crop_assets(output: dict, extraction: dict, output_dir: Path) -> dict:
             asset["crops"] = {"context": err, "visual": err}
             asset["crop"] = err
 
+    # ── Source document crops (for History and similar) ────────────
+    # Generate full-page crops for source documents so legends/sources are preserved
+    sources_dir = output_dir / "assets" / "sources"
+    sources_dir.mkdir(parents=True, exist_ok=True)
+
+    for source in output.get("sources", []):
+        page_num = source.get("pageStart")
+        if not page_num or page_num not in page_images:
+            continue
+        try:
+            img = Image.open(page_images[page_num])
+            # Full document crop: entire page content area (skip margins)
+            w, h = img.size
+            margin_x = int(w * 0.03)
+            margin_top = int(h * 0.05)
+            margin_bottom = int(h * 0.05)
+            full_crop = img.crop((margin_x, margin_top, w - margin_x, h - margin_bottom))
+
+            source_id = source.get("sourceId", f"source_p{page_num}")
+            full_filename = f"{source_id}_full.png"
+            full_path = sources_dir / full_filename
+            full_crop.save(str(full_path))
+
+            source.setdefault("crops", {})["full"] = {
+                "status": "success",
+                "method": "full_page_content",
+                "relativePath": f"assets/sources/{full_filename}",
+                "url": f"/api/exams/{exam_id}/assets/sources/{full_filename}",
+                "width": full_crop.width,
+                "height": full_crop.height,
+            }
+        except Exception:
+            pass
+
     return output
 
 
