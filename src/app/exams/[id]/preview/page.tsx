@@ -41,17 +41,13 @@ export default function PreviewPage() {
   const current = questions[selected];
   if (!current) return <div className="p-8">Sem perguntas.</div>;
 
-  // Get best URL for an asset (embedded > visual > context)
+  // Get best URL for an asset (embedded > visual > good context)
   const getBestUrl = (asset?: Asset): string | null => {
     if (!asset) return null;
-    // Embedded images are always clean (extracted directly from PDF)
     if (asset.type === 'embedded_image' && asset.crop?.url) return asset.crop.url;
-    // Visual crop (clean isolated figure)
     if (asset.crops?.visual?.status === 'success' && asset.crops.visual.url) return asset.crops.visual.url;
-    // Context crop only if successful
-    if (asset.crops?.context?.status === 'success' && asset.crops.context.url) return asset.crops.context.url;
-    // Generic crop fallback
     if (asset.crop?.status === 'success' && asset.crop.url) return asset.crop.url;
+    if (asset.crops?.context?.status === 'success' && asset.crops.context.url) return asset.crops.context.url;
     return null;
   };
 
@@ -82,7 +78,16 @@ export default function PreviewPage() {
         // Full source — show asset images
         if (src.assetRefs?.length) {
           for (const aId of src.assetRefs) {
-            const asset = data.assets.find(a => a.id === aId);
+            const url = getBestUrl(data.assets.find(a => a.id === aId));
+            if (url) urls.push(url);
+          }
+          if (urls.length > 0) continue;
+        }
+
+        // Fallback: embedded images on the source page
+        if (src.pageStart) {
+          const embedded = data.assets.filter(a => a.page === src.pageStart && a.type === 'embedded_image');
+          for (const asset of embedded) {
             const url = getBestUrl(asset);
             if (url) urls.push(url);
           }
