@@ -3,8 +3,9 @@
 import { useState, useEffect } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
+import MathText from '@/components/MathText';
 
-interface Option { letter: string; text: string; }
+interface Option { letter: string; text: string; latex?: string; }
 interface CropInfo { status: string; url?: string; }
 interface Asset {
   id: string; type: string; page: number; description?: string;
@@ -13,7 +14,7 @@ interface Asset {
 }
 interface Source { sourceId: string; groupId?: string; label?: string; pageStart?: number; crops?: { full?: CropInfo }; assetRefs?: string[]; }
 interface Question {
-  questionId: string; number: string; type: string; statement: string;
+  questionId: string; number: string; type: string; statement: string; statementLatex?: string;
   options?: Option[]; group?: string; groupId?: string; displayNumber?: string;
   imageRefs?: string[]; assetRefs?: string[]; sourceRefs?: { sourceId: string; childId?: string; mode: string }[];
   media?: { type: string; url: string; sourceId?: string; label?: string }[];
@@ -36,10 +37,17 @@ export default function PreviewPage() {
 
   if (!data) return <div className="min-h-screen flex items-center justify-center text-gray-500">A carregar...</div>;
 
-  // Filter to answerable questions (skip groups that are just containers)
-  const questions = data.questions.filter(q => !q.isGroup || (q.options && q.options.length > 0));
+  // Show all questions (including group parents with shared context)
+  const questions = data.questions.filter(q => q.statement || (q.options && q.options.length > 0));
   const current = questions[selected];
   if (!current) return <div className="p-8">Sem perguntas.</div>;
+
+  // Get parent context for sub-questions
+  const getParentContext = (q: Question): string | null => {
+    if (!q.parentQuestion) return null;
+    const parent = data.questions.find(p => p.questionId === q.parentQuestion);
+    return parent?.statement || null;
+  };
 
   // Get best URL for an asset (embedded > visual > good context)
   const getBestUrl = (asset?: Asset): string | null => {
@@ -111,9 +119,9 @@ export default function PreviewPage() {
     if (q.groupId && data.sources) {
       const text = (q.statement || '').toLowerCase();
       const groupSources = data.sources.filter(s => s.groupId === q.groupId);
-      const docNums = [...text.matchAll(/documentos?\s+((?:\d+\s*[,e]?\s*)+)/gi)]
+      const docNums = [...text.matchAll(/documentos?\s+((?:\d+[\s,e]*)+)/gi)]
         .flatMap(m => [...m[1].matchAll(/\d+/g)].map(n => n[0]));
-      const allDocs = /cada um dos documentos|dos documentos apresentados/i.test(text);
+      const allDocs = /cada um dos documentos|dos documentos apresentados|dos dois documentos|dos três documentos/i.test(text);
 
       const matched = allDocs ? groupSources : groupSources.filter(s =>
         docNums.some(n => s.sourceId.endsWith(`_${n}`))
@@ -210,8 +218,17 @@ export default function PreviewPage() {
               </div>
             )}
 
+            {/* Parent context for sub-questions */}
+            {getParentContext(current) && (
+              <div className="bg-gray-100 border-l-4 border-blue-300 p-4 rounded text-sm text-gray-700">
+                <MathText text={getParentContext(current)!} />
+              </div>
+            )}
+
             {/* Statement */}
-            <p className="text-gray-900 text-base leading-relaxed whitespace-pre-wrap">{current.statement}</p>
+            <div className="text-gray-900 text-base leading-relaxed">
+              <MathText text={current.statementLatex || current.statement} />
+            </div>
 
             {/* Answer area */}
             {current.type === 'multiple_choice' && current.options && current.options.length > 0 ? (
@@ -231,7 +248,7 @@ export default function PreviewPage() {
                       className="mt-0.5"
                     />
                     <span className="font-medium text-sm text-gray-500 w-5">({opt.letter})</span>
-                    <span className="text-gray-800">{opt.text}</span>
+                    <span className="text-gray-800"><MathText text={opt.latex || opt.text} /></span>
                   </label>
                 ))}
               </div>

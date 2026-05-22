@@ -313,13 +313,13 @@ def _resolve_scoped_refs(questions: list[dict], sources: list[dict]):
         for pat in _SOURCE_REF_PATTERNS:
             doc_nums.update(pat.findall(text))
 
-        # Match plural: "documentos 1 e 2", "documentos 1, 2 e 3"
-        plural_match = re.search(r'documentos?\s+((?:\d+\s*(?:[,e]\s*)?)+)', text, re.IGNORECASE)
-        if plural_match:
-            doc_nums.update(re.findall(r'\d+', plural_match.group(1)))
+        # Match plural: "documentos 1 e 2", "documentos 1, 2 e 3",
+        # "cada um dos documentos 1, 2 e 3"
+        for plural_m in re.finditer(r'documentos?\s+((?:\d+[\s,e]*)+)', text, re.IGNORECASE):
+            doc_nums.update(re.findall(r'\d+', plural_m.group(1)))
 
-        # Match "cada um dos documentos" / "dos documentos apresentados"
-        if not doc_nums and re.search(r'cada um dos documentos|dos documentos apresentados|documentos apresentados', text, re.IGNORECASE):
+        # "dos dois documentos" / "dos três documentos" / "cada um dos documentos" / "dos documentos apresentados"
+        if not doc_nums and re.search(r'cada um dos documentos|dos documentos apresentados|dos dois documentos|dos três documentos', text, re.IGNORECASE):
             for s in group_sources.get(gid, []):
                 source_refs.append({"sourceId": s["sourceId"], "childId": None, "mode": "full_group"})
 
