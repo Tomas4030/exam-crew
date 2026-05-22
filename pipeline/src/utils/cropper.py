@@ -575,7 +575,6 @@ def crop_assets(output: dict, extraction: dict, output_dir: Path) -> dict:
             asset["crop"] = err
 
     # ── Source document crops (for History and similar) ────────────
-    # Generate full-page crops for source documents so legends/sources are preserved
     sources_dir = output_dir / "assets" / "sources"
     sources_dir.mkdir(parents=True, exist_ok=True)
 
@@ -585,30 +584,92 @@ def crop_assets(output: dict, extraction: dict, output_dir: Path) -> dict:
             continue
         try:
             img = Image.open(page_images[page_num])
-            # Full document crop: entire page content area (skip margins)
-            w, h = img.size
-            margin_x = int(w * 0.03)
-            margin_top = int(h * 0.05)
-            margin_bottom = int(h * 0.05)
-            full_crop = img.crop((margin_x, margin_top, w - margin_x, h - margin_bottom))
-
             source_id = source.get("sourceId", f"source_p{page_num}")
             full_filename = f"{source_id}_full.png"
             full_path = sources_dir / full_filename
-            full_crop.save(str(full_path))
+
+            # Try precise crop by document label position in PDF
+            doc_num_match = re.search(r'_(\d+)$', source_id)
+            cropped = None
+            method = "full_page_content"
+
+            if pdf_path and doc_num_match:
+                doc_num = int(doc_num_match.group(1))
+                cropped = _crop_by_document_label(pdf_path, page_num, doc_num, img)
+                if cropped:
+                    method = "document_label_range"
+
+            # Fallback: full page content area
+            if not cropped:
+                w, h = img.size
+                margin_x = int(w * 0.03)
+                margin_top = int(h * 0.05)
+                margin_bottom = int(h * 0.05)
+                cropped = img.crop((margin_x, margin_top, w - margin_x, h - margin_bottom))
+
+            cropped.save(str(full_path))
 
             source.setdefault("crops", {})["full"] = {
                 "status": "success",
-                "method": "full_page_content",
+                "method": method,
                 "relativePath": f"assets/sources/{full_filename}",
                 "url": f"/api/exams/{exam_id}/assets/sources/{full_filename}",
-                "width": full_crop.width,
-                "height": full_crop.height,
+                "width": cropped.width,
+                "height": cropped.height,
             }
         except Exception:
             pass
 
     return output
+
+
+def _crop_by_document_label(pdf_path: str, page_num: int, doc_num: int, img: Image.Image):
+    """Crop from 'Documento N' label to next document label or page end."""
+    doc = fitz.open(pdf_path)
+    page = doc[page_num - 1]
+
+    current = page.search_for(f"Documento {doc_num}")
+    if not current:
+        doc.close()
+        return None
+
+    current_rect = sorted(current, key=lambda r: (r.y0, r.x0))[0]
+
+    # Find next document label on same page
+    next_y = None
+    for next_num in range(doc_num + 1, doc_num + 5):
+        found = page.search_for(f"Documento {next_num}")
+        found = [r for r in found if r.y0 > current_rect.y0 + 10]
+        if found:
+            next_y = sorted(found, key=lambda r: r.y0)[0].y0 - 8
+            break
+
+    # Also check for question numbers that would end the document zone
+    if not next_y:
+        for q_label in ["1.", "1. "]:
+            found = page.search_for(q_label)
+            found = [r for r in found if r.y0 > current_rect.y0 + 50]
+            if found:
+                next_y = sorted(found, key=lambda r: r.y0)[0].y0 - 8
+                break
+
+    page_rect = page.rect
+    y0 = max(0, current_rect.y0 - 6)
+    y1 = next_y if next_y else page_rect.height * 0.94
+    x0 = page_rect.width * 0.03
+    x1 = page_rect.width * 0.97
+
+    doc.close()
+
+    left = int(x0 * SCALE)
+    top = int(y0 * SCALE)
+    right = int(x1 * SCALE)
+    bottom = int(y1 * SCALE)
+
+    if right - left < 80 or bottom - top < 80:
+        return None
+
+    return img.crop((left, top, right, bottom))
 
 
 def _do_context_crop(img, label_rect, bbox, is_table, filename, context_dir, legacy_dir, exam_id) -> dict:
