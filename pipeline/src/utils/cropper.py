@@ -624,40 +624,81 @@ def crop_assets(output: dict, extraction: dict, output_dir: Path) -> dict:
 
 
 def _crop_by_document_label(pdf_path: str, page_num: int, doc_num: int, img: Image.Image):
-    """Crop from 'Documento N' label to next document label or page end."""
+    """Crop from 'Documento N' label to next document/question boundary."""
     doc = fitz.open(pdf_path)
     page = doc[page_num - 1]
+    page_rect = page.rect
 
-    current = page.search_for(f"Documento {doc_num}")
-    if not current:
-        doc.close()
-        return None
-
-    current_rect = sorted(current, key=lambda r: (r.y0, r.x0))[0]
-
-    # Find next document label on same page
-    next_y = None
-    for next_num in range(doc_num + 1, doc_num + 5):
-        found = page.search_for(f"Documento {next_num}")
-        found = [r for r in found if r.y0 > current_rect.y0 + 10]
-        if found:
-            next_y = sorted(found, key=lambda r: r.y0)[0].y0 - 8
+    # Find the label "Documento N" using block-level search for precision
+    current_y = None
+    blocks = page.get_text("dict")["blocks"]
+    for block in blocks:
+        if block.get("type") != 0:
+            continue
+        block_text = ""
+        for line in block.get("lines", []):
+            block_text += "".join(span["text"] for span in line.get("spans", []))
+        if re.search(rf'\bDocumento\s+{doc_num}\b', block_text, re.IGNORECASE):
+            current_y = block["bbox"][1]  # y0
             break
 
-    # Also check for question numbers that would end the document zone
-    if not next_y:
-        for q_label in ["1.", "1. "]:
-            found = page.search_for(q_label)
-            found = [r for r in found if r.y0 > current_rect.y0 + 50]
-            if found:
-                next_y = sorted(found, key=lambda r: r.y0)[0].y0 - 8
-                break
+    # Fallback to search_for
+    if current_y is None:
+        found = page.search_for(f"Documento {doc_num}")
+        if not found:
+            doc.close()
+            return None
+        current_y = sorted(found, key=lambda r: r.y0)[0].y0
 
-    page_rect = page.rect
-    y0 = max(0, current_rect.y0 - 6)
-    y1 = next_y if next_y else page_rect.height * 0.94
-    x0 = page_rect.width * 0.03
-    x1 = page_rect.width * 0.97
+    # Find boundaries below current label
+    boundaries = []
+
+    # Next document label
+    for next_num in range(doc_num + 1, doc_num + 6):
+        for block in blocks:
+            if block.get("type") != 0:
+                continue
+            block_text = ""
+            for line in block.get("lines", []):
+                block_text += "".join(span["text"] for span in line.get("spans", []))
+            if re.search(rf'\bDocumento\s+{next_num}\b', block_text, re.IGNORECASE):
+                by = block["bbox"][1]
+                if by > current_y + 10:
+                    boundaries.append(by)
+                    break
+        if boundaries:
+            break
+
+    # Question start pattern: "1. ", "2. " etc at start of block
+    for block in blocks:
+        if block.get("type") != 0:
+            continue
+        by = block["bbox"][1]
+        if by <= current_y + 40:
+            continue
+        for line in block.get("lines", []):
+            line_text = "".join(span["text"] for span in line.get("spans", []))
+            if re.match(r'^\s*\d+\.\s+\S', line_text):
+                boundaries.append(line["bbox"][1])
+                break
+        if len(boundaries) > 1:
+            break
+
+    # Page footer "Prova 623..."
+    for block in blocks:
+        if block.get("type") != 0:
+            continue
+        block_text = ""
+        for line in block.get("lines", []):
+            block_text += "".join(span["text"] for span in line.get("spans", []))
+        if re.match(r'Prova\s+\d+', block_text.strip()) and block["bbox"][1] > current_y + 40:
+            boundaries.append(block["bbox"][1])
+            break
+
+    y0 = max(0, current_y - 6)
+    y1 = min(boundaries) - 8 if boundaries else page_rect.height * 0.94
+    x0 = page_rect.width * 0.035
+    x1 = page_rect.width * 0.965
 
     doc.close()
 
@@ -666,7 +707,7 @@ def _crop_by_document_label(pdf_path: str, page_num: int, doc_num: int, img: Ima
     right = int(x1 * SCALE)
     bottom = int(y1 * SCALE)
 
-    if right - left < 80 or bottom - top < 80:
+    if right - left < 100 or bottom - top < 80:
         return None
 
     return img.crop((left, top, right, bottom))

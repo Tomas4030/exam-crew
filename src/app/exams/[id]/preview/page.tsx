@@ -12,7 +12,7 @@ interface Asset {
   crops?: { context?: CropInfo; visual?: CropInfo; full?: CropInfo };
   crop?: CropInfo;
 }
-interface Source { sourceId: string; groupId?: string; label?: string; pageStart?: number; crops?: { full?: CropInfo }; assetRefs?: string[]; }
+interface Source { sourceId: string; groupId?: string; label?: string; kind?: string; pageStart?: number; crops?: { full?: CropInfo }; assetRefs?: string[]; }
 interface Question {
   questionId: string; number: string; type: string; statement: string; statementLatex?: string;
   options?: Option[]; group?: string; groupId?: string; displayNumber?: string;
@@ -76,11 +76,22 @@ export default function PreviewPage() {
         const src = data.sources?.find(s => s.sourceId === ref.sourceId);
         if (!src) continue;
 
+        // Specific child image (e.g. "imagem B")
         if (ref.childId && src.assetRefs?.length) {
           const letter = ref.childId.split('_').pop() || 'a';
           const idx = letter.charCodeAt(0) - 'a'.charCodeAt(0);
           add(getBestUrl(data.assets.find(a => a.id === src.assetRefs![idx])));
-        } else if (src.assetRefs?.length) {
+        }
+        // For image_set sources (e.g. 4 images A/B/C/D), show embedded assets
+        else if (src.kind === 'image_set' && src.assetRefs?.length) {
+          for (const aId of src.assetRefs) add(getBestUrl(data.assets.find(a => a.id === aId)));
+        }
+        // For other sources (table, graph, text), prefer the document crop
+        else if (src.crops?.full?.url) {
+          add(src.crops.full.url);
+        }
+        // Fallback: try assetRefs anyway
+        else if (src.assetRefs?.length) {
           for (const aId of src.assetRefs) add(getBestUrl(data.assets.find(a => a.id === aId)));
         }
 
