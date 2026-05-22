@@ -107,6 +107,33 @@ export default function PreviewPage() {
     }
     if (urls.length > 0) return [...new Set(urls)];
 
+    // Priority 3.5: detect document references from question text
+    if (q.groupId && data.sources) {
+      const text = (q.statement || '').toLowerCase();
+      const groupSources = data.sources.filter(s => s.groupId === q.groupId);
+      const docNums = [...text.matchAll(/documentos?\s+((?:\d+\s*[,e]?\s*)+)/gi)]
+        .flatMap(m => [...m[1].matchAll(/\d+/g)].map(n => n[0]));
+      const allDocs = /cada um dos documentos|dos documentos apresentados/i.test(text);
+
+      const matched = allDocs ? groupSources : groupSources.filter(s =>
+        docNums.some(n => s.sourceId.endsWith(`_${n}`))
+      );
+
+      for (const src of matched) {
+        if (src.assetRefs?.length) {
+          for (const aId of src.assetRefs) {
+            const url = getBestUrl(data.assets.find(a => a.id === aId));
+            if (url) urls.push(url);
+          }
+        } else if (src.pageStart) {
+          const embedded = data.assets.filter(a => a.page === src.pageStart && a.type === 'embedded_image');
+          for (const asset of embedded) { const url = getBestUrl(asset); if (url) urls.push(url); }
+        }
+        if (urls.length === 0 && src.crops?.full?.url) urls.push(src.crops.full.url);
+      }
+    }
+    if (urls.length > 0) return [...new Set(urls)];
+
     // Priority 4: group fallback
     if (q.groupId && data.sources) {
       for (const src of data.sources.filter(s => s.groupId === q.groupId && (s.pageStart || 0) < (q.sourcePage || 999))) {

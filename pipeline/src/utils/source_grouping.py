@@ -284,7 +284,7 @@ def _detect_sources(assets: list[dict], questions: list[dict],
 # ══════════════════════════════════════════════════════════════════
 
 def _resolve_scoped_refs(questions: list[dict], sources: list[dict]):
-    """Resolve 'documento 1', 'imagem B' in question text within its group."""
+    """Resolve 'documento 1', 'documentos 1 e 2', 'imagem B' in question text within its group."""
     # Index: (groupId, doc_num_str) → source
     source_index: dict[tuple[str, str], dict] = {}
     for s in sources:
@@ -292,20 +292,36 @@ def _resolve_scoped_refs(questions: list[dict], sources: list[dict]):
         if m:
             source_index[(s["groupId"], m.group(1))] = s
 
+    # Group sources by groupId
+    group_sources: dict[str, list[dict]] = defaultdict(list)
+    for s in sources:
+        group_sources[s["groupId"]].append(s)
+
     for q in questions:
         gid = q.get("groupId")
         if not gid:
             continue
 
-        # Use statement only (not sourceTextRaw which has the whole page)
         text = q.get("statement") or ""
         if not text.strip():
             continue
 
         source_refs = []
         doc_nums = set()
+
+        # Match singular: "documento 1", "documento 2"
         for pat in _SOURCE_REF_PATTERNS:
             doc_nums.update(pat.findall(text))
+
+        # Match plural: "documentos 1 e 2", "documentos 1, 2 e 3"
+        plural_match = re.search(r'documentos?\s+((?:\d+\s*(?:[,e]\s*)?)+)', text, re.IGNORECASE)
+        if plural_match:
+            doc_nums.update(re.findall(r'\d+', plural_match.group(1)))
+
+        # Match "cada um dos documentos" / "dos documentos apresentados"
+        if not doc_nums and re.search(r'cada um dos documentos|dos documentos apresentados|documentos apresentados', text, re.IGNORECASE):
+            for s in group_sources.get(gid, []):
+                source_refs.append({"sourceId": s["sourceId"], "childId": None, "mode": "full_group"})
 
         child_letters = [c.upper() for c in _CHILD_REF_PATTERN.findall(text)]
 
@@ -315,7 +331,6 @@ def _resolve_scoped_refs(questions: list[dict], sources: list[dict]):
                 continue
 
             if child_letters and source["children"]:
-                # Check which children are referenced
                 for letter in child_letters:
                     child_id = f"{source['sourceId']}_{letter.lower()}"
                     if child_id in source["children"]:
@@ -324,7 +339,6 @@ def _resolve_scoped_refs(questions: list[dict], sources: list[dict]):
                             "childId": child_id,
                             "mode": "specific_child",
                         })
-                # If ALL children referenced → full_group
                 n_children = len(source["children"])
                 all_letters = {chr(ord('a') + i).upper() for i in range(n_children)}
                 if all_letters and set(child_letters) >= all_letters:
