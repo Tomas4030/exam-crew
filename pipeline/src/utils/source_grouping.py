@@ -229,6 +229,12 @@ def _detect_sources(assets: list[dict], questions: list[dict],
                 group_explicit_docs[gid][doc_num] = page
 
     # Build Source entities
+    # First, identify pages with multiple documents to split assets correctly
+    page_doc_counts: dict[int, list[int]] = defaultdict(list)  # page → [doc_nums]
+    for gid in sorted(set(page_group_map.values())):
+        for doc_num, page in group_explicit_docs.get(gid, {}).items():
+            page_doc_counts[page].append(doc_num)
+
     for gid in sorted(set(page_group_map.values())):
         docs = group_explicit_docs.get(gid, {})
         for doc_num in sorted(docs.keys()):
@@ -236,11 +242,32 @@ def _detect_sources(assets: list[dict], questions: list[dict],
             source_id = f"{gid}_documento_{doc_num}"
 
             # Find assets on this page — prefer embedded (clean PDF images)
-            embedded = [a for a in assets
-                        if a.get("page") == page and a.get("type") == "embedded_image"]
-            detected = [a for a in assets
-                        if a.get("page") == page and a.get("type") != "embedded_image"]
-            page_assets = embedded if embedded else detected
+            embedded = sorted(
+                [a for a in assets if a.get("page") == page and a.get("type") == "embedded_image"],
+                key=lambda a: a.get("id", "")
+            )
+            detected = sorted(
+                [a for a in assets if a.get("page") == page and a.get("type") != "embedded_image"],
+                key=lambda a: a.get("id", "")
+            )
+            all_page_assets = embedded if embedded else detected
+
+            # If multiple documents share this page, split assets by position
+            docs_on_page = sorted(page_doc_counts.get(page, [doc_num]))
+            if len(docs_on_page) > 1 and all_page_assets:
+                n_docs = len(docs_on_page)
+                if len(all_page_assets) >= n_docs:
+                    # Enough assets to split evenly
+                    doc_idx = docs_on_page.index(doc_num)
+                    chunk_size = max(1, len(all_page_assets) // n_docs)
+                    start = doc_idx * chunk_size
+                    end = start + chunk_size if doc_idx < n_docs - 1 else len(all_page_assets)
+                    page_assets = all_page_assets[start:end]
+                else:
+                    # Fewer assets than documents — don't assign (use source.crops.full)
+                    page_assets = []
+            else:
+                page_assets = all_page_assets
 
             # Determine kind and children
             kind = _infer_kind(page_assets, page_texts.get(page, ""))

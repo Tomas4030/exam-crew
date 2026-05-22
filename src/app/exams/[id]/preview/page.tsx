@@ -49,74 +49,62 @@ export default function PreviewPage() {
     return parent?.statement || null;
   };
 
-  // Get best URL for an asset (embedded > visual > good context)
+  // Get best URL for an asset — accept any valid URL regardless of status
   const getBestUrl = (asset?: Asset): string | null => {
     if (!asset) return null;
     if (asset.type === 'embedded_image' && asset.crop?.url) return asset.crop.url;
-    if (asset.crops?.visual?.status === 'success' && asset.crops.visual.url) return asset.crops.visual.url;
-    if (asset.crop?.status === 'success' && asset.crop.url) return asset.crop.url;
-    if (asset.crops?.context?.status === 'success' && asset.crops.context.url) return asset.crops.context.url;
+    if (asset.crops?.visual?.url) return asset.crops.visual.url;
+    if (asset.crop?.url) return asset.crop.url;
+    if (asset.crops?.context?.url) return asset.crops.context.url;
     return null;
   };
 
   // Get images for current question
   const getAllImages = (q: Question): string[] => {
-    // Priority 1: question.media (resolved by backend)
-    if (q.media && q.media.length > 0) {
-      return q.media.map(m => m.url).filter(Boolean);
+    const urls: string[] = [];
+    const add = (url?: string | null) => { if (url && !urls.includes(url)) urls.push(url); };
+
+    // 1. media (cache from backend, but don't block sourceRefs)
+    if (q.media?.length) {
+      for (const m of q.media) add(m.url);
     }
 
-    const urls: string[] = [];
-
-    // Priority 2: sourceRefs → find assets (prefer embedded)
-    if (q.sourceRefs && q.sourceRefs.length > 0) {
+    // 2. sourceRefs — expand each source independently
+    if (q.sourceRefs?.length) {
       for (const ref of q.sourceRefs) {
+        const before = urls.length;
         const src = data.sources?.find(s => s.sourceId === ref.sourceId);
         if (!src) continue;
 
-        // Specific child
         if (ref.childId && src.assetRefs?.length) {
           const letter = ref.childId.split('_').pop() || 'a';
           const idx = letter.charCodeAt(0) - 'a'.charCodeAt(0);
-          const asset = data.assets.find(a => a.id === src.assetRefs![idx]);
-          const url = getBestUrl(asset);
-          if (url) { urls.push(url); continue; }
+          add(getBestUrl(data.assets.find(a => a.id === src.assetRefs![idx])));
+        } else if (src.assetRefs?.length) {
+          for (const aId of src.assetRefs) add(getBestUrl(data.assets.find(a => a.id === aId)));
         }
 
-        // Full source — show asset images
-        if (src.assetRefs?.length) {
-          for (const aId of src.assetRefs) {
-            const url = getBestUrl(data.assets.find(a => a.id === aId));
-            if (url) urls.push(url);
+        // Per-source fallback: embedded images on source page
+        if (urls.length === before && src.pageStart) {
+          for (const a of data.assets.filter(a => a.page === src.pageStart && a.type === 'embedded_image')) {
+            add(getBestUrl(a));
           }
-          if (urls.length > 0) continue;
         }
 
-        // Fallback: embedded images on the source page
-        if (src.pageStart) {
-          const embedded = data.assets.filter(a => a.page === src.pageStart && a.type === 'embedded_image');
-          for (const asset of embedded) {
-            const url = getBestUrl(asset);
-            if (url) urls.push(url);
-          }
-          if (urls.length > 0) continue;
+        // Per-source last resort: source full crop
+        if (urls.length === before && src.crops?.full?.url) {
+          add(src.crops.full.url);
         }
-
-        // Last resort: source full crop
-        if (src.crops?.full?.url) urls.push(src.crops.full.url);
       }
     }
-    if (urls.length > 0) return [...new Set(urls)];
 
-    // Priority 3: direct refs
+    // 3. Direct refs
     for (const refId of [...(q.imageRefs || []), ...(q.assetRefs || [])]) {
-      const url = getBestUrl(data.assets.find(a => a.id === refId));
-      if (url) urls.push(url);
+      add(getBestUrl(data.assets.find(a => a.id === refId)));
     }
-    if (urls.length > 0) return [...new Set(urls)];
 
-    // Priority 3.5: detect document references from question text
-    if (q.groupId && data.sources) {
+    // 4. Text-based detection (for old outputs without sourceRefs)
+    if (urls.length === 0 && q.groupId && data.sources) {
       const text = (q.statement || '').toLowerCase();
       const groupSources = data.sources.filter(s => s.groupId === q.groupId);
       const docNums = [...text.matchAll(/documentos?\s+((?:\d+[\s,e]*)+)/gi)]
@@ -126,34 +114,17 @@ export default function PreviewPage() {
       const matched = allDocs ? groupSources : groupSources.filter(s =>
         docNums.some(n => s.sourceId.endsWith(`_${n}`))
       );
-
       for (const src of matched) {
         if (src.assetRefs?.length) {
-          for (const aId of src.assetRefs) {
-            const url = getBestUrl(data.assets.find(a => a.id === aId));
-            if (url) urls.push(url);
-          }
+          for (const aId of src.assetRefs) add(getBestUrl(data.assets.find(a => a.id === aId)));
         } else if (src.pageStart) {
-          const embedded = data.assets.filter(a => a.page === src.pageStart && a.type === 'embedded_image');
-          for (const asset of embedded) { const url = getBestUrl(asset); if (url) urls.push(url); }
+          for (const a of data.assets.filter(a => a.page === src.pageStart && a.type === 'embedded_image')) add(getBestUrl(a));
         }
-        if (urls.length === 0 && src.crops?.full?.url) urls.push(src.crops.full.url);
+        if (urls.length === 0 && src.crops?.full?.url) add(src.crops.full.url);
       }
     }
-    if (urls.length > 0) return [...new Set(urls)];
 
-    // Priority 4: group fallback
-    if (q.groupId && data.sources) {
-      for (const src of data.sources.filter(s => s.groupId === q.groupId && (s.pageStart || 0) < (q.sourcePage || 999))) {
-        if (src.assetRefs?.length) {
-          for (const aId of src.assetRefs) {
-            const url = getBestUrl(data.assets.find(a => a.id === aId));
-            if (url) urls.push(url);
-          }
-        }
-      }
-    }
-    return [...new Set(urls)];
+    return urls;
   };
 
   const images = getAllImages(current);
