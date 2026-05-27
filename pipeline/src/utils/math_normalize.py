@@ -113,10 +113,12 @@ Return ONLY strict JSON with these fields:
 
 Rules:
 - Preserve ALL text exactly as shown on the image
-- Use \\\\( ... \\\\) for inline math
+- Use \\\\( ... \\\\) for inline math ONLY for actual formulas/expressions
 - Use \\\\frac{{}}{{}} for fractions, ^{{}} for exponents, \\\\sqrt{{}} for roots
 - Use \\\\pi, \\\\in, \\\\mathbb{{R}}, \\\\leq, \\\\geq where appropriate
 - Do NOT solve or simplify
+- Keep Portuguese ordinals as plain text: 12.º, 1.ª, 2.ª, n.º — never use \\\\degree
+- Do NOT wrap ordinary numbers, ages, years, percentages in math delimiters
 - mathSpans: list each distinct formula/expression found
 - If no options visible, return empty options array"""
 
@@ -209,7 +211,7 @@ def math_normalize(output: dict, extraction: dict, delay: float = 2.0) -> dict:
             if checks.get("balancedLatexDelimiters", True) and checks.get("balancedBraces", True):
                 q["statementLatex"] = latex_stmt
                 q["statementPlain"] = latex_to_plain(latex_stmt)
-                q["statement"] = latex_stmt  # Best version for consumption
+                # Preserve original statement; frontend uses statementLatex for rendering
 
                 # Math spans
                 spans = result.get("mathSpans") or extract_math_spans(latex_stmt)
@@ -239,7 +241,6 @@ def math_normalize(output: dict, extraction: dict, delay: float = 2.0) -> dict:
                     if checks2.get("balancedLatexDelimiters", True) and checks2.get("balancedBraces", True):
                         q["statementLatex"] = latex_stmt2
                         q["statementPlain"] = latex_to_plain(latex_stmt2)
-                        q["statement"] = latex_stmt2
                         q["mathSpans"] = result2.get("mathSpans") or extract_math_spans(latex_stmt2)
                         if result2.get("options") and q.get("options"):
                             for opt_new in result2["options"]:
@@ -255,7 +256,6 @@ def math_normalize(output: dict, extraction: dict, delay: float = 2.0) -> dict:
                 # Both attempts failed
                 q["statementPlain"] = statement
                 q["statementLatex"] = latex_stmt  # Keep best attempt
-                q["statement"] = latex_stmt
                 q["mathSpans"] = extract_math_spans(latex_stmt)
                 _set_text_quality(q, "needs_review", "vision_latex_normalized",
                                   has_latex=True, math_heavy=is_math_heavy, checks=checks,

@@ -20,6 +20,18 @@ def normalize(output: dict) -> dict:
     # These are propositions (I, II, III, IV) inside another question, not real questions
     _remove_roman_numeral_questions(questions)
 
+    # ── 0b. Merge false multi_blank_choice subquestions ───────────
+    # When pipeline creates q2 (group) + q2_1/q2_2 (multi_blank_choice),
+    # but the real exam has just one question with blanks I/II/III/IV
+    _merge_false_multi_blank_groups(output)
+    questions = output.get("questions", [])  # refresh after merge
+
+    # ── 0c. Clear statementLatex for multi_blank_choice (no math rendering needed)
+    for q in questions:
+        if q.get("type") == "multi_blank_choice":
+            q["statementLatex"] = None
+            q["mathHeavy"] = False
+
     # ── 1. Reassociate figures by statement mentions ─────────────
     _repair_figure_associations(questions, assets)
 
@@ -214,3 +226,55 @@ def _find_child_in_group(source_group: dict, letter: str) -> str | None:
         if f"_{letter_lower}_" in child_id or child_id.endswith(f"_{letter_lower}"):
             return child_id
     return None
+
+
+def _merge_false_multi_blank_groups(output: dict):
+    """Merge false group+subquestion splits for multi_blank_choice questions.
+
+    When the pipeline creates q2(group) + q2_1(multi_blank_choice) + q2_2(multi_blank_choice),
+    but the real exam has just one question 2 with blanks I/II/III/IV, merge them back.
+    """
+    questions = output.get("questions", [])
+    by_id = {q["questionId"]: q for q in questions}
+    to_remove = set()
+
+    for q in questions:
+        if not q.get("isGroup"):
+            continue
+        children_ids = q.get("subQuestions") or []
+        children = [by_id[cid] for cid in children_ids if cid in by_id]
+        if not children:
+            continue
+
+        # Check if children are multi_blank_choice with blanks
+        mb_children = [c for c in children if c.get("type") == "multi_blank_choice" and c.get("blanks")]
+        if not mb_children:
+            continue
+
+        # Only merge if parent number has no decimal (real subquestions are 2.1, 2.2)
+        if "." in str(q.get("number", "")):
+            continue
+
+        # Merge: promote first child's blanks into parent, remove children
+        first = mb_children[0]
+        q["type"] = "multi_blank_choice"
+        q["isGroup"] = False
+        q["subQuestions"] = []
+        q["blanks"] = first.get("blanks")
+        q["options"] = []
+        q["tableRefs"] = first.get("tableRefs") or q.get("tableRefs", [])
+        q["assetRefs"] = first.get("assetRefs") or q.get("assetRefs", [])
+        q["hasTable"] = first.get("hasTable") or q.get("hasTable", False)
+
+        # Merge statement if parent is just intro
+        parent_stmt = (q.get("statement") or "").strip()
+        child_stmt = (first.get("statement") or "").strip()
+        if child_stmt and child_stmt not in parent_stmt:
+            q["statement"] = f"{parent_stmt}\n\n{child_stmt}".strip()
+        q["statementLatex"] = None
+        q["statementPlain"] = q["statement"]
+
+        for child in children:
+            to_remove.add(child["questionId"])
+
+    output["questions"] = [q for q in questions if q["questionId"] not in to_remove]

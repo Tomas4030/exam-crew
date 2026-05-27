@@ -13,10 +13,11 @@ interface Asset {
   crop?: CropInfo;
 }
 interface Source { sourceId: string; groupId?: string; label?: string; kind?: string; pageStart?: number; crops?: { full?: CropInfo }; assetRefs?: string[]; }
+interface Blank { number: string; options: { letter: string; text: string; latex?: string }[]; }
 interface Question {
   questionId: string; number: string; type: string; statement: string; statementLatex?: string;
-  options?: Option[]; group?: string; groupId?: string; displayNumber?: string;
-  imageRefs?: string[]; assetRefs?: string[]; sourceRefs?: { sourceId: string; childId?: string; mode: string }[];
+  options?: Option[]; blanks?: Blank[] | null; group?: string; groupId?: string; displayNumber?: string;
+  imageRefs?: string[]; tableRefs?: string[]; assetRefs?: string[]; sourceRefs?: { sourceId: string; childId?: string; mode: string }[];
   media?: { type: string; url: string; sourceId?: string; label?: string }[];
   points?: number; sourcePage?: number; parentQuestion?: string | null; isGroup?: boolean;
 }
@@ -209,11 +210,42 @@ export default function PreviewPage() {
 
             {/* Statement */}
             <div className="text-gray-900 text-base leading-relaxed">
-              <MathText text={current.statementLatex || current.statement} />
+              <MathText text={(() => {
+                const useRaw = current.type === 'multi_blank_choice' || current.tableRefs?.length;
+                let text = useRaw ? current.statement : (current.statementLatex || current.statement);
+                // Remove inline table text when table is shown as image asset
+                if (current.tableRefs?.length) {
+                  const tableAsset = data.assets.find(a => current.tableRefs!.includes(a.id) && a.type === 'table');
+                  if (tableAsset) {
+                    // Remove block that looks like table data (rows of numbers/text separated by spaces)
+                    text = text.replace(/(?:^|\n)(?:Ano|Year)\s+\d{4}[\s\S]*?(?:\d[\s\d]*\d)\s*(?:\n|$)/gi, '\n');
+                  }
+                }
+                return text.replace(/\n{3,}/g, '\n\n').trim();
+              })()} />
             </div>
 
             {/* Answer area */}
-            {current.type === 'multiple_choice' && current.options && current.options.length > 0 ? (
+            {current.type === 'multi_blank_choice' && current.blanks?.length ? (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
+                {current.blanks.map(blank => (
+                  <div key={blank.number} className="border rounded-lg bg-white overflow-hidden">
+                    <div className="font-bold text-center border-b p-2 bg-gray-50">{blank.number}</div>
+                    <div className="p-3 space-y-2">
+                      {blank.options.map(opt => {
+                        const key = `${current.questionId}_${blank.number}`;
+                        return (
+                          <label key={opt.letter} className={`flex items-start gap-2 p-2 rounded cursor-pointer ${answers[key] === opt.letter ? 'bg-blue-50 border border-blue-300' : 'hover:bg-gray-50'}`}>
+                            <input type="radio" name={key} value={opt.letter} checked={answers[key] === opt.letter} onChange={() => setAnswers(prev => ({ ...prev, [key]: opt.letter }))} className="mt-1" />
+                            <span className="text-sm"><strong>{opt.letter})</strong> <MathText text={opt.latex || opt.text} /></span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : current.type === 'multiple_choice' && current.options && current.options.length > 0 ? (
               <div className="space-y-2">
                 {current.options.map(opt => (
                   <label

@@ -1,30 +1,27 @@
 'use client';
 
-import { useMemo } from 'react';
-import katex from 'katex';
-import 'katex/dist/katex.min.css';
+import { MathJax } from 'better-react-mathjax';
 
-/** Renders text with inline LaTeX (\( ... \)) and display LaTeX (\[ ... \]) */
-export default function MathText({ text, className }: { text: string; className?: string }) {
-  const html = useMemo(() => renderMath(text), [text]);
-  return <span className={className} dangerouslySetInnerHTML={{ __html: html }} />;
+function normalize(text: string): string {
+  if (!text) return '';
+  return text
+    // Fix Portuguese ordinals wrongly converted to LaTeX
+    .replace(/\\\((\d+)\.\\degree\\\)/g, '$1.º')
+    .replace(/\\\((\d+)\\\.º\\\)/g, '$1.º')
+    .replace(/\\degree/g, 'º')
+    .replace(/\\textsuperscript\{a\}/g, 'ª')
+    .replace(/\\textsuperscript\{o\}/g, 'º')
+    // Strip tabular/center environments (rendered as assets instead)
+    .replace(/\\begin\{center\}[\s\S]*?\\end\{center\}/g, '')
+    .replace(/\\begin\{tabular\}[\s\S]*?\\end\{tabular\}/g, '')
+    .replace(/\\hline/g, '')
+    .trim();
 }
 
-function renderMath(text: string): string {
-  // Split on \( ... \) and \[ ... \]
-  const parts = text.split(/(\\\([\s\S]*?\\\)|\\\[[\s\S]*?\\\])/g);
-  return parts.map(part => {
-    if (part.startsWith('\\(') && part.endsWith('\\)')) {
-      const latex = part.slice(2, -2);
-      try { return katex.renderToString(latex, { throwOnError: false }); }
-      catch { return part; }
-    }
-    if (part.startsWith('\\[') && part.endsWith('\\]')) {
-      const latex = part.slice(2, -2);
-      try { return katex.renderToString(latex, { throwOnError: false, displayMode: true }); }
-      catch { return part; }
-    }
-    // Escape HTML in plain text
-    return part.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br/>');
-  }).join('');
+export default function MathText({ text, className }: { text: string; className?: string }) {
+  return (
+    <MathJax dynamic hideUntilTypeset="first" inline className={className}>
+      {normalize(text)}
+    </MathJax>
+  );
 }

@@ -98,6 +98,8 @@ def _prescan_page(image_path: str, page_num: int) -> dict | None:
 2. List ALL question numbers visible (e.g. "1", "2", "2.1", "2.2", "3")
 3. List any figures/tables with their labels (e.g. "Figura 1", "Tabela")
 
+Important: Roman numerals I, II, III, IV inside fill-in-the-blank questions are blanks, NOT question numbers. Only include actual numbered questions (1., 2., 2.1, etc.)
+
 Respond ONLY with JSON:
 {{"page": {page_num}, "pageType": "questions", "questionNumbers": ["1", "2.1", "2.2"], "figures": ["Figura 1"], "hasScoring": false}}"""
 
@@ -127,9 +129,17 @@ Respond ONLY with JSON:
 
 Rules:
 - Copy text EXACTLY as shown. Do NOT simplify formulas.
-- If question has sub-items I/II/III/IV to fill, it's ONE question type "multi_blank_choice" with blanks.
+- If question has blanks/spaces I, II, III, IV with separate options (a/b/c) for each, it is type "multi_blank_choice".
+  For multi_blank_choice, set options=[] and fill blanks like this:
+  "blanks": [
+    {{"number": "I", "options": [{{"letter": "a", "text": "value1"}}, {{"letter": "b", "text": "value2"}}, {{"letter": "c", "text": "value3"}}]}},
+    {{"number": "II", "options": [{{"letter": "a", "text": "..."}}, ...]}}
+  ]
+  Do NOT collapse blanks into a single multiple choice A/B/C/D.
+- For normal multiple choice (A)/(B)/(C)/(D), use type "multiple_choice" with options.
 - calculatorAllowed: false only if text says "sem recorrer à calculadora", else null.
 - groupContext: shared text before sub-questions (e.g. function definition).
+- referencesTable: true if the question uses a table shown on the page.
 - Respond ONLY with the JSON object. No markdown, no explanation."""
 
     content = _call_vision(image_path, prompt, max_tokens=1500)

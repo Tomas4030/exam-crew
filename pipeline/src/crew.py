@@ -119,6 +119,42 @@ Text:
                         asset["rows"] = table_data.get("rows", [])
                         report_progress("table", f"Extracted {len(asset['rows'])} rows from {asset['id']}")
 
+        # Step 3.3: Detect tables via PyMuPDF for multi_blank_choice questions
+        import fitz as _fitz
+        pdf_doc = _fitz.open(self.pdf_path)
+        for q in output.get("questions", []):
+            if q.get("type") != "multi_blank_choice" or q.get("blanks"):
+                continue
+            # This question was marked multi_blank_choice but blanks weren't extracted
+            page_num = q.get("sourcePage", 0)
+            if page_num < 1 or page_num > pdf_doc.page_count:
+                continue
+            page = pdf_doc[page_num - 1]
+            tables = page.find_tables().tables
+            if len(tables) >= 2:
+                # Last table is likely the options table (I/II/III/IV columns)
+                opts_table = tables[-1]
+                rows = opts_table.extract()
+                if rows and len(rows[0]) >= 2:
+                    # First row = headers (I, II, III, IV), rest = options
+                    headers = [h.strip() if h else "" for h in rows[0]]
+                    blanks = []
+                    for col_idx, header in enumerate(headers):
+                        if not header:
+                            continue
+                        options = []
+                        for row_idx, row in enumerate(rows[1:], 1):
+                            cell = row[col_idx].strip() if col_idx < len(row) and row[col_idx] else ""
+                            if cell:
+                                letter = chr(ord('a') + row_idx - 1)
+                                options.append({"letter": letter, "text": cell})
+                        if options:
+                            blanks.append({"number": header, "options": options})
+                    if blanks:
+                        q["blanks"] = blanks
+                        report_progress("table", f"Extracted {len(blanks)} blanks for Q{q['number']} from PyMuPDF table")
+        pdf_doc.close()
+
         # Step 3.5: Source grouping (for History, Portuguese, etc.)
         report_progress("source_grouping", "Detecting source/document pages")
         output = apply_source_grouping(output, subject_profile, extraction)
@@ -138,6 +174,17 @@ Text:
         # Step 3.8: Math normalization (LaTeX, textQuality)
         report_progress("math_normalize", "Normalizing mathematical text")
         output = math_normalize(output, extraction)
+
+        # Step 3.9: Clean statementLatex — remove tabular when table is already an asset
+        for q in output.get("questions", []):
+            if q.get("tableRefs") and q.get("statementLatex"):
+                q["statementLatex"] = re.sub(
+                    r'\\begin\{center\}[\s\S]*?\\end\{center\}', '', q["statementLatex"]
+                )
+                q["statementLatex"] = re.sub(
+                    r'\\begin\{tabular\}[\s\S]*?\\end\{tabular\}', '', q["statementLatex"]
+                )
+                q["statementLatex"] = q["statementLatex"].strip()
 
         # Step 4: Validate
         report_progress("validate", "Running post-processing validation")
@@ -199,34 +246,23 @@ Text:
         for page_info in retry_page_data:
             page_num = page_info["page"]
             image_path = page_info["page_image_path"]
+            page_text = page_info.get("text", "")
 
             # Try to extract each missing question directly
             for mq in sorted(missing_nums):
+                # VALIDATE: only attempt if the question number actually appears on this page
+                if page_text and not re.search(rf'(?:^|\n)\s*{mq}\.\s', page_text):
+                    continue  # Question number not on this page — don't hallucinate
+
                 q_data = _extract_question(image_path, page_num, str(mq), extraction["total_pages"])
                 time.sleep(2)
 
-                # If first attempt fails, try with a more aggressive prompt
-                if not q_data or not q_data.get("statement"):
-                    from .tools.vision_tool import _call_vision, _parse_json
-                    aggressive_prompt = f"""Look at the TOP of this page. There should be question {mq} (numbered "{mq}.") before question {mq + 1}.
-
-Extract question {mq} ONLY. It is likely a multiple choice question with options (A), (B), (C), (D).
-
-Respond ONLY with JSON:
-{{
-  "number": "{mq}",
-  "type": "multiple_choice",
-  "statement": "full text of question {mq}",
-  "options": [{{"letter": "A", "text": "..."}}, {{"letter": "B", "text": "..."}}, {{"letter": "C", "text": "..."}}, {{"letter": "D", "text": "..."}}],
-  "mathHeavy": true,
-  "calculatorAllowed": null,
-  "points": null
-}}
-
-If question {mq} is truly not on this page, respond: {{"number": "{mq}", "statement": null}}"""
-                    content = _call_vision(image_path, aggressive_prompt, max_tokens=1500)
-                    time.sleep(2)
-                    q_data = _parse_json(content) if content else None
+                # Validate the result: reject if statement is suspiciously short or generic
+                if q_data and q_data.get("statement"):
+                    stmt = q_data["statement"]
+                    # Reject hallucinated responses
+                    if len(stmt) < 15 or "not on this page" in stmt.lower():
+                        q_data = None
 
                 if q_data and q_data.get("statement"):
                     q_data["_retry_page"] = page_num
