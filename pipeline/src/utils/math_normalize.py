@@ -178,6 +178,24 @@ def math_normalize(output: dict, extraction: dict, delay: float = 2.0) -> dict:
         suspicious = has_suspicious_math(statement) if is_math_exam else False
         needs_normalization = is_math_heavy and (corrupt or suspicious or is_math_exam)
 
+        # Skip normalization for questions that don't benefit from LaTeX rewriting
+        if needs_normalization:
+            skip_reasons = []
+            if q.get("type") == "multi_blank_choice":
+                skip_reasons.append("multi_blank_choice")
+            if q.get("tableRefs"):
+                skip_reasons.append("has_tableRefs")
+            if q.get("blanks"):
+                skip_reasons.append("has_blanks")
+            if "•" in statement or "–\t" in statement:
+                skip_reasons.append("has_bullets")
+            if "____" in statement:
+                skip_reasons.append("has_blanks_text")
+            if len(statement) > 900:
+                skip_reasons.append("statement_too_long")
+            if skip_reasons:
+                needs_normalization = False
+
         if not needs_normalization:
             # Non-math or clean text: just set quality as ok
             q["statementPlain"] = q.get("statementPlain") or statement

@@ -15,7 +15,7 @@ Rules:
 import re
 
 
-def validate_and_fix(output: dict) -> dict:
+def validate_and_fix(output: dict, extraction: dict = None) -> dict:
     """Apply hard validation rules. Returns corrected output."""
     warnings = output.get("warnings", [])
     questions = output.get("questions", [])
@@ -101,6 +101,24 @@ def validate_and_fix(output: dict) -> dict:
             else:
                 msg = f"⚠️ CRITICAL: Question {m} not found in output — extraction failed"
             warnings.append({"type": "missing_question", "severity": "critical", "message": msg})
+
+    # ── Rule 6b: Cross-check with PDF text for missing questions ──
+    if extraction and not has_groups:
+        numbers_in_pdf = set()
+        for page in extraction.get("pages", []):
+            text = page.get("text", "")
+            for m in re.finditer(r'(?m)^\s*(\d{1,2})\.\s+\S', text):
+                n = int(m.group(1))
+                if 1 <= n <= 30:
+                    numbers_in_pdf.add(n)
+        numbers_in_json = {int(q["number"]) for q in questions if q["number"].isdigit()}
+        pdf_missing = numbers_in_pdf - numbers_in_json
+        for m in sorted(pdf_missing):
+            warnings.append({
+                "type": "missing_question",
+                "severity": "critical",
+                "message": f"⚠️ CRITICAL: Question {m} found in PDF text but not extracted"
+            })
 
     # ── Rule 7: mathHeavy → needsHumanReview ─────────────────────
     for q in questions:

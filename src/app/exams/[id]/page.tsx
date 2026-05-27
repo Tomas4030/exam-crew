@@ -10,12 +10,16 @@ export default function ExamDetailPage() {
   const [status, setStatus] = useState<string>('');
 
   useEffect(() => {
+    let interval: ReturnType<typeof setInterval>;
     const check = () =>
       fetch(`/api/exams/${id}/status`).then(r => r.json()).then(d => {
         setStatus(d.status);
+        if (['completed', 'completed_with_warnings', 'needs_review', 'partial_failed'].includes(d.status)) {
+          clearInterval(interval);
+        }
       }).catch(() => {});
     check();
-    const interval = setInterval(check, 3000);
+    interval = setInterval(check, 3000);
     return () => clearInterval(interval);
   }, [id]);
 

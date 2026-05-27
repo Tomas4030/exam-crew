@@ -49,6 +49,34 @@ class ExamProcessingCrew:
         if formula_pages:
             report_progress("filter", f"Skipping formula pages: {formula_pages}")
 
+        # Step 1.7: Create table assets from PyMuPDF detection (before vision)
+        _ROMAN_HEADERS = {"I", "II", "III", "IV", "V"}
+        for page_info in pages_to_process:
+            for table in page_info.get("tables", []):
+                bbox = table.get("bbox")
+                rows = table.get("rows", [])
+                if not rows or len(rows) < 2 or not bbox:
+                    continue
+                page_num = page_info["page"]
+                header = [h.strip() if h else "" for h in rows[0]]
+                # Classify: options table (I/II/III/IV) vs data table
+                is_options = all(h in _ROMAN_HEADERS for h in header if h)
+                table_id = f"tabela_p{page_num}" if not is_options else f"tabela_opcoes_p{page_num}"
+                # Avoid duplicates
+                if any(a["id"] == table_id for a in extraction["assets"]):
+                    continue
+                extraction["assets"].append({
+                    "id": table_id,
+                    "path": None,
+                    "page": page_num,
+                    "bbox": {"x": round(bbox[0]), "y": round(bbox[1]),
+                             "width": round(bbox[2] - bbox[0]), "height": round(bbox[3] - bbox[1])},
+                    "type": "table",
+                    "columns": header,
+                    "rows": [{header[i]: (row[i] or "").strip() for i in range(len(header)) if i < len(row)} for row in rows[1:]],
+                    "_is_options_table": is_options,
+                })
+
         # Step 2: Analyze pages (pre-scan + per-question)
         report_progress("vision", f"Analyzing {len(pages_to_process)} pages with Qwen3-VL")
         page_results = analyze_exam_pages(pages_to_process)
@@ -188,7 +216,7 @@ Text:
 
         # Step 4: Validate
         report_progress("validate", "Running post-processing validation")
-        output = validate_and_fix(output)
+        output = validate_and_fix(output, extraction)
 
         # Step 4.5: Targeted retry for missing questions
         missing_q_warnings = [w for w in output.get("warnings", []) if w["type"] == "missing_question"]
@@ -373,7 +401,7 @@ Text:
 
             # Re-run normalize + validate from scratch
             output = normalize(output)
-            output = validate_and_fix(output)
+            output = validate_and_fix(output, extraction)
 
         return output
 
@@ -985,9 +1013,35 @@ Text:
                             q["points"] = pts
                             break
 
+        # Detect optional questions from scoring page: "N × P pontos" pattern
+        # and list of optional question numbers
+        last_page = extraction["pages"][-1]
+        last_text = last_page.get("text", "")
+        import re as _re2
+        opt_match = _re2.search(r'(\d+)\s*[×x]\s*(\d+)\s*pontos', last_text)
+        opt_points = int(opt_match.group(2)) if opt_match else None
+        # Try to find which questions are optional (listed near the "× pontos" section)
+        opt_question_nums = set()
+        if opt_points:
+            # Look for a list of numbers near "itens" or "opcionais"
+            opt_section = _re2.search(r'(?:opcion|contribuem para a classificação final da prova os \d+ itens)[\s\S]{0,200}', last_text, _re2.IGNORECASE)
+            if opt_section:
+                opt_question_nums = {int(n) for n in _re2.findall(r'\b(\d{1,2})\b', opt_section.group())}
+
         # Warn for questions still without points
         for q in all_questions:
             if q.get("points") is None and not q.get("isGroup"):
+                q_num = int(q["number"]) if q["number"].isdigit() else 0
+                # If this question is in the optional group, assign optional points
+                if opt_points and q_num in opt_question_nums:
+                    q["points"] = opt_points
+                    q.setdefault("disciplineData", {})["optional"] = True
+                    continue
+                # If we have optional points and no specific list, assign to all unscored
+                if opt_points and not opt_question_nums and 8 <= opt_points <= 30:
+                    q["points"] = opt_points
+                    q.setdefault("disciplineData", {})["optional"] = True
+                    continue
                 q.setdefault("warnings", []).append({
                     "type": "missing_points",
                     "message": f"No scoring entry applied for Q{q['number']}"

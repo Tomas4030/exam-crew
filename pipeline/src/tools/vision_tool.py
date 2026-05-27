@@ -169,10 +169,10 @@ def analyze_exam_pages(pages_data: list[dict], delay: float = 2.0) -> list[dict]
     results = []
     total = len(pages_data)
 
-    for page_info in pages_data:
+    for idx, page_info in enumerate(pages_data):
         page_num = page_info["page"]
         image_path = page_info["page_image_path"]
-        print(json.dumps({"stage": "vision", "message": f"Pre-scanning page {page_num}/{total}"}), flush=True)
+        print(json.dumps({"stage": "vision", "message": f"Pre-scanning page {page_num} ({idx+1}/{total})"}), flush=True)
 
         # Step 1: Pre-scan
         scan = _prescan_page(image_path, page_num)

@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
+import MathJaxProvider from '@/components/MathJaxProvider';
 import MathText from '@/components/MathText';
 
 interface Option { letter: string; text: string; latex?: string; }
@@ -143,6 +144,7 @@ export default function PreviewPage() {
   const qJson = current;
 
   return (
+    <MathJaxProvider>
     <div className="h-screen flex flex-col bg-gray-50">
       {/* Header */}
       <header className="bg-white border-b px-4 py-3 flex items-center gap-4 shrink-0">
@@ -304,5 +306,6 @@ export default function PreviewPage() {
         </aside>
       </div>
     </div>
+    </MathJaxProvider>
   );
 }

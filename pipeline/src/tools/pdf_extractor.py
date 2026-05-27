@@ -1,4 +1,4 @@
-"""PDF Extractor v2: extracts text per page, renders pages as PNG, extracts embedded images with bbox."""
+"""PDF Extractor v3: text + layout blocks + tables + rendered pages + embedded images."""
 import json
 from pathlib import Path
 from typing import Type
@@ -17,7 +17,7 @@ class PDFExtractorInput(BaseModel):
 
 class PDFExtractorTool(BaseTool):
     name: str = "pdf_extractor"
-    description: str = "Extracts text, renders pages as PNG, and extracts embedded images with bounding boxes"
+    description: str = "Extracts text, layout blocks, tables, renders pages as PNG, and extracts embedded images"
     args_schema: Type[BaseModel] = PDFExtractorInput
 
     def _run(self, pdf_path: str, output_dir: str) -> str:
@@ -40,13 +40,44 @@ class PDFExtractorTool(BaseTool):
             # Extract text
             text = page.get_text("text")
 
-            # Render full page as PNG (2x zoom)
-            mat = fitz.Matrix(200/72, 200/72)  # 200 DPI for clear formulas
+            # Extract layout blocks with bboxes
+            text_dict = page.get_text("dict")
+            blocks = []
+            for block in text_dict.get("blocks", []):
+                if block.get("type") == 0:  # text block
+                    block_text = ""
+                    for line in block.get("lines", []):
+                        block_text += "".join(span["text"] for span in line.get("spans", []))
+                    if block_text.strip():
+                        blocks.append({
+                            "type": "text",
+                            "bbox": list(block["bbox"]),
+                            "text": block_text.strip(),
+                        })
+
+            # Detect tables
+            tables = []
+            try:
+                found_tables = page.find_tables()
+                for i, table in enumerate(found_tables.tables):
+                    rows = table.extract()
+                    if rows and len(rows) > 1:
+                        tables.append({
+                            "index": i,
+                            "bbox": list(table.bbox),
+                            "rows": rows,
+                            "header": rows[0] if rows else [],
+                        })
+            except Exception:
+                pass
+
+            # Render full page as PNG (200 DPI)
+            mat = fitz.Matrix(200/72, 200/72)
             pix = page.get_pixmap(matrix=mat)
             page_path = pages_dir / f"page_{page_num + 1}.png"
             pix.save(str(page_path))
 
-            # Count and extract embedded images
+            # Extract embedded images
             page_images = page.get_images(full=True)
             image_count = 0
 
@@ -88,6 +119,8 @@ class PDFExtractorTool(BaseTool):
             result["pages"].append({
                 "page": page_num + 1,
                 "text": text,
+                "blocks": blocks,
+                "tables": tables,
                 "page_image_path": str(page_path),
                 "has_images": image_count > 0,
                 "image_count": image_count,
