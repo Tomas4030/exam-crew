@@ -251,6 +251,19 @@ def validate_and_fix(output: dict, extraction: dict = None) -> dict:
                     "message": f"Q{q['number']} references {ref} but no crop image exists"
                 })
 
+    # ── Rule 10f: Remove false table assets (no data, no references) ──
+    referenced_ids = set()
+    for q in questions:
+        referenced_ids.update(q.get("imageRefs", []))
+        referenced_ids.update(q.get("tableRefs", []))
+        referenced_ids.update(q.get("assetRefs", []))
+    assets[:] = [a for a in assets if not (
+        a.get("id", "").startswith("tabela_")
+        and not a.get("rows")
+        and not a.get("columns")
+        and a["id"] not in referenced_ids
+    )]
+
     # ── Rule 11: Fix stats ───────────────────────────────────────
     groups = [q for q in questions if q.get("isGroup")]
     non_group = [q for q in questions if not q.get("isGroup")]

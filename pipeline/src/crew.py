@@ -1020,27 +1020,45 @@ Text:
         import re as _re2
         opt_match = _re2.search(r'(\d+)\s*[×x]\s*(\d+)\s*pontos', last_text)
         opt_points = int(opt_match.group(2)) if opt_match else None
+        opt_choose = int(opt_match.group(1)) if opt_match else None
         # Try to find which questions are optional (listed near the "× pontos" section)
         opt_question_nums = set()
         if opt_points:
-            # Look for a list of numbers near "itens" or "opcionais"
-            opt_section = _re2.search(r'(?:opcion|contribuem para a classificação final da prova os \d+ itens)[\s\S]{0,200}', last_text, _re2.IGNORECASE)
+            opt_section = _re2.search(r'(?:opcion|contribuem para a classificação final da prova os \d+ itens)[\s\S]{0,300}', last_text, _re2.IGNORECASE)
             if opt_section:
                 opt_question_nums = {int(n) for n in _re2.findall(r'\b(\d{1,2})\b', opt_section.group())}
+
+        # Build scoringGroup metadata
+        scoring_group = None
+        if opt_points and opt_choose:
+            scoring_group = {
+                "type": "best_of",
+                "choose": opt_choose,
+                "from": len(opt_question_nums) or opt_choose,
+                "pointsEach": opt_points,
+            }
+
+        # Mark optional questions (even if they already have points from main scoring)
+        if opt_question_nums:
+            for q in all_questions:
+                q_num = int(q["number"]) if q["number"].isdigit() else 0
+                if q_num in opt_question_nums:
+                    q.setdefault("disciplineData", {})["optional"] = True
+                    if scoring_group:
+                        q.setdefault("disciplineData", {})["scoringGroup"] = scoring_group
+                    if q.get("points") is None:
+                        q["points"] = opt_points
 
         # Warn for questions still without points
         for q in all_questions:
             if q.get("points") is None and not q.get("isGroup"):
                 q_num = int(q["number"]) if q["number"].isdigit() else 0
-                # If this question is in the optional group, assign optional points
-                if opt_points and q_num in opt_question_nums:
-                    q["points"] = opt_points
-                    q.setdefault("disciplineData", {})["optional"] = True
-                    continue
                 # If we have optional points and no specific list, assign to all unscored
                 if opt_points and not opt_question_nums and 8 <= opt_points <= 30:
                     q["points"] = opt_points
                     q.setdefault("disciplineData", {})["optional"] = True
+                    if scoring_group:
+                        q.setdefault("disciplineData", {})["scoringGroup"] = scoring_group
                     continue
                 q.setdefault("warnings", []).append({
                     "type": "missing_points",
