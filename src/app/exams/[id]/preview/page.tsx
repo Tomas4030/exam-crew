@@ -7,7 +7,7 @@ import MathJaxProvider from '@/components/MathJaxProvider';
 import MathText from '@/components/MathText';
 
 interface Option { letter: string; text: string; latex?: string; }
-interface CropInfo { status: string; url?: string; }
+interface CropInfo { status: string; url?: string; quality?: string; diagnostics?: { edgeTouch?: boolean; textTouchesEdge?: boolean; contentAreaRatio?: number }; }
 interface Asset {
   id: string; type: string; page: number; description?: string;
   crops?: { context?: CropInfo; visual?: CropInfo; full?: CropInfo };
@@ -51,10 +51,12 @@ export default function PreviewPage() {
     return parent?.statement || null;
   };
 
-  // Get best URL for an asset — accept any valid URL regardless of status
+  // Get best URL for an asset — backend provides crops.best
   const getBestUrl = (asset?: Asset): string | null => {
     if (!asset) return null;
     if (asset.type === 'embedded_image' && asset.crop?.url) return asset.crop.url;
+    const best = (asset.crops as any)?.best;
+    if (best?.url) return best.url;
     if (asset.crops?.visual?.url) return asset.crops.visual.url;
     if (asset.crop?.url) return asset.crop.url;
     if (asset.crops?.context?.url) return asset.crops.context.url;

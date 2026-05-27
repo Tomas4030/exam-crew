@@ -567,11 +567,12 @@ def crop_assets(output: dict, extraction: dict, output_dir: Path) -> dict:
             )
 
             asset["crops"] = {"context": context_crop_info, "visual": visual_crop_info}
-            asset["crop"] = context_crop_info
+            asset["crops"]["best"] = _choose_best_crop(visual_crop_info, context_crop_info)
+            asset["crop"] = asset["crops"]["best"]
 
         except Exception as e:
             err = {"status": "failed", "reason": str(e)}
-            asset["crops"] = {"context": err, "visual": err}
+            asset["crops"] = {"context": err, "visual": err, "best": err}
             asset["crop"] = err
 
     # ── Source document crops (for History and similar) ────────────
@@ -711,6 +712,31 @@ def _crop_by_document_label(pdf_path: str, page_num: int, doc_num: int, img: Ima
         return None
 
     return img.crop((left, top, right, bottom))
+
+
+def _choose_best_crop(visual: dict, context: dict) -> dict:
+    """Choose the best crop between visual and context based on diagnostics."""
+    v_ok = visual.get("status") == "success"
+    c_ok = context.get("status") in ("success", "needs_review")
+
+    if not v_ok and c_ok:
+        return context
+    if v_ok and not c_ok:
+        return visual
+    if not v_ok and not c_ok:
+        return visual if visual.get("url") else context
+
+    # Both exist — score visual
+    diag = visual.get("diagnostics", {})
+    v_bad = (
+        visual.get("quality") == "needs_review"
+        and (diag.get("edgeTouch") or diag.get("textTouchesEdge")
+             or (diag.get("contentAreaRatio", 0) > 0.92))
+    )
+
+    if v_bad:
+        return context
+    return visual
 
 
 def _do_context_crop(img, label_rect, bbox, is_table, filename, context_dir, legacy_dir, exam_id) -> dict:

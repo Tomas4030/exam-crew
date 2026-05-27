@@ -193,6 +193,8 @@ def math_normalize(output: dict, extraction: dict, delay: float = 2.0) -> dict:
                 skip_reasons.append("has_blanks_text")
             if len(statement) > 900:
                 skip_reasons.append("statement_too_long")
+            if q.get("assetRefs") and re.search(r'[Ff]igura', statement):
+                skip_reasons.append("has_figure_ref")
             if skip_reasons:
                 needs_normalization = False
 
