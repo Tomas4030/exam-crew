@@ -32,6 +32,24 @@ def normalize(output: dict) -> dict:
             q["statementLatex"] = None
             q["mathHeavy"] = False
 
+    # ── 0d. Fix multi_blank_choice misclassification ─────────────
+    # A question is only multi_blank_choice if it has fill-in-the-blank instructions
+    for q in questions:
+        if q.get("type") == "multi_blank_choice":
+            text = (q.get("statement") or "").lower()
+            has_fill_instructions = (
+                "complete o texto" in text or
+                "a cada espaço" in text or
+                "cada um dos números" in text or
+                "cada espaço corresponde" in text
+            )
+            if not has_fill_instructions and not q.get("blanks"):
+                q["type"] = "open_answer"
+
+    # ── 0e. Reassign tables to correct question by position ──────
+    # Tables with options (a/b/c/d) belong to multi_blank_choice questions
+    _fix_table_assignment(questions, assets)
+
     # ── 1. Reassociate figures by statement mentions ─────────────
     _repair_figure_associations(questions, assets)
 
@@ -278,3 +296,62 @@ def _merge_false_multi_blank_groups(output: dict):
             to_remove.add(child["questionId"])
 
     output["questions"] = [q for q in questions if q["questionId"] not in to_remove]
+
+
+def _fix_table_assignment(questions: list[dict], assets: list[dict]):
+    """Fix table assignment: options tables only go to multi_blank_choice questions.
+
+    Rules:
+    - Tables with a)/b)/c)/d) content are options tables
+    - Options tables can ONLY belong to multi_blank_choice questions
+    - Questions that only reference documents must NOT have options tables
+    """
+    _DOC_RE = re.compile(r'\bdocumentos?\s+\d', re.IGNORECASE)
+
+    def _is_multi_blank(q: dict) -> bool:
+        text = (q.get("statement") or "").lower()
+        return (
+            q.get("type") == "multi_blank_choice"
+            or "complete o texto" in text
+            or "cada espaço" in text
+            or "opção adequada" in text
+        )
+
+    def _is_options_table(asset: dict) -> bool:
+        rows = asset.get("rows") or []
+        if not rows:
+            return False
+        text = " ".join(
+            str(c) for row in rows
+            for c in (row.values() if isinstance(row, dict) else row)
+        ).lower()
+        return ("a)" in text or "1)" in text) and ("b)" in text or "2)" in text)
+
+    table_assets = [a for a in assets if a.get("type") == "table" or "tabela" in a.get("id", "")]
+
+    for asset in table_assets:
+        if not _is_options_table(asset):
+            continue
+
+        asset_id = asset.get("id", "")
+        page = asset.get("page")
+
+        # Remove this options table from ALL non-multi_blank questions
+        for q in questions:
+            if _is_multi_blank(q):
+                continue
+            for field in ("assetRefs", "tableRefs"):
+                refs = q.get(field) or []
+                if asset_id in refs:
+                    q[field] = [r for r in refs if r != asset_id]
+
+        # Assign to the multi_blank_choice question on the same page
+        candidates = [q for q in questions if q.get("sourcePage") == page and _is_multi_blank(q)]
+        if candidates:
+            owner = candidates[0]
+            owner.setdefault("tableRefs", [])
+            owner.setdefault("assetRefs", [])
+            if asset_id not in owner["tableRefs"]:
+                owner["tableRefs"].append(asset_id)
+            if asset_id not in owner["assetRefs"]:
+                owner["assetRefs"].append(asset_id)
