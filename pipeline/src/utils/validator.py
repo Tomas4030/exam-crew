@@ -15,6 +15,17 @@ Rules:
 import re
 
 
+def _looks_corrupt_math_text(text: str) -> bool:
+    suspicious = ("□", "�", "\u001f", "\u001e", "^ h", "] g", " b l", "[45::47;5u")
+    if any(s in text for s in suspicious):
+        return True
+    tokens = re.findall(r'\S+', text or "")
+    if len(tokens) <= 8:
+        return False
+    one_char = sum(1 for t in tokens if len(t) == 1)
+    return (one_char / len(tokens)) > 0.35
+
+
 def validate_and_fix(output: dict, extraction: dict = None) -> dict:
     """Apply hard validation rules. Returns corrected output."""
     warnings = output.get("warnings", [])
@@ -206,6 +217,23 @@ def validate_and_fix(output: dict, extraction: dict = None) -> dict:
                         "questionId": q["questionId"],
                         "message": f"Q{q['number']} references {table_id} — table rows not extracted"
                     })
+
+    # ── Rule 10cc: Corrupt math text in multiple choice ──────────
+    for q in questions:
+        if q.get("type") != "multiple_choice" or not q.get("mathHeavy"):
+            continue
+        stmt = q.get("statement", "") or ""
+        if _looks_corrupt_math_text(stmt):
+            q["needsHumanReview"] = True
+            q.setdefault("warnings", []).append({
+                "type": "corrupt_math_text",
+                "message": "Math-heavy multiple choice has corrupted extracted text; requires vision repair."
+            })
+            warnings.append({
+                "type": "corrupt_math_text",
+                "questionId": q["questionId"],
+                "message": f"Q{q['number']} math text appears corrupted"
+            })
 
     # ── Rule 10c: Wrong asset reference (figure on wrong question) ──
     for q in questions:

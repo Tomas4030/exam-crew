@@ -219,7 +219,7 @@ export default function PreviewPage() {
             {images.length > 0 && (
               <div className="space-y-3">
                 {images.map((url, i) => (
-                  <img key={i} src={url} alt={`Documento ${i + 1}`} className="max-w-full rounded border shadow-sm" />
+                  <img key={i} src={url} alt={`Documento ${i + 1}`} className="mx-auto max-h-[560px] max-w-full rounded border bg-white object-contain shadow-sm" />
                 ))}
               </div>
             )}

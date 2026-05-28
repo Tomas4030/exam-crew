@@ -110,8 +110,13 @@ def _crop_context(img: Image.Image, label_rect: fitz.Rect, is_table: bool) -> Im
     else:
         top = max(0, int(label_y_top - FIGURE_ABOVE_LABEL_PX))
         bottom = min(img_h, int(label_y_bottom + FIGURE_BELOW_LABEL_PX))
-        left = max(0, FIGURE_MARGIN_X_PX)
-        right = min(img_w, img_w - FIGURE_MARGIN_X_PX)
+        label_cx = ((label_rect.x0 + label_rect.x1) / 2) * SCALE
+        crop_width = min(int(img_w * 0.75), 900)
+        left = max(0, int(label_cx - crop_width / 2))
+        right = min(img_w, int(label_cx + crop_width / 2))
+        if right - left < 200:
+            left = max(0, FIGURE_MARGIN_X_PX)
+            right = min(img_w, img_w - FIGURE_MARGIN_X_PX)
 
     return img.crop((left, top, right, bottom))
 
@@ -755,6 +760,9 @@ def _choose_best_crop(visual: dict, context: dict) -> dict:
     """Choose the best crop between visual and context based on diagnostics."""
     v_ok = visual.get("status") == "success"
     c_ok = context.get("status") in ("success", "needs_review")
+
+    if v_ok and visual.get("width", 0) >= 80 and visual.get("height", 0) >= 80:
+        return visual
 
     if not v_ok and c_ok:
         return context
