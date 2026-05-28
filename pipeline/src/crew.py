@@ -13,6 +13,59 @@ from .utils.subjects import detect_subject, is_formula_page
 from .utils.source_grouping import apply_source_grouping
 
 
+def _find_question_anchor_y(blocks: list[dict], q_number: str) -> float | None:
+    pattern = re.compile(rf'^\s*{re.escape(str(q_number))}\.\s+\S')
+    for block in blocks:
+        text = (block.get("text") or "").strip()
+        if pattern.match(text):
+            bbox = block.get("bbox") or []
+            if len(bbox) == 4:
+                return float(bbox[1])
+    return None
+
+
+def _attach_question_regions(questions: list[dict], extraction: dict):
+    pages = {p.get("page"): p for p in extraction.get("pages", [])}
+    page_heights = {}
+    for p in extraction.get("pages", []):
+        blocks = p.get("blocks") or []
+        max_y = max((float((b.get("bbox") or [0, 0, 0, 0])[3]) for b in blocks), default=0.0)
+        page_heights[p.get("page")] = max_y or 842.0
+
+    by_page: dict[int, list[dict]] = {}
+    for q in questions:
+        page = q.get("sourcePage")
+        if isinstance(page, int):
+            by_page.setdefault(page, []).append(q)
+
+    for page_num, page_questions in by_page.items():
+        page_data = pages.get(page_num, {})
+        blocks = page_data.get("blocks") or []
+        if not blocks:
+            continue
+
+        entries = []
+        for q in page_questions:
+            q_num = str(q.get("number", ""))
+            if not q_num:
+                continue
+            y = _find_question_anchor_y(blocks, q_num)
+            if y is None:
+                continue
+            entries.append((y, q))
+
+        entries.sort(key=lambda x: x[0])
+        page_bottom = page_heights.get(page_num, 842.0)
+        for idx, (start_y, q) in enumerate(entries):
+            end_y = entries[idx + 1][0] if idx + 1 < len(entries) else page_bottom
+            if end_y <= start_y:
+                end_y = min(page_bottom, start_y + 180.0)
+            q["region"] = {
+                "page": page_num,
+                "bbox": [0.0, round(start_y, 2), 595.0, round(end_y, 2)],
+            }
+
+
 class ExamProcessingCrew:
     def __init__(self, pdf_path: str, exam_id: str, base_dir: str = None):
         self.pdf_path = pdf_path
@@ -1089,6 +1142,9 @@ Text:
             except ValueError:
                 return (q["sourcePage"], 999, 0)
         all_questions.sort(key=sort_key)
+
+        # Add per-question page region for safer crop boundaries
+        _attach_question_regions(all_questions, extraction)
 
         # Add embedded images from PDF extraction as assets (with REAL bbox)
         for asset in extraction.get("assets", []):

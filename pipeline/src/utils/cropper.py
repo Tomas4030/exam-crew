@@ -23,6 +23,18 @@ FALLBACK_PADDING_PCT = 8
 VISUAL_PAD_PX = 10
 
 
+def _region_to_rect(region: dict | None) -> fitz.Rect | None:
+    if not region:
+        return None
+    bbox = region.get("bbox") or []
+    if len(bbox) != 4:
+        return None
+    try:
+        return fitz.Rect(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+    except Exception:
+        return None
+
+
 # ── Label Finding ────────────────────────────────────────────────
 
 def _find_label_position(pdf_path: str, page_num: int, label: str) -> fitz.Rect | None:
@@ -226,7 +238,7 @@ def _score_candidate(crop_rect: fitz.Rect, drawing_rects: list[fitz.Rect],
     }
 
 
-def _visual_crop_figure(pdf_path: str, page_num: int, label_rect: fitz.Rect, img: Image.Image) -> tuple[Image.Image | None, dict]:
+def _visual_crop_figure(pdf_path: str, page_num: int, label_rect: fitz.Rect, img: Image.Image, question_region: fitz.Rect | None = None) -> tuple[Image.Image | None, dict]:
     """Auto candidate score: generate multiple crop candidates, score each, pick best.
     
     Returns (cropped_image, diagnostics_dict) or (None, {}).
@@ -337,9 +349,16 @@ def _visual_crop_figure(pdf_path: str, page_num: int, label_rect: fitz.Rect, img
                   "col_large": 6, "large": 5, "col_xlarge": 2, "xlarge": 1}
     
     for name, rect in candidates:
+        if question_region:
+            rect = rect & question_region
+            if rect.is_empty or rect.width <= 20 or rect.height <= 20:
+                continue
         diag = _score_candidate(rect, drawing_rects, text_blocks, page_rect)
         diag["candidate"] = name
         scored.append((rect, diag))
+
+    if not scored:
+        return None, {}
 
     # Sort by score descending; tiebreak: prefer medium-sized candidates
     scored.sort(key=lambda x: (x[1]["score"], pref_order.get(x[1]["candidate"], 0)), reverse=True)
@@ -430,6 +449,7 @@ def _visual_crop_figure(pdf_path: str, page_num: int, label_rect: fitz.Rect, img
     if (right - left) < 60 or (bottom - top) < 60:
         return None, {}
 
+    best_diag["questionBounded"] = bool(question_region)
     return img.crop((left, top, right, bottom)), best_diag
 
 
@@ -499,6 +519,8 @@ def crop_assets(output: dict, extraction: dict, output_dir: Path) -> dict:
 
     pdf_path = output.get("_pdf_path") or extraction.get("_pdf_path")
     exam_id = output.get("exam_id", "")
+    by_qid = {q.get("questionId"): q for q in output.get("questions", [])}
+    by_page_number = {(q.get("sourcePage"), str(q.get("number"))): q for q in output.get("questions", [])}
 
     for asset in output.get("assets", []):
         page_num = asset.get("page")
@@ -543,6 +565,21 @@ def crop_assets(output: dict, extraction: dict, output_dir: Path) -> dict:
         try:
             img = Image.open(page_images[page_num])
 
+            question_region = None
+            near = str(asset.get("nearQuestion") or "").strip()
+            if near:
+                q_match = by_page_number.get((page_num, near))
+                if q_match:
+                    question_region = _region_to_rect(q_match.get("region"))
+            if question_region is None:
+                linked = asset.get("linkedQuestions") or []
+                for qid in linked:
+                    q_match = by_qid.get(qid)
+                    if q_match and q_match.get("sourcePage") == page_num:
+                        question_region = _region_to_rect(q_match.get("region"))
+                        if question_region:
+                            break
+
             label_rect = None
             if pdf_path and label:
                 label_rect = _find_label_position(pdf_path, page_num, label)
@@ -563,7 +600,7 @@ def crop_assets(output: dict, extraction: dict, output_dir: Path) -> dict:
 
             # Visual Crop
             visual_crop_info = _do_visual_crop(
-                pdf_path, page_num, label_rect, bbox, is_table, img, crop_filename, visual_dir, exam_id
+                pdf_path, page_num, label_rect, bbox, is_table, img, crop_filename, visual_dir, exam_id, question_region
             )
 
             asset["crops"] = {"context": context_crop_info, "visual": visual_crop_info}
@@ -770,7 +807,7 @@ def _do_context_crop(img, label_rect, bbox, is_table, filename, context_dir, leg
     }
 
 
-def _do_visual_crop(pdf_path, page_num, label_rect, bbox, is_table, img, filename, visual_dir, exam_id) -> dict:
+def _do_visual_crop(pdf_path, page_num, label_rect, bbox, is_table, img, filename, visual_dir, exam_id, question_region=None) -> dict:
     """Produce the visual crop using auto_candidate_score."""
     if not pdf_path:
         return {"status": "failed", "reason": "no_pdf_path"}
@@ -783,7 +820,7 @@ def _do_visual_crop(pdf_path, page_num, label_rect, bbox, is_table, img, filenam
         cropped = _visual_crop_table(pdf_path, page_num, label_rect, img, bbox)
         method = "find_tables"
     elif label_rect:
-        cropped, diagnostics = _visual_crop_figure(pdf_path, page_num, label_rect, img)
+        cropped, diagnostics = _visual_crop_figure(pdf_path, page_num, label_rect, img, question_region)
         method = "auto_candidate_score"
 
     if cropped is None:

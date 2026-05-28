@@ -56,6 +56,11 @@ def validate_and_fix(output: dict, extraction: dict = None) -> dict:
         page = q.get("sourcePage", 0)
         if page < 1 or (total_pages > 0 and page > total_pages):
             warnings.append({"type": "invalid_page", "message": f"Q{q['number']} has invalid sourcePage={page}", "questionId": q["questionId"]})
+        if q.get("region"):
+            region = q.get("region", {})
+            bbox = region.get("bbox") or []
+            if region.get("page") != page or len(bbox) != 4:
+                warnings.append({"type": "invalid_region", "message": f"Q{q['number']} has invalid region metadata", "questionId": q["questionId"]})
 
     # ── Rule 4: Asset references exist ───────────────────────────
     asset_ids = {a["id"] for a in assets}
@@ -287,7 +292,7 @@ def validate_and_fix(output: dict, extraction: dict = None) -> dict:
     has_missing_table = any(w["type"] == "missing_table_data" for w in warnings)
     has_math_review = any(q.get("mathHeavy") and q.get("needsHumanReview") for q in questions)
     has_text_quality_issue = any(
-        q.get("textQuality", {}).get("status") == "needs_review" and q.get("textQuality", {}).get("requiresMathReview")
+        q.get("textQuality", {}).get("status") in ("needs_review", "corrupt") and q.get("textQuality", {}).get("requiresMathReview")
         for q in questions
     )
     any_review = any(q.get("needsHumanReview") for q in questions)

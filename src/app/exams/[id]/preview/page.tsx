@@ -10,13 +10,16 @@ interface Option { letter: string; text: string; latex?: string; }
 interface CropInfo { status: string; url?: string; quality?: string; diagnostics?: { edgeTouch?: boolean; textTouchesEdge?: boolean; contentAreaRatio?: number }; }
 interface Asset {
   id: string; type: string; page: number; description?: string;
-  crops?: { context?: CropInfo; visual?: CropInfo; full?: CropInfo };
+  crops?: { context?: CropInfo; visual?: CropInfo; full?: CropInfo; best?: CropInfo };
   crop?: CropInfo;
 }
 interface Source { sourceId: string; groupId?: string; label?: string; kind?: string; pageStart?: number; crops?: { full?: CropInfo }; assetRefs?: string[]; }
 interface Blank { number: string; options: { letter: string; text: string; latex?: string }[]; }
 interface Question {
   questionId: string; number: string; type: string; statement: string; statementLatex?: string;
+  statementPlain?: string;
+  mathSpans?: { plain: string; latex: string; confidence?: number }[];
+  textQuality?: { status?: string };
   options?: Option[]; blanks?: Blank[] | null; group?: string; groupId?: string; displayNumber?: string;
   imageRefs?: string[]; tableRefs?: string[]; assetRefs?: string[]; sourceRefs?: { sourceId: string; childId?: string; mode: string }[];
   media?: { type: string; url: string; sourceId?: string; label?: string }[];
@@ -55,7 +58,7 @@ export default function PreviewPage() {
   const getBestUrl = (asset?: Asset): string | null => {
     if (!asset) return null;
     if (asset.type === 'embedded_image' && asset.crop?.url) return asset.crop.url;
-    const best = (asset.crops as any)?.best;
+    const best = asset.crops?.best;
     if (best?.url) return best.url;
     if (asset.crops?.visual?.url) return asset.crops.visual.url;
     if (asset.crop?.url) return asset.crop.url;
@@ -143,6 +146,22 @@ export default function PreviewPage() {
   };
 
   const images = getAllImages(current);
+  const childQuestions = data.questions.filter(q => q.parentQuestion === current.questionId);
+  const isGroupParent = Boolean(current.isGroup || current.type === 'group' || childQuestions.length > 0);
+
+  const getRenderableStatement = (q: Question): string => {
+    const latex = q.statementLatex || '';
+    const badLatex =
+      latex.includes('�') ||
+      latex.includes('\\begin{itemize}') ||
+      latex.includes('\\begin{center}') ||
+      latex.includes('\\_\\_') ||
+      (q.textQuality?.status === 'corrupt');
+    if (badLatex) {
+      return q.statementPlain || q.statement;
+    }
+    return latex || q.statementPlain || q.statement;
+  };
   const qJson = current;
 
   return (
@@ -216,7 +235,7 @@ export default function PreviewPage() {
             <div className="text-gray-900 text-base leading-relaxed">
               <MathText text={(() => {
                 const useRaw = current.type === 'multi_blank_choice' || current.tableRefs?.length;
-                let text = useRaw ? current.statement : (current.statementLatex || current.statement);
+                let text = useRaw ? current.statement : getRenderableStatement(current);
                 // Remove inline table text when table is shown as image asset
                 if (current.tableRefs?.length) {
                   const tableAsset = data.assets.find(a => current.tableRefs!.includes(a.id) && a.type === 'table');
@@ -230,7 +249,30 @@ export default function PreviewPage() {
             </div>
 
             {/* Answer area */}
-            {current.type === 'multi_blank_choice' && current.blanks?.length ? (
+            {isGroupParent ? (
+              <div className="space-y-2 rounded-lg border bg-white p-4">
+                <div className="text-sm font-semibold text-gray-700">Subquestoes</div>
+                {childQuestions.length === 0 ? (
+                  <div className="text-sm text-gray-500">Este grupo nao tem subquestoes extraidas.</div>
+                ) : (
+                  childQuestions
+                    .sort((a, b) => a.number.localeCompare(b.number, undefined, { numeric: true }))
+                    .map(child => (
+                      <button
+                        key={child.questionId}
+                        onClick={() => {
+                          const idx = questions.findIndex(q => q.questionId === child.questionId);
+                          if (idx >= 0) setSelected(idx);
+                        }}
+                        className="w-full rounded border border-gray-200 px-3 py-2 text-left text-sm hover:bg-gray-50"
+                      >
+                        <span className="font-medium text-gray-700">{child.displayNumber || child.number}</span>
+                        <span className="ml-2 text-gray-500">{child.type}</span>
+                      </button>
+                    ))
+                )}
+              </div>
+            ) : current.type === 'multi_blank_choice' && current.blanks?.length ? (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
                 {current.blanks.map(blank => (
                   <div key={blank.number} className="border rounded-lg bg-white overflow-hidden">

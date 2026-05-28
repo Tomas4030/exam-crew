@@ -35,6 +35,37 @@ def has_suspicious_math(text: str) -> bool:
     return any(p.search(text) for p in _SUSPICIOUS_MATH_PATTERNS)
 
 
+def should_fallback_math_vision(q: dict) -> bool:
+    text = q.get("statement", "") or ""
+    one_char_tokens = len(re.findall(r'\b.\b', text))
+    weird_hits = len(re.findall(r'[\ufffd□]|\[\d+;\d+u|n\s*\^\s*h', text))
+    tq_status = (q.get("textQuality") or {}).get("status")
+    return bool(
+        q.get("mathHeavy", False)
+        and (
+            has_corrupt_chars(text)
+            or has_suspicious_math(text)
+            or weird_hits > 0
+            or one_char_tokens > 10
+            or tq_status not in (None, "ok")
+        )
+    )
+
+
+def _text_quality_metrics(text: str) -> dict:
+    tokens = re.findall(r'\S+', text or "")
+    one_char = sum(1 for t in tokens if len(t) == 1)
+    weird = len(re.findall(r'[\ufffd□]|\[\d+;\d+u|�', text or ""))
+    math_struct = 1.0
+    if tokens:
+        math_struct = max(0.0, 1.0 - (one_char / len(tokens)))
+    return {
+        "oneCharTokenRatio": round((one_char / len(tokens)), 3) if tokens else 0.0,
+        "weirdGlyphCount": weird,
+        "mathStructureScore": round(math_struct, 3),
+    }
+
+
 # ── LaTeX validation ──────────────────────────────────────────────
 
 def validate_latex(text: str) -> dict[str, bool]:
@@ -176,7 +207,7 @@ def math_normalize(output: dict, extraction: dict, delay: float = 2.0) -> dict:
         # Detect corrupt text
         corrupt = has_corrupt_chars(statement)
         suspicious = has_suspicious_math(statement) if is_math_exam else False
-        needs_normalization = is_math_heavy and (corrupt or suspicious or is_math_exam)
+        needs_normalization = should_fallback_math_vision(q)
 
         # Skip normalization for questions that don't benefit from LaTeX rewriting
         if needs_normalization:
@@ -277,7 +308,7 @@ def math_normalize(output: dict, extraction: dict, delay: float = 2.0) -> dict:
                 q["statementPlain"] = statement
                 q["statementLatex"] = latex_stmt  # Keep best attempt
                 q["mathSpans"] = extract_math_spans(latex_stmt)
-                _set_text_quality(q, "needs_review", "vision_latex_normalized",
+                _set_text_quality(q, "corrupt", "vision_latex_normalized",
                                   has_latex=True, math_heavy=is_math_heavy, checks=checks,
                                   requires_review=True)
                 q["needsHumanReview"] = True
@@ -290,7 +321,7 @@ def math_normalize(output: dict, extraction: dict, delay: float = 2.0) -> dict:
             # Vision call failed entirely
             q["statementPlain"] = statement
             q["statementLatex"] = statement
-            _set_text_quality(q, "needs_review", "pdf_text_raw",
+            _set_text_quality(q, "corrupt", "pdf_text_raw",
                               corrupt=corrupt, math_heavy=is_math_heavy, requires_review=True)
             q["needsHumanReview"] = True
             warnings_generated.append({
@@ -319,6 +350,7 @@ def _set_text_quality(q: dict, status: str, source: str, *,
         "mathHeavy": math_heavy,
         "requiresMathReview": requires_review,
     }
+    tq.update(_text_quality_metrics(q.get("statement", "") or ""))
     if checks:
         tq["checks"] = checks
     q["textQuality"] = tq
