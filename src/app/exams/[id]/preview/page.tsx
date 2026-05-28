@@ -103,9 +103,6 @@ export default function PreviewPage() {
         else if (src.crops?.full?.url) {
           add(src.crops.full.url);
         }
-        else if (src.assetRefs?.length) {
-          for (const aId of src.assetRefs) add(getBestUrl(data.assets.find(a => a.id === aId)));
-        }
 
         // Per-source fallback: embedded images on source page
         if (urls.length === before && src.pageStart) {
@@ -184,28 +181,34 @@ export default function PreviewPage() {
       </header>
 
       <div className="flex flex-1 overflow-hidden">
-        {/* Left sidebar — question nav */}
+        {/* Left sidebar — question nav grouped */}
         <aside className="w-56 bg-white border-r overflow-y-auto shrink-0 p-3">
-          <div className="grid grid-cols-4 gap-1.5">
-            {questions.map((q, i) => (
-              <button
-                key={q.questionId}
-                onClick={() => setSelected(i)}
-                className={`w-full aspect-square rounded text-xs font-medium flex items-center justify-center transition-colors
-                  ${i === selected ? 'bg-blue-600 text-white' : answers[q.questionId] ? 'bg-green-100 text-green-800 border border-green-300' : 'bg-gray-100 hover:bg-gray-200 text-gray-700'}`}
-              >
-                {q.displayNumber ? q.number : q.number}
-              </button>
-            ))}
-          </div>
-          {/* Group legend */}
-          {questions.some(q => q.group) && (
-            <div className="mt-4 text-xs text-gray-500 space-y-1">
-              {[...new Set(questions.map(q => q.group).filter(Boolean))].map(g => (
-                <div key={g} className="font-medium">{g}</div>
-              ))}
-            </div>
-          )}
+          {(() => {
+            const groups = [...new Set(questions.map(q => q.group || 'Perguntas'))];
+            return groups.map(group => {
+              const groupQs = questions.filter(q => (q.group || 'Perguntas') === group);
+              return (
+                <div key={group} className="mb-4">
+                  <div className="text-xs font-bold text-gray-900 uppercase tracking-wide mb-1.5 px-1">{group}</div>
+                  <div className="grid grid-cols-4 gap-1.5">
+                    {groupQs.map(q => {
+                      const i = questions.indexOf(q);
+                      return (
+                        <button
+                          key={q.questionId}
+                          onClick={() => setSelected(i)}
+                          className={`w-full aspect-square rounded text-xs font-bold flex items-center justify-center border transition-colors
+                            ${i === selected ? 'bg-blue-600 text-white border-blue-600' : answers[q.questionId] ? 'bg-blue-50 text-blue-800 border-blue-300' : 'bg-white text-gray-900 border-gray-300 hover:border-blue-400'}`}
+                        >
+                          {q.number}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            });
+          })()}
         </aside>
 
         {/* Center — question content */}
@@ -336,7 +339,7 @@ export default function PreviewPage() {
               <button
                 onClick={() => setSelected(Math.max(0, selected - 1))}
                 disabled={selected === 0}
-                className="px-4 py-2 rounded bg-gray-200 hover:bg-gray-300 disabled:opacity-40 text-sm"
+                className="px-4 py-2 rounded bg-white border border-gray-300 hover:bg-gray-50 disabled:opacity-40 text-sm text-gray-900 font-medium"
               >
                 &larr; Anterior
               </button>
