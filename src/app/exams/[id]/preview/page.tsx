@@ -93,11 +93,16 @@ export default function PreviewPage() {
         else if (src.kind === 'image_set' && src.assetRefs?.length) {
           for (const aId of src.assetRefs) add(getBestUrl(data.assets.find(a => a.id === aId)));
         }
-        // For other sources (table, graph, text), prefer the document crop
+        // For other sources: best crop > assetRefs > full
+        else if ((src.crops as any)?.best?.url) {
+          add((src.crops as any).best.url);
+        }
+        else if (src.assetRefs?.length) {
+          for (const aId of src.assetRefs) add(getBestUrl(data.assets.find(a => a.id === aId)));
+        }
         else if (src.crops?.full?.url) {
           add(src.crops.full.url);
         }
-        // Fallback: try assetRefs anyway
         else if (src.assetRefs?.length) {
           for (const aId of src.assetRefs) add(getBestUrl(data.assets.find(a => a.id === aId)));
         }
@@ -273,23 +278,28 @@ export default function PreviewPage() {
                 )}
               </div>
             ) : current.type === 'multi_blank_choice' && current.blanks?.length ? (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
-                {current.blanks.map(blank => (
-                  <div key={blank.number} className="border rounded-lg bg-white overflow-hidden">
-                    <div className="font-bold text-center border-b p-2 bg-gray-50">{blank.number}</div>
-                    <div className="p-3 space-y-2">
-                      {blank.options.map(opt => {
-                        const key = `${current.questionId}_${blank.number}`;
-                        return (
-                          <label key={opt.letter} className={`flex items-start gap-2 p-2 rounded cursor-pointer ${answers[key] === opt.letter ? 'bg-blue-50 border border-blue-300' : 'hover:bg-gray-50'}`}>
-                            <input type="radio" name={key} value={opt.letter} checked={answers[key] === opt.letter} onChange={() => setAnswers(prev => ({ ...prev, [key]: opt.letter }))} className="mt-1" />
-                            <span className="text-sm"><strong>{opt.letter})</strong> <MathText text={opt.latex || opt.text} /></span>
-                          </label>
-                        );
-                      })}
-                    </div>
-                  </div>
-                ))}
+              <div className="rounded-lg border bg-white p-4 space-y-3">
+                <div className="text-sm font-semibold text-gray-700">Respostas</div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {current.blanks.map(blank => {
+                    const key = `${current.questionId}_${blank.number}`;
+                    return (
+                      <label key={blank.number} className="flex items-center gap-3 rounded border px-3 py-2">
+                        <span className="w-8 font-bold text-blue-700">{blank.number}</span>
+                        <select
+                          value={answers[key] || ''}
+                          onChange={e => setAnswers(prev => ({ ...prev, [key]: e.target.value }))}
+                          className="flex-1 rounded border border-gray-300 bg-white px-2 py-1.5 text-sm text-gray-900"
+                        >
+                          <option value="">Selecionar...</option>
+                          {blank.options.map(opt => (
+                            <option key={opt.letter} value={opt.letter}>{opt.letter}) {opt.text}</option>
+                          ))}
+                        </select>
+                      </label>
+                    );
+                  })}
+                </div>
               </div>
             ) : current.type === 'multiple_choice' && current.options && current.options.length > 0 ? (
               <div className="space-y-2">

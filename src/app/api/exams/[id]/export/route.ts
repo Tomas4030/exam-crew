@@ -20,16 +20,14 @@ export async function GET(
 
   const examData = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
 
-  // Build filename
-  const title = examData.metadata?.title || '';
+  // Build filename: HistoriaA2025Fase1_ID.zip
+  const subject = (examData.metadata?.subject || 'Exame')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9]/g, '');
+  const year = examData.metadata?.year || '';
+  const phase = (examData.metadata?.phase || '').replace(/[^0-9]/g, '');
   const shortId = id.split('_').pop() || id.slice(-8);
-  const slug = title
-    ? title.toLowerCase()
-        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-        .replace(/[^a-z0-9]+/g, '_')
-        .replace(/^_|_$/g, '')
-    : id;
-  const zipFilename = `${slug}-${shortId}.zip`;
+  const zipFilename = `${subject}${year}${phase ? `Fase${phase}` : ''}_${shortId}.zip`;
 
   // Collect only used asset paths from the JSON
   const usedFiles = collectUsedAssets(examData);

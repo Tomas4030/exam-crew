@@ -652,7 +652,7 @@ def crop_assets(output: dict, extraction: dict, output_dir: Path) -> dict:
 
             cropped.save(str(full_path))
 
-            source.setdefault("crops", {})["full"] = {
+            crop_info = {
                 "status": "success",
                 "method": method,
                 "relativePath": f"assets/sources/{full_filename}",
@@ -660,6 +660,8 @@ def crop_assets(output: dict, extraction: dict, output_dir: Path) -> dict:
                 "width": cropped.width,
                 "height": cropped.height,
             }
+            source.setdefault("crops", {})["full"] = crop_info
+            source.setdefault("crops", {})["best"] = crop_info
         except Exception:
             pass
 
