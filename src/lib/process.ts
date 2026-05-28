@@ -1,15 +1,17 @@
 import { spawn } from 'child_process';
 import path from 'path';
+import os from 'os';
 import { ProcessResult } from './types';
 
 export function runPipeline(pdfPath: string, examId: string): Promise<ProcessResult> {
   return new Promise((resolve) => {
     const pipelineDir = path.join(process.cwd(), 'pipeline');
+    const uvPath = path.join(os.homedir(), '.local', 'bin', 'uv.exe');
     console.log(`[Pipeline] Starting: ${examId}`);
     console.log(`[Pipeline] PDF: ${pdfPath}`);
     console.log(`[Pipeline] CWD: ${pipelineDir}`);
 
-    const child = spawn('uv', ['run', 'python', '-m', 'src.main', pdfPath, examId], {
+    const child = spawn(uvPath, ['run', 'python', '-m', 'src.main', pdfPath, examId], {
       cwd: pipelineDir,
     });
 
