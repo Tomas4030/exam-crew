@@ -13,7 +13,7 @@ interface Asset {
   crops?: { context?: CropInfo; visual?: CropInfo; full?: CropInfo; best?: CropInfo };
   crop?: CropInfo;
 }
-interface Source { sourceId: string; groupId?: string; label?: string; kind?: string; pageStart?: number; crops?: { full?: CropInfo }; assetRefs?: string[]; }
+interface Source { sourceId: string; groupId?: string; label?: string; kind?: string; pageStart?: number; crops?: { best?: CropInfo; full?: CropInfo; visual?: CropInfo; context?: CropInfo; document?: CropInfo }; assetRefs?: string[]; }
 interface Blank { number: string; options: { letter: string; text: string; latex?: string }[]; }
 interface Question {
   questionId: string; number: string; type: string; statement: string; statementLatex?: string;
@@ -54,94 +54,82 @@ export default function PreviewPage() {
     return parent?.statement || null;
   };
 
-  // Get best URL for an asset — backend provides crops.best
+  // Get best URL for an asset
   const getBestUrl = (asset?: Asset): string | null => {
     if (!asset) return null;
-    if (asset.type === 'embedded_image' && asset.crop?.url) return asset.crop.url;
-    const best = asset.crops?.best;
-    if (best?.url) return best.url;
-    if (asset.crops?.visual?.url) return asset.crops.visual.url;
-    if (asset.crop?.url) return asset.crop.url;
-    if (asset.crops?.context?.url) return asset.crops.context.url;
-    return null;
+    return (
+      asset.crops?.best?.url ||
+      asset.crops?.visual?.url ||
+      asset.crop?.url ||
+      asset.crops?.context?.url ||
+      asset.crops?.full?.url ||
+      null
+    );
   };
 
   // Get images for current question
   const getAllImages = (q: Question): string[] => {
     const urls: string[] = [];
     const add = (url?: string | null) => { if (url && !urls.includes(url)) urls.push(url); };
+    const addAsset = (id?: string) => { if (id) add(getBestUrl(data.assets.find(a => a.id === id))); };
 
-    // 1. media (cache from backend, but don't block sourceRefs)
-    if (q.media?.length) {
-      for (const m of q.media) add(m.url);
+    // 1. Direct refs (most specific — always wins)
+    for (const refId of [...(q.imageRefs || []), ...(q.assetRefs || []), ...(q.tableRefs || [])]) {
+      addAsset(refId);
     }
 
-    // 2. sourceRefs — expand each source independently
+    // 2. Source refs: assetRefs first, source crop only as fallback
     if (q.sourceRefs?.length) {
       for (const ref of q.sourceRefs) {
-        const before = urls.length;
         const src = data.sources?.find(s => s.sourceId === ref.sourceId);
         if (!src) continue;
+        const srcAssets = src.assetRefs || [];
 
-        // Specific child image (e.g. "imagem B")
-        if (ref.childId && src.assetRefs?.length) {
-          const letter = ref.childId.split('_').pop() || 'a';
+        // Specific child (e.g. "imagem B")
+        if (ref.childId && srcAssets.length) {
+          const letter = ref.childId.split('_').pop()?.toLowerCase() || 'a';
           const idx = letter.charCodeAt(0) - 'a'.charCodeAt(0);
-          add(getBestUrl(data.assets.find(a => a.id === src.assetRefs![idx])));
-        }
-        // For image_set sources (e.g. 4 images A/B/C/D), show embedded assets
-        else if (src.kind === 'image_set' && src.assetRefs?.length) {
-          for (const aId of src.assetRefs) add(getBestUrl(data.assets.find(a => a.id === aId)));
-        }
-        // For other sources: best crop > assetRefs > full
-        else if ((src.crops as any)?.best?.url) {
-          add((src.crops as any).best.url);
-        }
-        else if (src.assetRefs?.length) {
-          for (const aId of src.assetRefs) add(getBestUrl(data.assets.find(a => a.id === aId)));
-        }
-        else if (src.crops?.full?.url) {
-          add(src.crops.full.url);
+          if (idx >= 0 && idx < srcAssets.length) addAsset(srcAssets[idx]);
+          continue;
         }
 
-        // Per-source fallback: embedded images on source page
-        if (urls.length === before && src.pageStart) {
-          for (const a of data.assets.filter(a => a.page === src.pageStart && a.type === 'embedded_image')) {
-            add(getBestUrl(a));
-          }
+        // Source has asset images — use them (not the full page crop)
+        if (srcAssets.length) {
+          for (const aId of srcAssets) addAsset(aId);
+          continue;
         }
 
-        // Per-source last resort: source full crop
-        if (urls.length === before && src.crops?.full?.url) {
-          add(src.crops.full.url);
-        }
+        // No assets — use source document crop as fallback
+        add(
+          (src.crops as any)?.best?.url ||
+          src.crops?.full?.url ||
+          null
+        );
       }
     }
 
-    // 3. Direct refs
-    for (const refId of [...(q.imageRefs || []), ...(q.assetRefs || [])]) {
-      add(getBestUrl(data.assets.find(a => a.id === refId)));
-    }
-
-    // 4. Text-based detection (for old outputs without sourceRefs)
+    // 3. Text-based detection (old outputs without sourceRefs)
     if (urls.length === 0 && q.groupId && data.sources) {
       const text = (q.statement || '').toLowerCase();
       const groupSources = data.sources.filter(s => s.groupId === q.groupId);
       const docNums = [...text.matchAll(/documentos?\s+((?:\d+[\s,e]*)+)/gi)]
         .flatMap(m => [...m[1].matchAll(/\d+/g)].map(n => n[0]));
       const allDocs = /cada um dos documentos|dos documentos apresentados|dos dois documentos|dos três documentos/i.test(text);
-
       const matched = allDocs ? groupSources : groupSources.filter(s =>
         docNums.some(n => s.sourceId.endsWith(`_${n}`))
       );
       for (const src of matched) {
         if (src.assetRefs?.length) {
-          for (const aId of src.assetRefs) add(getBestUrl(data.assets.find(a => a.id === aId)));
-        } else if (src.pageStart) {
-          for (const a of data.assets.filter(a => a.page === src.pageStart && a.type === 'embedded_image')) add(getBestUrl(a));
+          for (const aId of src.assetRefs) addAsset(aId);
+        } else if (src.crops?.full?.url) {
+          add(src.crops.full.url);
         }
-        if (urls.length === 0 && src.crops?.full?.url) add(src.crops.full.url);
       }
+    }
+
+    // 4. Media as last fallback
+    if (urls.length === 0 && q.media?.length) {
+      for (const m of q.media) add(m.url);
     }
 
     return urls;
