@@ -41,10 +41,14 @@ def normalize(output: dict) -> dict:
                 "complete o texto" in text or
                 "a cada espaço" in text or
                 "cada um dos números" in text or
-                "cada espaço corresponde" in text
+                "cada espaço corresponde" in text or
+                "opção adequada para cada espaço" in text or
+                "selecionando a opção" in text
             )
-            if not has_fill_instructions and not q.get("blanks"):
+            if not has_fill_instructions:
                 q["type"] = "open_answer"
+                q["blanks"] = None
+                q["statementLatex"] = None
 
     # ── 0e. Reassign tables to correct question by position ──────
     # Tables with options (a/b/c/d) belong to multi_blank_choice questions
@@ -299,59 +303,82 @@ def _merge_false_multi_blank_groups(output: dict):
 
 
 def _fix_table_assignment(questions: list[dict], assets: list[dict]):
-    """Fix table assignment: options tables only go to multi_blank_choice questions.
+    """Fix option-table assignment. Catches clones and 1./2./3. format."""
 
-    Rules:
-    - Tables with a)/b)/c)/d) content are options tables
-    - Options tables can ONLY belong to multi_blank_choice questions
-    - Questions that only reference documents must NOT have options tables
-    """
-    _DOC_RE = re.compile(r'\bdocumentos?\s+\d', re.IGNORECASE)
-
-    def _is_multi_blank(q: dict) -> bool:
-        text = (q.get("statement") or "").lower()
+    def _is_real_multi_blank(q: dict) -> bool:
+        text = (q.get("statement") or q.get("rawText") or "").lower()
         return (
-            q.get("type") == "multi_blank_choice"
-            or "complete o texto" in text
-            or "cada espaço" in text
-            or "opção adequada" in text
+            "complete o texto" in text or
+            "cada espaço" in text or
+            "opção adequada" in text or
+            "selecionando a opção" in text or
+            "corresponde à opção" in text
         )
 
     def _is_options_table(asset: dict) -> bool:
+        # Check rows content
         rows = asset.get("rows") or []
-        if not rows:
-            return False
-        text = " ".join(
-            str(c) for row in rows
-            for c in (row.values() if isinstance(row, dict) else row)
-        ).lower()
-        return ("a)" in text or "1)" in text) and ("b)" in text or "2)" in text)
+        if rows:
+            text = " ".join(
+                str(c) for row in rows
+                for c in (row.values() if isinstance(row, dict) else row)
+            ).lower()
+            has_letters = ("a)" in text and "b)" in text) or ("a)" in text and "c)" in text)
+            has_numbers = ("1." in text and "2." in text) or ("1)" in text and "2)" in text)
+            if has_letters or has_numbers:
+                return True
+        # Check columns for a)/b)/c)/d) headers
+        cols = [str(c).lower().strip() for c in (asset.get("columns") or [])]
+        if any("a)" in c or "b)" in c or "c)" in c for c in cols):
+            return True
+        return False
 
-    table_assets = [a for a in assets if a.get("type") == "table" or "tabela" in a.get("id", "")]
+    # Collect option table IDs + prefixes for clone detection
+    option_table_ids: set[str] = set()
+    table_prefixes: set[str] = set()
 
-    for asset in table_assets:
-        if not _is_options_table(asset):
+    for asset in assets:
+        aid = asset.get("id", "")
+        if not ("tabela" in aid.lower() or asset.get("type") == "table"):
             continue
+        if _is_options_table(asset):
+            option_table_ids.add(aid)
+            m = re.match(r'^(tabela_p\d+)', aid.lower())
+            if m:
+                table_prefixes.add(m.group(1))
 
-        asset_id = asset.get("id", "")
+    # Catch ALL clones by prefix (tabela_p12_12, tabela_p12_abc, etc.)
+    for asset in assets:
+        aid = asset.get("id", "")
+        aid_lower = aid.lower()
+        for prefix in table_prefixes:
+            if aid_lower == prefix or aid_lower.startswith(prefix + "_"):
+                option_table_ids.add(aid)
+
+    if not option_table_ids:
+        return
+
+    # Remove from all non-fill-blank questions
+    for q in questions:
+        if _is_real_multi_blank(q):
+            continue
+        for field in ("assetRefs", "tableRefs", "imageRefs"):
+            refs = q.get(field) or []
+            if any(r in option_table_ids for r in refs):
+                q[field] = [r for r in refs if r not in option_table_ids]
+
+    # Assign to the correct fill-blank question on the same page
+    for asset in assets:
+        aid = asset.get("id", "")
+        if aid not in option_table_ids:
+            continue
         page = asset.get("page")
-
-        # Remove this options table from ALL non-multi_blank questions
-        for q in questions:
-            if _is_multi_blank(q):
-                continue
-            for field in ("assetRefs", "tableRefs"):
-                refs = q.get(field) or []
-                if asset_id in refs:
-                    q[field] = [r for r in refs if r != asset_id]
-
-        # Assign to the multi_blank_choice question on the same page
-        candidates = [q for q in questions if q.get("sourcePage") == page and _is_multi_blank(q)]
+        candidates = [q for q in questions if q.get("sourcePage") == page and _is_real_multi_blank(q)]
         if candidates:
             owner = candidates[0]
             owner.setdefault("tableRefs", [])
             owner.setdefault("assetRefs", [])
-            if asset_id not in owner["tableRefs"]:
-                owner["tableRefs"].append(asset_id)
-            if asset_id not in owner["assetRefs"]:
-                owner["assetRefs"].append(asset_id)
+            if aid not in owner["tableRefs"]:
+                owner["tableRefs"].append(aid)
+            if aid not in owner["assetRefs"]:
+                owner["assetRefs"].append(aid)

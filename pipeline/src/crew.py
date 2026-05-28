@@ -252,6 +252,9 @@ Text:
         output = crop_assets(output, extraction, crop_output_dir)
         output.pop("_pdf_path", None)
 
+        # Step 3.7b: Re-normalize after crops (catches cloned table assets)
+        output = normalize(output)
+
         # Step 3.8: Math normalization (LaTeX, textQuality)
         report_progress("math_normalize", "Normalizing mathematical text")
         output = math_normalize(output, extraction)

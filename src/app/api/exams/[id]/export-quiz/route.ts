@@ -260,19 +260,17 @@ function collectAssetsFromQuestion(
     const source = sourcesById.get(ref.sourceId);
     if (!source) continue;
 
-    if (source.assetRefs?.length) {
-      for (const assetId of source.assetRefs) {
-        addAsset(
-          getBestAssetPath(assetsById.get(assetId)),
-          examDir,
-          assetsDir,
-          state,
-        );
+    // Specific child — use internal asset
+    if (ref.childId && source.assetRefs?.length) {
+      const letter = String(ref.childId).split('_').pop()?.toLowerCase() || 'a';
+      const idx = letter.charCodeAt(0) - 'a'.charCodeAt(0);
+      if (idx >= 0 && idx < source.assetRefs.length) {
+        addAsset(getBestAssetPath(assetsById.get(source.assetRefs[idx])), examDir, assetsDir, state);
       }
-
       continue;
     }
 
+    // Full document — always use source crop
     addAsset(getBestSourcePath(source), examDir, assetsDir, state);
   }
 
@@ -403,6 +401,8 @@ function indexHtml(clientData: AnyObj) {
   <meta name="color-scheme" content="light">
   <title>${escapeHtml(title)}</title>
   <link rel="stylesheet" href="styles.css">
+  <script>window.MathJax={tex:{inlineMath:[['\\\\(','\\\\)']],displayMath:[['\\\\[','\\\\]']],processEscapes:true,macros:{sen:'\\\\operatorname{sen}',tg:'\\\\operatorname{tg}',cotg:'\\\\operatorname{cotg}',arctg:'\\\\operatorname{arctg}'}},startup:{typeset:false}};</script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
   <script defer src="data.js"></script>
   <script defer src="app.js"></script>
 </head>
@@ -841,6 +841,10 @@ textarea:focus,select:focus{outline:3px solid rgba(36,87,214,.16);border-color:#
   .question-card{box-shadow:none;border:0;padding:0;overflow:visible}
   .asset-img{max-height:none}
 }
+mjx-container{outline:none;max-width:100%;overflow-x:auto}
+mjx-container[display="true"]{display:block;margin:1rem 0}
+.statement{overflow-wrap:anywhere}
+.option-text{overflow-wrap:anywhere}
 `;
 const APP_JS = String.raw`const state = {
   exam: null,
@@ -992,6 +996,7 @@ function render() {
     (isGroup ? renderGroupChildren(children) : renderAnswer(q));
 
   bindQuestionEvents(card);
+  if(window.MathJax&&window.MathJax.typesetPromise){window.MathJax.typesetPromise([card]).catch(function(){});}
 }
 
 function bindQuestionEvents(root) {
@@ -1131,42 +1136,51 @@ function renderImages(q) {
 
 function collectImagePaths(q) {
   var paths = [];
+  var seen = {};
+  var hideOptionTables = q.type === 'multi_blank_choice' && q.blanks && q.blanks.length > 0;
 
-  var directRefs = []
-    .concat(q.assetRefs || [])
-    .concat(q.imageRefs || [])
-    .concat(q.tableRefs || []);
-
-  for (var i = 0; i < directRefs.length; i++) {
-    paths.push(getAssetPath(findAsset(directRefs[i])));
+  function isOptionTable(id) {
+    if (!id) return false;
+    return id.toLowerCase().indexOf('tabela') >= 0;
   }
 
+  // 1. SourceRefs first — use document crop
   if (q.sourceRefs && q.sourceRefs.length) {
     for (var r = 0; r < q.sourceRefs.length; r++) {
       var ref = q.sourceRefs[r];
       var source = findSource(ref.sourceId);
       if (!source) continue;
 
-      if (source.assetRefs && source.assetRefs.length) {
-        if (ref.childId) {
-          var childPath = getChildAssetPath(source, ref.childId);
-          if (childPath) {
-            paths.push(childPath);
-            continue;
-          }
-        }
-
-        for (var a = 0; a < source.assetRefs.length; a++) {
-          paths.push(getAssetPath(findAsset(source.assetRefs[a])));
-        }
-
+      if (ref.childId && source.assetRefs && source.assetRefs.length) {
+        var childPath = getChildAssetPath(source, ref.childId);
+        if (childPath) paths.push(childPath);
         continue;
       }
 
-      paths.push(getSourcePath(source));
+      // Full document — use source crop, not internal assets
+      var sp = getSourcePath(source);
+      if (sp) paths.push(sp);
+    }
+
+    // If has sourceRefs and not multi_blank, don't pull direct assets
+    if (paths.some(Boolean) && !hideOptionTables) {
+      return paths.filter(Boolean);
     }
   }
 
+  // 2. Direct refs (skip option tables if selects exist)
+  var directRefs = []
+    .concat(q.assetRefs || [])
+    .concat(q.imageRefs || [])
+    .concat(q.tableRefs || []);
+
+  for (var i = 0; i < directRefs.length; i++) {
+    var rid = directRefs[i];
+    if (hideOptionTables && isOptionTable(rid)) continue;
+    paths.push(getAssetPath(findAsset(rid)));
+  }
+
+  // 3. Media fallback
   if (!paths.some(Boolean) && q.media && q.media.length) {
     for (var m = 0; m < q.media.length; m++) {
       paths.push(q.media[m].relativePath || q.media[m].url);
@@ -1379,7 +1393,9 @@ function cleanPath(value) {
 }
 
 function formatText(value) {
-  return esc(value).replace(/\n/g, '<br>');
+  var text=String(value==null?'':value).replace(/\\\\textsuperscript\\{a\\}/g,'ª').replace(/\\\\textsuperscript\\{o\\}/g,'º').replace(/\\\\degree/g,'º').replace(/\\\\begin\\{itemize\\}/g,'').replace(/\\\\end\\{itemize\\}/g,'').replace(/\\\\item\\s*/g,'• ');
+  var parts=text.split(/(\\\\\\([\\s\\S]*?\\\\\\)|\\\\\\[[\\s\\S]*?\\\\\\])/g);
+  return parts.map(function(p){if(p.match(/^\\\\\\(/)||p.match(/^\\\\\\[/))return p;return esc(p).replace(/\\n/g,'<br>');}).join('');
 }
 
 function cleanOptionText(value) {

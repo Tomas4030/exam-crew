@@ -71,44 +71,48 @@ export default function PreviewPage() {
   const getAllImages = (q: Question): string[] => {
     const urls: string[] = [];
     const add = (url?: string | null) => { if (url && !urls.includes(url)) urls.push(url); };
-    const addAsset = (id?: string) => { if (id) add(getBestUrl(data.assets.find(a => a.id === id))); };
 
-    // 1. Direct refs (most specific — always wins)
-    for (const refId of [...(q.imageRefs || []), ...(q.assetRefs || []), ...(q.tableRefs || [])]) {
-      addAsset(refId);
-    }
+    const hideOptionTables = q.type === 'multi_blank_choice' && q.blanks && q.blanks.length > 0;
+    const isOptionTable = (id: string) => {
+      const a = data.assets.find(x => x.id === id);
+      return (a?.type === 'table' || id.toLowerCase().includes('tabela'));
+    };
 
-    // 2. Source refs: assetRefs first, source crop only as fallback
+    // 1. SourceRefs first — use document crop (not internal assets)
     if (q.sourceRefs?.length) {
       for (const ref of q.sourceRefs) {
         const src = data.sources?.find(s => s.sourceId === ref.sourceId);
         if (!src) continue;
-        const srcAssets = src.assetRefs || [];
 
-        // Specific child (e.g. "imagem B")
-        if (ref.childId && srcAssets.length) {
+        // Specific child only
+        if (ref.childId && src.assetRefs?.length) {
           const letter = ref.childId.split('_').pop()?.toLowerCase() || 'a';
           const idx = letter.charCodeAt(0) - 'a'.charCodeAt(0);
-          if (idx >= 0 && idx < srcAssets.length) addAsset(srcAssets[idx]);
+          if (idx >= 0 && idx < src.assetRefs.length) {
+            add(getBestUrl(data.assets.find(a => a.id === src.assetRefs![idx])));
+          }
           continue;
         }
 
-        // Source has asset images — use them (not the full page crop)
-        if (srcAssets.length) {
-          for (const aId of srcAssets) addAsset(aId);
-          continue;
-        }
-
-        // No assets — use source document crop as fallback
+        // Full document — always use source crop
         add(
           (src.crops as any)?.best?.url ||
+          (src.crops as any)?.document?.url ||
           src.crops?.full?.url ||
           null
         );
       }
+      // If has sourceRefs and not multi_blank, don't pull direct assetRefs
+      if (!hideOptionTables) return urls;
     }
 
-    // 3. Text-based detection (old outputs without sourceRefs)
+    // 2. Direct refs (skip option tables if selects exist)
+    for (const refId of [...(q.imageRefs || []), ...(q.assetRefs || []), ...(q.tableRefs || [])]) {
+      if (hideOptionTables && isOptionTable(refId)) continue;
+      add(getBestUrl(data.assets.find(a => a.id === refId)));
+    }
+
+    // 3. Text-based fallback
     if (urls.length === 0 && q.groupId && data.sources) {
       const text = (q.statement || '').toLowerCase();
       const groupSources = data.sources.filter(s => s.groupId === q.groupId);
@@ -119,15 +123,11 @@ export default function PreviewPage() {
         docNums.some(n => s.sourceId.endsWith(`_${n}`))
       );
       for (const src of matched) {
-        if (src.assetRefs?.length) {
-          for (const aId of src.assetRefs) addAsset(aId);
-        } else if (src.crops?.full?.url) {
-          add(src.crops.full.url);
-        }
+        add((src.crops as any)?.best?.url || src.crops?.full?.url || null);
       }
     }
 
-    // 4. Media as last fallback
+    // 4. Media fallback
     if (urls.length === 0 && q.media?.length) {
       for (const m of q.media) add(m.url);
     }
