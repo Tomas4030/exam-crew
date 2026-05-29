@@ -139,98 +139,7 @@ def _crop_context_bbox(img: Image.Image, bbox: dict, is_table: bool) -> Image.Im
     return img.crop((x, y, min(w, x + crop_w), min(h, y + crop_h)))
 
 
-def _trim_bbox_rect_away_from_running_text(
-    pdf_path: str | None,
-    page_num: int | None,
-    img: Image.Image,
-    rect_px: tuple[int, int, int, int],
-) -> tuple[int, int, int, int]:
-    """Trim only text that sits on the crop borders.
-
-    This is a general safety pass for bbox/metadata crops.  The vision bbox is
-    often approximately correct but can include the question sentence above the
-    figure or a strip of running text on the left.  We do NOT erase text from
-    the image.  We move the crop edge inward when a large text block touches an
-    edge.  Short diagram labels such as A, B, O, x, y, Re(z), Im(z) are kept.
-    """
-    if not pdf_path or not page_num:
-        return rect_px
-
-    left, top, right, bottom = rect_px
-    crop_w = right - left
-    crop_h = bottom - top
-    if crop_w < 80 or crop_h < 80:
-        return rect_px
-
-    try:
-        doc = fitz.open(pdf_path)
-        page = doc[page_num - 1]
-        page_rect = page.rect
-        blocks = page.get_text("dict")["blocks"]
-        doc.close()
-    except Exception:
-        return rect_px
-
-    img_w, img_h = img.size
-    sx = img_w / max(1.0, page_rect.width)
-    sy = img_h / max(1.0, page_rect.height)
-
-    new_left, new_top, new_right, new_bottom = left, top, right, bottom
-    edge_pad = 10
-
-    for block in blocks:
-        if block.get("type") != 0:
-            continue
-
-        block_text = ""
-        for line in block.get("lines", []):
-            block_text += "".join(s.get("text", "") for s in line.get("spans", []))
-        block_text = block_text.strip()
-        if not block_text or _is_diagram_label(block_text) or len(block_text) <= 15:
-            continue
-
-        br = fitz.Rect(block["bbox"])
-        bx0, by0 = int(br.x0 * sx), int(br.y0 * sy)
-        bx1, by1 = int(br.x1 * sx), int(br.y1 * sy)
-
-        ix0, iy0 = max(left, bx0), max(top, by0)
-        ix1, iy1 = min(right, bx1), min(bottom, by1)
-        if ix1 <= ix0 or iy1 <= iy0:
-            continue
-
-        inter_area = (ix1 - ix0) * (iy1 - iy0)
-        block_area = max(1, (bx1 - bx0) * (by1 - by0))
-        if inter_area / block_area < 0.15:
-            continue
-
-        # Text strip on the left/right side of the candidate.
-        if bx0 <= left + crop_w * 0.38 and bx1 <= left + crop_w * 0.62:
-            new_left = max(new_left, bx1 + edge_pad)
-        elif bx1 >= right - crop_w * 0.38 and bx0 >= left + crop_w * 0.38:
-            new_right = min(new_right, bx0 - edge_pad)
-
-        # Question sentence above / caption-like running text below.
-        if by0 <= top + crop_h * 0.22 and by1 <= top + crop_h * 0.45:
-            new_top = max(new_top, by1 + edge_pad)
-        elif by1 >= bottom - crop_h * 0.18 and by0 >= top + crop_h * 0.55:
-            new_bottom = min(new_bottom, by0 - edge_pad)
-
-    # Only accept the trim if it leaves a useful crop.
-    if new_right - new_left < max(80, crop_w * 0.40):
-        new_left, new_right = left, right
-    if new_bottom - new_top < max(80, crop_h * 0.40):
-        new_top, new_bottom = top, bottom
-
-    return (new_left, new_top, new_right, new_bottom)
-
-
-def _crop_visual_bbox(
-    img: Image.Image,
-    bbox: dict,
-    is_table: bool = False,
-    pdf_path: str | None = None,
-    page_num: int | None = None,
-) -> Image.Image | None:
+def _crop_visual_bbox(img: Image.Image, bbox: dict, is_table: bool = False) -> Image.Image | None:
     """Tight visual crop from bbox_estimate / metadata.
 
     This is intentionally much tighter than _crop_context_bbox.  It is used as
@@ -269,10 +178,6 @@ def _crop_visual_bbox(
     right = int(w * x1 / 100)
     bottom = int(h * y1 / 100)
 
-    left, top, right, bottom = _trim_bbox_rect_away_from_running_text(
-        pdf_path, page_num, img, (left, top, right, bottom)
-    )
-
     if right - left < 50 or bottom - top < 50:
         return None
     return img.crop((left, top, right, bottom))
@@ -291,6 +196,196 @@ def _auto_visual_is_polluted(diag: dict) -> bool:
         or diag.get("score", 1.0) < 0.62
         or (diag.get("textTouchesEdge") and diag.get("textRatio", 0) > 0.03)
     )
+
+
+def _bbox_is_consistent_with_label(
+    bbox: dict | None,
+    label_rect: fitz.Rect | None,
+    page_rect: fitz.Rect,
+) -> bool:
+    """Reject LLM/metadata bboxes that are obviously far from the figure label.
+
+    This is a general guard, not an exam-specific rule.  Vision bboxes are useful
+    when they agree with the PDF geometry, but they can be badly wrong.  Example:
+    a bbox for "Figura 4" can accidentally point to the lower half of the page
+    near "Figura 5".  If a real label was found in the PDF, never let a far-away
+    bbox override the label/cluster crop.
+    """
+    if not bbox or not label_rect:
+        return True
+    try:
+        y_pct = float(bbox.get("y_pct", bbox.get("y", 0)))
+        h_pct = float(bbox.get("h_pct", bbox.get("height", 0)))
+        x_pct = float(bbox.get("x_pct", bbox.get("x", 0)))
+        w_pct = float(bbox.get("w_pct", bbox.get("width", 0)))
+    except (TypeError, ValueError):
+        return False
+
+    if w_pct <= 0 or h_pct <= 0:
+        return False
+
+    bbox_cx = page_rect.width * (x_pct + w_pct / 2) / 100
+    bbox_cy = page_rect.height * (y_pct + h_pct / 2) / 100
+    label_cx = (label_rect.x0 + label_rect.x1) / 2
+    label_cy = (label_rect.y0 + label_rect.y1) / 2
+
+    # Vertical agreement is the most important signal because figure captions
+    # are normally immediately below/near the visual object.
+    if abs(bbox_cy - label_cy) > max(185, page_rect.height * 0.30):
+        return False
+
+    # Horizontally, allow generous tolerance for wide graphs and captions.
+    if abs(bbox_cx - label_cx) > max(260, page_rect.width * 0.55):
+        return False
+
+    return True
+
+
+def _visual_crop_cluster_near_label(
+    pdf_path: str,
+    page_num: int,
+    label_rect: fitz.Rect,
+    img: Image.Image,
+) -> tuple[Image.Image | None, dict]:
+    """Crop the vector/drawing cluster immediately associated with a figure label.
+
+    This is preferred over bbox_estimate for PDFs like Exames Nacionais, where
+    many diagrams are vectors rather than embedded images.  It avoids the main
+    failure mode of bbox/metadata crops: a wrong bbox can jump to a different
+    figure or to surrounding running text.
+    """
+    try:
+        doc = fitz.open(pdf_path)
+        page = doc[page_num - 1]
+        page_rect = page.rect
+        label_cx = (label_rect.x0 + label_rect.x1) / 2
+
+        try:
+            clusters = list(page.cluster_drawings())
+        except Exception:
+            clusters = []
+
+        if not clusters:
+            drawings = []
+            for d in page.get_drawings():
+                r = fitz.Rect(d.get("rect"))
+                if r.width >= 3 or r.height >= 3:
+                    drawings.append(r)
+            if drawings:
+                u = fitz.Rect(drawings[0])
+                for r in drawings[1:]:
+                    u |= r
+                clusters = [u]
+
+        candidates: list[tuple[float, fitz.Rect]] = []
+        for r in clusters:
+            r = fitz.Rect(r)
+            if r.is_empty or r.width < 12 or r.height < 12:
+                continue
+            if _is_separator_line(r, page_rect.width):
+                continue
+
+            # Caption normally sits below the diagram.  Keep a wide vertical
+            # range to support tall diagrams, but do not grab earlier page items.
+            if r.y0 > label_rect.y1 + 35:
+                continue
+            if r.y1 < label_rect.y0 - max(360, page_rect.height * 0.45):
+                continue
+            if r.y1 < label_rect.y0 - 2 or r.y0 <= label_rect.y1 + 20:
+                pass
+            else:
+                continue
+
+            expanded_x0 = r.x0 - 90
+            expanded_x1 = r.x1 + 90
+            horizontal_ok = expanded_x0 <= label_cx <= expanded_x1
+            if not horizontal_ok:
+                label_band = fitz.Rect(label_rect.x0 - 120, r.y0, label_rect.x1 + 120, r.y1)
+                if (label_band & r).is_empty:
+                    continue
+
+            dist = abs(label_rect.y0 - r.y1)
+            h_bonus = 1.0 if horizontal_ok else 0.65
+            area_bonus = min(1.0, (r.width * r.height) / (page_rect.width * page_rect.height * 0.10))
+            score = h_bonus * 3.0 + area_bonus - dist / 220.0
+            candidates.append((score, r))
+
+        if not candidates:
+            doc.close()
+            return None, {}
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        cluster = fitz.Rect(candidates[0][1])
+
+        # Expand to include short diagram labels, axis labels, chart titles, and
+        # the figure caption, while excluding running question text.
+        crop_rect = fitz.Rect(cluster)
+        crop_rect |= label_rect
+
+        for block in page.get_text("dict")["blocks"]:
+            if block.get("type") != 0:
+                continue
+            block_text = ""
+            for line in block.get("lines", []):
+                block_text += "".join(s.get("text", "") for s in line.get("spans", []))
+            block_text = block_text.strip()
+            if not block_text:
+                continue
+            br = fitz.Rect(block["bbox"])
+
+            # Always keep the caption itself.
+            if not (br & label_rect).is_empty:
+                crop_rect |= br
+                continue
+
+            short_label = _is_diagram_label(block_text) or len(block_text) <= 18
+            near_cluster = not (br & fitz.Rect(cluster.x0 - 24, cluster.y0 - 24, cluster.x1 + 24, cluster.y1 + 24)).is_empty
+            centered_title = (
+                br.y1 <= cluster.y0 + 28
+                and br.y0 >= cluster.y0 - 34
+                and br.x0 >= cluster.x0 - 30
+                and br.x1 <= cluster.x1 + 30
+            )
+
+            if short_label and near_cluster:
+                crop_rect |= br
+            elif centered_title:
+                crop_rect |= br
+
+        # Safety padding.
+        pad_x = 14
+        pad_top = 12
+        pad_bottom = 10
+        crop_rect = fitz.Rect(
+            max(0, crop_rect.x0 - pad_x),
+            max(0, crop_rect.y0 - pad_top),
+            min(page_rect.width, crop_rect.x1 + pad_x),
+            min(page_rect.height, crop_rect.y1 + pad_bottom),
+        )
+        doc.close()
+
+        img_w, img_h = img.size
+        left = max(0, int(crop_rect.x0 * SCALE))
+        top = max(0, int(crop_rect.y0 * SCALE))
+        right = min(img_w, int(crop_rect.x1 * SCALE))
+        bottom = min(img_h, int(crop_rect.y1 * SCALE))
+        if right - left < 60 or bottom - top < 60:
+            return None, {}
+        return img.crop((left, top, right, bottom)), {
+            "score": 0.88,
+            "textRatio": 0.0,
+            "edgeTouch": False,
+            "textTouchesEdge": False,
+            "drawingCoverage": 1.0,
+            "candidate": "cluster_drawings_near_label",
+            "clusterRect": [round(cluster.x0, 2), round(cluster.y0, 2), round(cluster.x1, 2), round(cluster.y1, 2)],
+        }
+    except Exception:
+        try:
+            doc.close()
+        except Exception:
+            pass
+        return None, {}
 
 
 # ── Visual Crop: Auto Candidate Score ────────────────────────────
@@ -996,28 +1091,43 @@ def _do_visual_crop(pdf_path, page_num, label_rect, bbox, is_table, img, filenam
         cropped = _visual_crop_table(pdf_path, page_num, label_rect, img, bbox)
         method = "find_tables"
     elif label_rect:
-        cropped, diagnostics = _visual_crop_figure(pdf_path, page_num, label_rect, img, question_region)
-        method = "auto_candidate_score"
+        # Prefer the real PDF vector cluster near the caption.  This is more
+        # stable across exams than a vision bbox because many official exam
+        # figures are vector drawings, not embedded images.
+        cropped, diagnostics = _visual_crop_cluster_near_label(pdf_path, page_num, label_rect, img)
+        method = "cluster_drawings_near_label" if cropped is not None else ""
+
+        if cropped is None:
+            cropped, diagnostics = _visual_crop_figure(pdf_path, page_num, label_rect, img, question_region)
+            method = "auto_candidate_score"
 
         # If the vector/label candidate is polluted with running text, try the
         # metadata / bbox_estimate candidate before falling back to context.
         if bbox and _auto_visual_is_polluted(diagnostics):
-            bbox_crop = _crop_visual_bbox(
-                img, bbox, is_table=False, pdf_path=pdf_path, page_num=page_num
-            )
-            if bbox_crop is not None:
-                cropped = bbox_crop
-                method = "bbox_estimate_visual"
-                diagnostics = {
-                    "candidate": "bbox_estimate_visual",
-                    "fallbackReason": "auto_candidate_polluted_with_text",
-                    "previousAutoDiagnostics": diagnostics,
-                }
+            try:
+                doc = fitz.open(pdf_path)
+                page_rect = doc[page_num - 1].rect
+                doc.close()
+            except Exception:
+                page_rect = fitz.Rect(0, 0, img.width / SCALE, img.height / SCALE)
+
+            # Only trust the bbox when it agrees with the found caption.
+            if _bbox_is_consistent_with_label(bbox, label_rect, page_rect):
+                bbox_crop = _crop_visual_bbox(img, bbox, is_table=False)
+                if bbox_crop is not None:
+                    cropped = bbox_crop
+                    method = "bbox_estimate_visual"
+                    diagnostics = {
+                        "candidate": "bbox_estimate_visual",
+                        "fallbackReason": "auto_candidate_polluted_with_text",
+                        "previousAutoDiagnostics": diagnostics,
+                    }
+            else:
+                diagnostics = dict(diagnostics or {})
+                diagnostics["bboxRejected"] = "inconsistent_with_label_position"
 
     elif bbox:
-        cropped = _crop_visual_bbox(
-            img, bbox, is_table=is_table, pdf_path=pdf_path, page_num=page_num
-        )
+        cropped = _crop_visual_bbox(img, bbox, is_table=is_table)
         method = "bbox_estimate_visual"
         diagnostics = {"candidate": "bbox_estimate_visual", "fallbackReason": "label_not_found"}
 
