@@ -11,7 +11,7 @@ RENDER_DPI = 200
 SCALE = RENDER_DPI / 72  # PDF points to pixels
 
 # Context crop regions (existing behavior)
-FIGURE_ABOVE_LABEL_PX = 500
+FIGURE_ABOVE_LABEL_PX = 380
 FIGURE_BELOW_LABEL_PX = 40
 FIGURE_MARGIN_X_PX = 30
 TABLE_PADDING_TOP_PCT = 5
@@ -139,6 +139,160 @@ def _crop_context_bbox(img: Image.Image, bbox: dict, is_table: bool) -> Image.Im
     return img.crop((x, y, min(w, x + crop_w), min(h, y + crop_h)))
 
 
+def _trim_bbox_rect_away_from_running_text(
+    pdf_path: str | None,
+    page_num: int | None,
+    img: Image.Image,
+    rect_px: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Trim only text that sits on the crop borders.
+
+    This is a general safety pass for bbox/metadata crops.  The vision bbox is
+    often approximately correct but can include the question sentence above the
+    figure or a strip of running text on the left.  We do NOT erase text from
+    the image.  We move the crop edge inward when a large text block touches an
+    edge.  Short diagram labels such as A, B, O, x, y, Re(z), Im(z) are kept.
+    """
+    if not pdf_path or not page_num:
+        return rect_px
+
+    left, top, right, bottom = rect_px
+    crop_w = right - left
+    crop_h = bottom - top
+    if crop_w < 80 or crop_h < 80:
+        return rect_px
+
+    try:
+        doc = fitz.open(pdf_path)
+        page = doc[page_num - 1]
+        page_rect = page.rect
+        blocks = page.get_text("dict")["blocks"]
+        doc.close()
+    except Exception:
+        return rect_px
+
+    img_w, img_h = img.size
+    sx = img_w / max(1.0, page_rect.width)
+    sy = img_h / max(1.0, page_rect.height)
+
+    new_left, new_top, new_right, new_bottom = left, top, right, bottom
+    edge_pad = 10
+
+    for block in blocks:
+        if block.get("type") != 0:
+            continue
+
+        block_text = ""
+        for line in block.get("lines", []):
+            block_text += "".join(s.get("text", "") for s in line.get("spans", []))
+        block_text = block_text.strip()
+        if not block_text or _is_diagram_label(block_text) or len(block_text) <= 15:
+            continue
+
+        br = fitz.Rect(block["bbox"])
+        bx0, by0 = int(br.x0 * sx), int(br.y0 * sy)
+        bx1, by1 = int(br.x1 * sx), int(br.y1 * sy)
+
+        ix0, iy0 = max(left, bx0), max(top, by0)
+        ix1, iy1 = min(right, bx1), min(bottom, by1)
+        if ix1 <= ix0 or iy1 <= iy0:
+            continue
+
+        inter_area = (ix1 - ix0) * (iy1 - iy0)
+        block_area = max(1, (bx1 - bx0) * (by1 - by0))
+        if inter_area / block_area < 0.15:
+            continue
+
+        # Text strip on the left/right side of the candidate.
+        if bx0 <= left + crop_w * 0.38 and bx1 <= left + crop_w * 0.62:
+            new_left = max(new_left, bx1 + edge_pad)
+        elif bx1 >= right - crop_w * 0.38 and bx0 >= left + crop_w * 0.38:
+            new_right = min(new_right, bx0 - edge_pad)
+
+        # Question sentence above / caption-like running text below.
+        if by0 <= top + crop_h * 0.22 and by1 <= top + crop_h * 0.45:
+            new_top = max(new_top, by1 + edge_pad)
+        elif by1 >= bottom - crop_h * 0.18 and by0 >= top + crop_h * 0.55:
+            new_bottom = min(new_bottom, by0 - edge_pad)
+
+    # Only accept the trim if it leaves a useful crop.
+    if new_right - new_left < max(80, crop_w * 0.40):
+        new_left, new_right = left, right
+    if new_bottom - new_top < max(80, crop_h * 0.40):
+        new_top, new_bottom = top, bottom
+
+    return (new_left, new_top, new_right, new_bottom)
+
+
+def _crop_visual_bbox(
+    img: Image.Image,
+    bbox: dict,
+    is_table: bool = False,
+    pdf_path: str | None = None,
+    page_num: int | None = None,
+) -> Image.Image | None:
+    """Tight visual crop from bbox_estimate / metadata.
+
+    This is intentionally much tighter than _crop_context_bbox.  It is used as
+    a fallback when the vector/label crop pulls in running question text.  The
+    bbox coming from vision is often approximate, so we keep a small safety pad
+    instead of the large context pad.
+    """
+    if not bbox:
+        return None
+
+    w, h = img.size
+    try:
+        x_pct = float(bbox.get("x_pct", bbox.get("x", 0)))
+        y_pct = float(bbox.get("y_pct", bbox.get("y", 0)))
+        w_pct = float(bbox.get("w_pct", bbox.get("width", 0)))
+        h_pct = float(bbox.get("h_pct", bbox.get("height", 0)))
+    except (TypeError, ValueError):
+        return None
+
+    if w_pct <= 0 or h_pct <= 0:
+        return None
+
+    # Small padding: enough to avoid cutting strokes/axis arrows, not enough to
+    # include the surrounding question text.
+    pad_x = 2.0 if not is_table else 1.0
+    pad_top = 1.5 if not is_table else 1.0
+    pad_bottom = 2.5 if not is_table else 1.0
+
+    x0 = max(0.0, x_pct - pad_x)
+    y0 = max(0.0, y_pct - pad_top)
+    x1 = min(100.0, x_pct + w_pct + pad_x)
+    y1 = min(100.0, y_pct + h_pct + pad_bottom)
+
+    left = int(w * x0 / 100)
+    top = int(h * y0 / 100)
+    right = int(w * x1 / 100)
+    bottom = int(h * y1 / 100)
+
+    left, top, right, bottom = _trim_bbox_rect_away_from_running_text(
+        pdf_path, page_num, img, (left, top, right, bottom)
+    )
+
+    if right - left < 50 or bottom - top < 50:
+        return None
+    return img.crop((left, top, right, bottom))
+
+
+def _auto_visual_is_polluted(diag: dict) -> bool:
+    """True when auto_candidate_score likely included running question text.
+
+    Do not send these directly to context.  For quiz assets, a metadata/bbox
+    visual crop is usually better than a context crop with question text.
+    """
+    if not diag:
+        return False
+    return bool(
+        diag.get("textRatio", 0) > 0.08
+        or diag.get("score", 1.0) < 0.62
+        or (diag.get("textTouchesEdge") and diag.get("textRatio", 0) > 0.03)
+    )
+
+
 # ── Visual Crop: Auto Candidate Score ────────────────────────────
 
 def _is_separator_line(r: fitz.Rect, page_width: float) -> bool:
@@ -227,8 +381,8 @@ def _score_candidate(crop_rect: fitz.Rect, drawing_rects: list[fitz.Rect],
 
     # Granular score
     score = (
-        0.35 * drawing_capture
-        + 0.25 * max(0, 1.0 - text_ratio * 8)
+        0.30 * drawing_capture
+        + 0.30 * max(0, 1.0 - text_ratio * 15)
         + 0.15 * (0.0 if edge_touch else 1.0)
         + 0.15 * (0.0 if text_touches_edge else 1.0)
         + 0.10 * max(0, 1.0 - max(0, size_ratio - 0.12) * 3)
@@ -776,40 +930,23 @@ def _crop_by_document_label(pdf_path: str, page_num: int, doc_num: int, img: Ima
 
 
 def _choose_best_crop(visual: dict, context: dict) -> dict:
-    """Choose the best crop between visual and context based on diagnostics.
+    """Choose the best crop between visual and context.
 
-    Policy: never promote visual to best if it shows signs of bad cropping.
-    Prefer context (which shows the figure in page context) over a dubious visual.
+    Policy: for quiz display, visual is always preferred over context because
+    context includes surrounding question text. Only fall back to context when
+    visual completely failed (no image produced).
     """
     v_ok = visual.get("status") == "success"
     c_ok = context.get("status") in ("success", "needs_review")
 
-    # Check if visual is trustworthy
-    v_unsafe = False
-    if v_ok:
-        diag = visual.get("diagnostics", {})
-        score = diag.get("score", 1.0) if diag else 1.0
-        margins = diag.get("margins", {}) if diag else {}
-        min_margin = min(margins.get("left", 99), margins.get("right", 99),
-                         margins.get("top", 99), margins.get("bottom", 99)) if margins else 99
-        v_unsafe = (
-            visual.get("quality") == "needs_review"
-            or score < 0.68
-            or diag.get("edgeTouch", False)
-            or diag.get("textTouchesEdge", False)
-            or diag.get("contentAreaRatio", 0) > 0.82
-            or diag.get("textRatio", 0) > 0.08
-            or min_margin <= 8
-        )
-
-    if v_ok and not v_unsafe and visual.get("width", 0) >= 80 and visual.get("height", 0) >= 80:
+    # For quiz, prefer visual. Context has question text.
+    if v_ok and visual.get("width", 0) >= 80 and visual.get("height", 0) >= 80:
         return visual
 
-    # Visual is unsafe or failed — prefer context if available
     if c_ok:
         return context
 
-    # Fallback: return whatever exists
+    return visual if visual.get("url") else context
     if v_ok:
         return visual
     return visual if visual.get("url") else context
@@ -861,6 +998,28 @@ def _do_visual_crop(pdf_path, page_num, label_rect, bbox, is_table, img, filenam
     elif label_rect:
         cropped, diagnostics = _visual_crop_figure(pdf_path, page_num, label_rect, img, question_region)
         method = "auto_candidate_score"
+
+        # If the vector/label candidate is polluted with running text, try the
+        # metadata / bbox_estimate candidate before falling back to context.
+        if bbox and _auto_visual_is_polluted(diagnostics):
+            bbox_crop = _crop_visual_bbox(
+                img, bbox, is_table=False, pdf_path=pdf_path, page_num=page_num
+            )
+            if bbox_crop is not None:
+                cropped = bbox_crop
+                method = "bbox_estimate_visual"
+                diagnostics = {
+                    "candidate": "bbox_estimate_visual",
+                    "fallbackReason": "auto_candidate_polluted_with_text",
+                    "previousAutoDiagnostics": diagnostics,
+                }
+
+    elif bbox:
+        cropped = _crop_visual_bbox(
+            img, bbox, is_table=is_table, pdf_path=pdf_path, page_num=page_num
+        )
+        method = "bbox_estimate_visual"
+        diagnostics = {"candidate": "bbox_estimate_visual", "fallbackReason": "label_not_found"}
 
     if cropped is None:
         return {"status": "failed", "reason": "no_visual_elements_detected"}

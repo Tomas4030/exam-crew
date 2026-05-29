@@ -678,6 +678,7 @@ Text:
                     "id": fig_id,
                     "type": fig.get("type", "unknown"),
                     "page": page_num,
+                    "label": fig.get("label") or fig.get("id", "").replace("_", " ").title(),
                     "description": fig.get("description", ""),
                     "bbox_estimate": fig.get("bbox_estimate"),
                     "nearQuestion": fig.get("nearQuestion"),
