@@ -119,6 +119,45 @@ def latex_to_plain(text: str) -> str:
     return s.strip()
 
 
+def _latex_fractionize_text(text: str) -> str:
+    """Convert simple numeric fractions to LaTeX fractions.
+
+    Broad rules: only convert standalone integer/integer ratios outside dates,
+    URLs and decimal numbers. This catches exam text like `3/5` and `3/10` while
+    avoiding page markers such as `3/ 8` in raw headers because it runs on the
+    cleaned statement fields, not on full page text.
+    """
+    if not text:
+        return text
+
+    def repl(m: re.Match) -> str:
+        num, den = m.group(1), m.group(2)
+        return f"\\(\\frac{{{num}}}{{{den}}}\\)"
+
+    # Do not touch already-latexed \frac or inline math that already contains it.
+    if "\\frac" in text:
+        return text
+    return re.sub(r"(?<![\w.])([0-9]{1,4})\s*/\s*([0-9]{1,4})(?![\w.])", repl, text)
+
+
+def _apply_deterministic_math(q: dict) -> None:
+    """Cheap normalization that runs even when vision normalization is skipped."""
+    for field in ("statement", "rawText", "statementPlain", "statementLatex"):
+        val = q.get(field)
+        if isinstance(val, str) and re.search(r"(?<![\w.])\d{1,4}\s*/\s*\d{1,4}(?![\w.])", val):
+            if field == "statementLatex":
+                q[field] = _latex_fractionize_text(val)
+            elif not q.get("statementLatex"):
+                q["statementLatex"] = _latex_fractionize_text(val)
+
+    if q.get("statementLatex"):
+        q["statementPlain"] = q.get("statementPlain") or latex_to_plain(q["statementLatex"])
+        existing = q.get("mathSpans") or []
+        spans = extract_math_spans(q["statementLatex"])
+        seen = {s.get("latex") for s in existing}
+        q["mathSpans"] = existing + [s for s in spans if s.get("latex") not in seen]
+
+
 # ── Extract math spans from LaTeX text ────────────────────────────
 
 def extract_math_spans(latex_text: str) -> list[dict]:
@@ -218,8 +257,9 @@ def math_normalize(output: dict, extraction: dict, delay: float = 2.0) -> dict:
                 skip_reasons.append("has_tableRefs")
             if q.get("blanks"):
                 skip_reasons.append("has_blanks")
-            if "•" in statement or "–\t" in statement:
-                skip_reasons.append("has_bullets")
+            # Bullets are common in Mathematics statements and must not block
+            # deterministic fraction/LaTeX cleanup. The vision call may still be
+            # skipped later for very long statements, but simple fixes run below.
             if "____" in statement:
                 skip_reasons.append("has_blanks_text")
             if len(statement) > 900:
@@ -233,6 +273,7 @@ def math_normalize(output: dict, extraction: dict, delay: float = 2.0) -> dict:
             # Non-math or clean text: just set quality as ok
             q["statementPlain"] = q.get("statementPlain") or statement
             q["statementLatex"] = q.get("statementLatex") or statement
+            _apply_deterministic_math(q)
             _set_text_quality(q, "ok", "pdf_text_raw")
             continue
 
@@ -262,6 +303,7 @@ def math_normalize(output: dict, extraction: dict, delay: float = 2.0) -> dict:
             if checks.get("balancedLatexDelimiters", True) and checks.get("balancedBraces", True):
                 q["statementLatex"] = latex_stmt
                 q["statementPlain"] = latex_to_plain(latex_stmt)
+                _apply_deterministic_math(q)
                 # Preserve original statement; frontend uses statementLatex for rendering
 
                 # Math spans
@@ -292,6 +334,7 @@ def math_normalize(output: dict, extraction: dict, delay: float = 2.0) -> dict:
                     if checks2.get("balancedLatexDelimiters", True) and checks2.get("balancedBraces", True):
                         q["statementLatex"] = latex_stmt2
                         q["statementPlain"] = latex_to_plain(latex_stmt2)
+                        _apply_deterministic_math(q)
                         q["mathSpans"] = result2.get("mathSpans") or extract_math_spans(latex_stmt2)
                         if result2.get("options") and q.get("options"):
                             for opt_new in result2["options"]:

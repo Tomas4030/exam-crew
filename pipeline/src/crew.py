@@ -9,6 +9,7 @@ from .utils.progress import report_progress
 from .utils.validator import validate_and_fix
 from .utils.normalizer import normalize
 from .utils.math_normalize import math_normalize
+from .utils.text_format import apply_text_formatting
 from .utils.subjects import detect_subject, is_formula_page
 from .utils.source_grouping import apply_source_grouping
 
@@ -279,6 +280,11 @@ Text:
         if missing_q_warnings and pages_to_process:
             report_progress("retry", f"Retrying extraction for {len(missing_q_warnings)} missing question(s)")
             output = self._targeted_retry(output, extraction, pages_to_process, missing_q_warnings)
+
+        # Step 4.9: Deterministic readable line breaks for frontend display
+        # Runs last so validate/retry changes are captured. Overwrites statement
+        # with formatted version; original preserved in statementRaw.
+        output = apply_text_formatting(output)
 
         # Step 5: Save
         out_file = self.output_dir / f"{self.exam_id}.json"

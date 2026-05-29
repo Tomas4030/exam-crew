@@ -228,7 +228,7 @@ export default function PreviewPage() {
             )}
 
             {/* Statement */}
-            <div className="text-gray-900 text-base leading-relaxed">
+            <div className="text-gray-900 text-base leading-relaxed whitespace-pre-wrap">
               <MathText text={(() => {
                 const useRaw = current.type === 'multi_blank_choice' || current.tableRefs?.length;
                 let text = useRaw ? current.statement : getRenderableStatement(current);

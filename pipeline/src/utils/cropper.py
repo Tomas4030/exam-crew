@@ -255,8 +255,13 @@ def _visual_crop_figure(pdf_path: str, page_num: int, label_rect: fitz.Rect, img
     label_y = label_rect.y0
     label_cx = (label_rect.x0 + label_rect.x1) / 2
 
-    # Search window: up to 170pts above label
-    window_top = max(0, label_y - 170)
+    # Search window above label. Figures in national exams can be tall 3D
+    # diagrams/graphs; 170pt was too small and cut upper content. Prefer the
+    # linked question region when available, otherwise use a generous window.
+    if question_region:
+        window_top = max(0, min(question_region.y0, label_y - 300))
+    else:
+        window_top = max(0, label_y - 300)
     window_bottom = label_y - 2
 
     # Determine column bounds based on label position
@@ -355,9 +360,21 @@ def _visual_crop_figure(pdf_path: str, page_num: int, label_rect: fitz.Rect, img
     
     for name, rect in candidates:
         if question_region:
-            rect = rect & question_region
-            if rect.is_empty or rect.width <= 20 or rect.height <= 20:
-                continue
+            # Treat question_region as a soft bound. Region detection can be
+            # imperfect; hard intersection can chop diagrams. Expand it first
+            # and only use it when it still captures the drawing.
+            soft_region = fitz.Rect(
+                max(0, question_region.x0 - 35),
+                max(0, question_region.y0 - 35),
+                min(page_rect.width, question_region.x1 + 35),
+                min(page_rect.height, question_region.y1 + 35),
+            )
+            clipped = rect & soft_region
+            if not clipped.is_empty and clipped.width > 20 and clipped.height > 20:
+                clipped_diag = _score_candidate(clipped, drawing_rects, text_blocks, page_rect)
+                # Only accept the clipped version when it did not lose content.
+                if clipped_diag.get("drawingCoverage", 0) >= 0.97:
+                    rect = clipped
         diag = _score_candidate(rect, drawing_rects, text_blocks, page_rect)
         diag["candidate"] = name
         scored.append((rect, diag))
@@ -426,9 +443,9 @@ def _visual_crop_figure(pdf_path: str, page_num: int, label_rect: fitz.Rect, img
                 continue
             test = fitz.Rect(new_rect)
             if side == "left":
-                test.x0 = max(col_left, test.x0 - exp)
+                test.x0 = max(0, test.x0 - exp)
             elif side == "right":
-                test.x1 = min(col_right, test.x1 + exp)
+                test.x1 = min(page_rect.width, test.x1 + exp)
             elif side == "top":
                 test.y0 = max(0, test.y0 - exp)
             elif side == "bottom":
@@ -759,31 +776,43 @@ def _crop_by_document_label(pdf_path: str, page_num: int, doc_num: int, img: Ima
 
 
 def _choose_best_crop(visual: dict, context: dict) -> dict:
-    """Choose the best crop between visual and context based on diagnostics."""
+    """Choose the best crop between visual and context based on diagnostics.
+
+    Policy: never promote visual to best if it shows signs of bad cropping.
+    Prefer context (which shows the figure in page context) over a dubious visual.
+    """
     v_ok = visual.get("status") == "success"
     c_ok = context.get("status") in ("success", "needs_review")
 
-    if v_ok and visual.get("width", 0) >= 80 and visual.get("height", 0) >= 80:
+    # Check if visual is trustworthy
+    v_unsafe = False
+    if v_ok:
+        diag = visual.get("diagnostics", {})
+        score = diag.get("score", 1.0) if diag else 1.0
+        margins = diag.get("margins", {}) if diag else {}
+        min_margin = min(margins.get("left", 99), margins.get("right", 99),
+                         margins.get("top", 99), margins.get("bottom", 99)) if margins else 99
+        v_unsafe = (
+            visual.get("quality") == "needs_review"
+            or score < 0.68
+            or diag.get("edgeTouch", False)
+            or diag.get("textTouchesEdge", False)
+            or diag.get("contentAreaRatio", 0) > 0.82
+            or diag.get("textRatio", 0) > 0.08
+            or min_margin <= 8
+        )
+
+    if v_ok and not v_unsafe and visual.get("width", 0) >= 80 and visual.get("height", 0) >= 80:
         return visual
 
-    if not v_ok and c_ok:
+    # Visual is unsafe or failed — prefer context if available
+    if c_ok:
         return context
-    if v_ok and not c_ok:
+
+    # Fallback: return whatever exists
+    if v_ok:
         return visual
-    if not v_ok and not c_ok:
-        return visual if visual.get("url") else context
-
-    # Both exist — score visual
-    diag = visual.get("diagnostics", {})
-    v_bad = (
-        visual.get("quality") == "needs_review"
-        and (diag.get("edgeTouch") or diag.get("textTouchesEdge")
-             or (diag.get("contentAreaRatio", 0) > 0.92))
-    )
-
-    if v_bad:
-        return context
-    return visual
+    return visual if visual.get("url") else context
 
 
 def _do_context_crop(img, label_rect, bbox, is_table, filename, context_dir, legacy_dir, exam_id) -> dict:
