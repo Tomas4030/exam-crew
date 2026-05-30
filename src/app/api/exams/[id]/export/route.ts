@@ -137,5 +137,11 @@ function collectUsedAssets(examData: Record<string, unknown>): string[] {
     }
   }
 
+  // Include every asset crop, even if the asset was not linked to a question.
+  // This prevents figures detected by the pipeline from disappearing from the ZIP.
+  for (const asset of (examData.assets as Record<string, unknown>[]) || []) {
+    addAssetCrops(asset);
+  }
+
   return [...paths];
 }

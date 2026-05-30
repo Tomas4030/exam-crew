@@ -243,7 +243,7 @@ Text:
 
         # Step 3.5b: Normalize (deterministic corrections)
         report_progress("normalize", "Applying deterministic corrections")
-        output = normalize(output)
+        output = normalize(output, extraction)
 
         # Step 3.7: Crop assets from rendered pages
         from .utils.cropper import crop_assets
@@ -254,7 +254,7 @@ Text:
         output.pop("_pdf_path", None)
 
         # Step 3.7b: Re-normalize after crops (catches cloned table assets)
-        output = normalize(output)
+        output = normalize(output, extraction)
 
         # Step 3.8: Math normalization (LaTeX, textQuality)
         report_progress("math_normalize", "Normalizing mathematical text")
@@ -462,7 +462,7 @@ Text:
                 q["warnings"] = [w for w in q.get("warnings", []) if w.get("type") == "retry_extracted"]
 
             # Re-run normalize + validate from scratch
-            output = normalize(output)
+            output = normalize(output, extraction)
             output = validate_and_fix(output, extraction)
 
         return output
@@ -727,6 +727,7 @@ Text:
                             "options": [],
                             "imageRefs": [],
                             "tableRefs": [],
+                            "assetRefs": [],
                             "visualDependency": False,
                             "confidence": 0.9,
                             "needsHumanReview": False,
@@ -1177,28 +1178,50 @@ Text:
 
         for asset in all_assets:
             aid = asset["id"]
-            if aid not in all_image_refs and aid not in all_table_refs and asset["type"] != "embedded_image":
-                # Try to auto-associate by nearQuestion
-                near = asset.get("nearQuestion")
-                if near:
-                    for q in all_questions:
-                        if q["number"] == near:
-                            if asset["type"] == "table":
-                                q["tableRefs"].append(aid)
-                            else:
-                                q["imageRefs"].append(aid)
-                                q["visualDependency"] = True
-                            break
-                    else:
-                        all_warnings.append({
-                            "type": "unassociated_asset",
-                            "message": f"Asset '{aid}' (page {asset['page']}) not linked to any question"
-                        })
-                else:
-                    all_warnings.append({
-                        "type": "unassociated_asset",
-                        "message": f"Asset '{aid}' (page {asset['page']}) not linked to any question"
-                    })
+            if aid in all_image_refs or aid in all_table_refs or asset["type"] == "embedded_image":
+                continue
+
+            associated = False
+
+            # Try nearQuestion first
+            near = asset.get("nearQuestion")
+            if near:
+                for q in all_questions:
+                    if q["number"] == near:
+                        if asset["type"] == "table":
+                            q["tableRefs"].append(aid)
+                        else:
+                            q["imageRefs"].append(aid)
+                            q["visualDependency"] = True
+                        associated = True
+                        break
+
+            # Fallback: geometric association by page — find the question on the
+            # same page whose region is closest above/around the asset label.
+            if not associated:
+                asset_page = asset.get("page")
+                page_questions = [q for q in all_questions if q.get("sourcePage") == asset_page]
+                if page_questions:
+                    # Sort by position (earlier questions first)
+                    page_questions.sort(key=lambda q: (q.get("region", {}).get("y0", 0) if q.get("region") else 0))
+                    # Pick the last question that starts before or near the asset
+                    # (figures are usually placed after the question text)
+                    best_q = page_questions[0]  # default: first question on page
+                    for q in page_questions:
+                        best_q = q  # last question on page before end
+                    if best_q:
+                        if asset["type"] == "table":
+                            best_q["tableRefs"].append(aid)
+                        else:
+                            best_q["imageRefs"].append(aid)
+                            best_q["visualDependency"] = True
+                        associated = True
+
+            if not associated:
+                all_warnings.append({
+                    "type": "unassociated_asset",
+                    "message": f"Asset '{aid}' (page {asset['page']}) not linked to any question"
+                })
 
         # Stats
         main_questions = len([q for q in all_questions if not q.get("parentQuestion") and not q.get("isGroup")])

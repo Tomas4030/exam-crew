@@ -11,10 +11,19 @@ without calling the LLM again:
 import re
 
 
-def normalize(output: dict) -> dict:
+def normalize(output: dict, extraction: dict | None = None) -> dict:
     """Apply deterministic corrections. Returns corrected output."""
     questions = output.get("questions", [])
     assets = output.get("assets", [])
+
+    # Ensure all questions have required list fields to prevent KeyError
+    for q in questions:
+        q.setdefault("imageRefs", [])
+        q.setdefault("tableRefs", [])
+        q.setdefault("assetRefs", [])
+        q.setdefault("options", [])
+        q.setdefault("warnings", [])
+        q.setdefault("subQuestions", [])
 
     # ── 0. Remove fake questions with Roman numeral numbers ──────
     # These are propositions (I, II, III, IV) inside another question, not real questions
@@ -56,6 +65,17 @@ def normalize(output: dict) -> dict:
 
     # ── 1. Reassociate figures by statement mentions ─────────────
     _repair_figure_associations(questions, assets)
+    _repair_table_associations(questions, assets)
+
+    # ── 1a. Recover subquestions missed by the VLM from native PDF text ──
+    _recover_numbered_subquestions(output, extraction)
+    questions = output.get("questions", [])  # refresh after recovery
+
+    # ── 1a.1. Keep recovered group parents clean ──────────────────
+    _trim_group_parent_statements(output)
+
+    # ── 1a.2. Build blanks when a multi_blank_choice was recovered from text ─
+    _repair_multiblank_options_from_statement(output)
 
     # ── 1b. Resolve source group references in questions ─────────
     _resolve_source_refs(questions, output.get("sourceGroups", []))
@@ -100,6 +120,268 @@ def normalize(output: dict) -> dict:
             q["visualDependency"] = True
 
     return output
+
+
+def _repair_table_associations(questions: list[dict], assets: list[dict]):
+    """Associate table assets to the question they belong to."""
+    table_assets = [
+        a for a in assets
+        if a.get("type") == "table" or "tabela" in str(a.get("id", "")).lower()
+    ]
+    if not table_assets:
+        return
+
+    # Check which tables are already referenced
+    all_table_refs = set()
+    for q in questions:
+        all_table_refs.update(q.get("tableRefs", []))
+
+    by_number = {str(q.get("number", "")).strip(): q for q in questions}
+    for asset in table_assets:
+        aid = asset.get("id")
+        if aid in all_table_refs:
+            continue
+        page = asset.get("page")
+        near = str(asset.get("nearQuestion") or "").strip()
+
+        candidates = []
+        if near and near in by_number:
+            candidates.append(by_number[near])
+        candidates.extend(q for q in questions if q.get("sourcePage") == page and q not in candidates)
+
+        def score(q: dict) -> int:
+            text = ((q.get("statement") or "") + " " + (q.get("rawText") or "")).lower()
+            s = 0
+            if str(q.get("number", "")).strip() == near:
+                s += 10
+            if "tabela" in text or "medições" in text or "apresentam-se" in text:
+                s += 8
+            if q.get("type") in ("calculation", "open_answer", "multi_blank_choice"):
+                s += 1
+            return s
+
+        candidates = [q for q in candidates if q]
+        if not candidates:
+            continue
+        best = max(candidates, key=score)
+        if score(best) <= 0:
+            continue
+
+        best.setdefault("tableRefs", [])
+        best.setdefault("assetRefs", [])
+        if aid not in best["tableRefs"]:
+            best["tableRefs"].append(aid)
+        if aid not in best["assetRefs"]:
+            best["assetRefs"].append(aid)
+        best["hasTable"] = True
+        best["visualDependency"] = True
+
+
+def _recover_numbered_subquestions(output: dict, extraction: dict | None):
+    """Recover missing decimal-number items using native PDF text."""
+    if not extraction or not extraction.get("pages"):
+        return
+
+    questions = output.get("questions", [])
+    existing = {str(q.get("number", "")).strip() for q in questions}
+    by_number = {str(q.get("number", "")).strip(): q for q in questions}
+
+    page_texts = {p.get("page"): p.get("text", "") or "" for p in extraction.get("pages", [])}
+
+    found: list[tuple[int, str, str]] = []
+    for page in sorted(p for p in page_texts if isinstance(p, int)):
+        text = page_texts.get(page, "")
+        low = text.lower()
+        if not text or page <= 3 or "cotações" in low or "tabela periódica" in low:
+            continue
+        pattern = re.compile(r'(?m)^\s*(\d+(?:\.\d+)+)\.\s+')
+        matches = list(pattern.finditer(text))
+        for i, m in enumerate(matches):
+            num = m.group(1)
+            if num in existing:
+                continue
+            start = m.start()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            chunk = text[start:end].strip()
+            chunk = re.split(r'\n\s*(?:Prova\s+\d+|FIM)\b', chunk)[0].strip()
+            if len(chunk) >= 40:
+                found.append((page, num, chunk))
+
+    if not found:
+        return
+
+    def infer_type(chunk: str) -> str:
+        low = chunk.lower()
+        if "complete o texto" in low or "selecionando a opção" in low:
+            return "multi_blank_choice"
+        if "(a)" in low and "(d)" in low:
+            return "multiple_choice"
+        if "determine" in low or "calcule" in low:
+            return "calculation"
+        return "open_answer"
+
+    def extract_options(chunk: str) -> list[dict]:
+        opts = []
+        for letter, text in re.findall(r'(?m)^\s*\(([A-D])\)\s+(.+?)(?=\n\s*\([A-D]\)|\Z)', chunk, re.S):
+            clean = " ".join(text.split()).strip()
+            if clean:
+                opts.append({"letter": letter, "text": clean})
+        return opts
+
+    added_by_parent: dict[str, list[str]] = {}
+    new_questions = []
+    for page, num, chunk in found:
+        parent_num = num.rsplit(".", 1)[0]
+        parent_id = f"q{parent_num.replace('.', '_')}"
+        q_id = f"q{num.replace('.', '_')}"
+        q_type = infer_type(chunk)
+        statement = re.sub(r'^\s*' + re.escape(num) + r'\.\s*', '', chunk).strip()
+        opts = extract_options(chunk) if q_type == "multiple_choice" else []
+
+        q = {
+            "questionId": q_id,
+            "number": num,
+            "type": q_type,
+            "sourcePage": page,
+            "statement": statement,
+            "rawText": statement,
+            "blanks": None,
+            "options": opts,
+            "imageRefs": [],
+            "tableRefs": [],
+            "assetRefs": [],
+            "visualDependency": False,
+            "confidence": 0.78,
+            "needsHumanReview": True,
+            "warnings": [{"type": "text_fallback_extracted", "message": f"Q{num} recovered from native PDF text"}],
+            "parentQuestion": parent_id if parent_num in by_number else None,
+            "subQuestions": [],
+            "mathHeavy": bool(re.search(r'[=<>]|mol|Kc|Qc|pH', statement)),
+            "hasGraph": bool(re.search(r'gráfico|figura', statement, re.I)),
+            "hasDiagram": False,
+            "hasTable": False,
+            "calculatorAllowed": None,
+        }
+        new_questions.append(q)
+        existing.add(num)
+        added_by_parent.setdefault(parent_num, []).append(q_id)
+
+    if not new_questions:
+        return
+
+    questions.extend(new_questions)
+
+    for parent_num, child_ids in added_by_parent.items():
+        parent = by_number.get(parent_num)
+        if not parent:
+            continue
+        parent["isGroup"] = True
+        parent["type"] = "group"
+        parent.setdefault("subQuestions", [])
+        for cid in child_ids:
+            if cid not in parent["subQuestions"]:
+                parent["subQuestions"].append(cid)
+
+
+def _trim_group_parent_statements(output: dict):
+    """Remove child-question text accidentally swallowed by group parents."""
+    questions = output.get("questions", [])
+    by_id = {q.get("questionId"): q for q in questions}
+
+    for parent in questions:
+        children_ids = parent.get("subQuestions") or []
+        if not children_ids:
+            continue
+        children = [by_id[cid] for cid in children_ids if cid in by_id]
+        if not children:
+            continue
+        children.sort(key=lambda q: tuple(
+            int(p) if p.isdigit() else 999 for p in str(q.get("number", "")).split(".")
+        ))
+        first = children[0]
+
+        parent_stmt = (parent.get("statement") or "").strip()
+        child_stmt = (first.get("statement") or "").strip()
+        if not parent_stmt or not child_stmt:
+            continue
+
+        prefix = re.sub(r"\s+", " ", child_stmt[:120]).strip()
+        parent_flat = re.sub(r"\s+", " ", parent_stmt)
+        pos_flat = parent_flat.find(prefix[:60])
+        if pos_flat <= 20:
+            continue
+
+        # Map flat position back to original
+        count = 0
+        cut = None
+        for i, ch in enumerate(parent_stmt):
+            if not ch.isspace():
+                count += 1
+            if count >= len(re.sub(r"\s+", "", parent_flat[:pos_flat])):
+                cut = i
+                break
+        if cut is None:
+            continue
+
+        trimmed = parent_stmt[:cut].strip()
+        trimmed = re.sub(r"\s*\d+(?:\.\d+)+\.\s*$", "", trimmed).strip()
+        if len(trimmed) >= 30 and len(trimmed) < len(parent_stmt):
+            parent.setdefault("statementRaw", parent_stmt)
+            parent["statement"] = trimmed
+            parent["statementPlain"] = trimmed
+            if parent.get("statementLatex"):
+                parent["statementLatex"] = None
+            parent["tableRefs"] = []
+            parent["imageRefs"] = []
+            parent["assetRefs"] = []
+
+
+def _repair_multiblank_options_from_statement(output: dict):
+    """Build blanks for multi_blank_choice items when options are in text."""
+    for q in output.get("questions", []):
+        if q.get("type") != "multi_blank_choice" or q.get("blanks"):
+            continue
+        text = q.get("statement") or ""
+        if not re.search(r"\ba\)\s*b\)\s*c\)", text, re.IGNORECASE | re.DOTALL):
+            continue
+
+        header_match = re.search(r"\ba\)\s*b\)\s*c\)\s*d\)?", text, re.IGNORECASE | re.DOTALL)
+        tail = text[header_match.end():] if header_match else text
+        pairs = re.findall(r"(?m)^\s*([1-5])\.\s+(.+?)(?=\n\s*[1-5]\.\s+|\Z)", tail.strip())
+        if len(pairs) < 6:
+            continue
+
+        groups: list[list[dict]] = []
+        current: list[dict] = []
+        last_num = 0
+        for num, opt_text in pairs:
+            n = int(num)
+            if n == 1 and current:
+                groups.append(current)
+                current = []
+            elif current and n <= last_num:
+                groups.append(current)
+                current = []
+            current.append({"letter": num, "text": opt_text.strip()})
+            last_num = n
+        if current:
+            groups.append(current)
+
+        if not groups:
+            continue
+
+        letters = ["a", "b", "c", "d"]
+        while len(groups) < 4 and groups:
+            groups.append(groups[-1])
+
+        q["blanks"] = [
+            {"number": letters[i], "options": groups[i]}
+            for i in range(min(4, len(groups)))
+            if groups[i]
+        ]
+        if q["blanks"]:
+            q["hasTable"] = False
+            q["tableRefs"] = []
 
 
 def _repair_figure_associations(questions: list[dict], assets: list[dict]):
@@ -157,9 +439,9 @@ def _repair_figure_associations(questions: list[dict], assets: list[dict]):
                 if q["questionId"] not in mentioning_qs:
                     continue
                 if aid not in q.get("imageRefs", []):
-                    q["imageRefs"].append(aid)
+                    q.setdefault("imageRefs", []).append(aid)
                 if aid not in q.get("assetRefs", []):
-                    q["assetRefs"].append(aid)
+                    q.setdefault("assetRefs", []).append(aid)
                 q["visualDependency"] = True
 
 

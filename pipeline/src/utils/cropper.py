@@ -784,6 +784,15 @@ def crop_assets(output: dict, extraction: dict, output_dir: Path) -> dict:
     visual_dir.mkdir(parents=True, exist_ok=True)
     legacy_dir = output_dir / "assets"
 
+    # Determine crop strategy based on subject
+    subject = (output.get("metadata", {}).get("subject") or "").lower()
+    if "matem" in subject:
+        crop_strategy = "math"
+    elif "fis" in subject or "quim" in subject:
+        crop_strategy = "physics"
+    else:
+        crop_strategy = "auto"
+
     page_images: dict[int, str] = {}
     for p in extraction.get("pages", []):
         page_images[p["page"]] = p["page_image_path"]
@@ -864,6 +873,58 @@ def crop_assets(output: dict, extraction: dict, output_dir: Path) -> dict:
             bbox = asset.get("bbox") or asset.get("bbox_estimate")
             crop_filename = f"{aid}.png"
 
+            # Check if there's an embedded_image on the same page near this label.
+            # For subjects like Physics/Chemistry, figures are often real photos,
+            # not vector drawings. The embedded image is more accurate than cluster.
+            embedded_match = None
+            if label_rect and pdf_path:
+                for other in output.get("assets", []):
+                    if other.get("type") != "embedded_image" or other.get("page") != page_num:
+                        continue
+                    other_bbox = other.get("bbox")
+                    if not other_bbox:
+                        continue
+                    # Check if embedded image is above/near the label
+                    img_bottom = other_bbox.get("y", 0) + other_bbox.get("height", 0)
+                    img_top = other_bbox.get("y", 0)
+                    label_top_pt = label_rect.y0
+                    # Image should be above or overlapping the label, within 80pt
+                    if img_bottom >= label_top_pt - 80 and img_top < label_top_pt + 20:
+                        # Horizontal overlap check
+                        img_cx = other_bbox.get("x", 0) + other_bbox.get("width", 0) / 2
+                        label_cx = (label_rect.x0 + label_rect.x1) / 2
+                        page_w = img.width / SCALE
+                        if abs(img_cx - label_cx) < page_w * 0.4:
+                            embedded_match = other
+                            break
+
+            if embedded_match and embedded_match.get("url"):
+                # Use the embedded image directly as the visual crop
+                src_path = Path(embedded_match["url"])
+                if src_path.exists():
+                    import shutil
+                    dst_visual = visual_dir / crop_filename
+                    shutil.copy2(str(src_path), str(dst_visual))
+                    dst_legacy = legacy_dir / crop_filename
+                    if not dst_legacy.exists():
+                        shutil.copy2(str(src_path), str(dst_legacy))
+                    visual_crop_info = {
+                        "status": "success",
+                        "method": "embedded_image_near_label",
+                        "quality": "accepted",
+                        "relativePath": f"assets/visual/{crop_filename}",
+                        "url": f"/api/exams/{exam_id}/assets/visual/{crop_filename}",
+                        "width": embedded_match.get("img_width", 0),
+                        "height": embedded_match.get("img_height", 0),
+                    }
+                    context_crop_info = _do_context_crop(
+                        img, label_rect, bbox, is_table, crop_filename, context_dir, legacy_dir, exam_id
+                    )
+                    asset["crops"] = {"context": context_crop_info, "visual": visual_crop_info}
+                    asset["crops"]["best"] = visual_crop_info
+                    asset["crop"] = visual_crop_info
+                    continue
+
             # Context Crop
             context_crop_info = _do_context_crop(
                 img, label_rect, bbox, is_table, crop_filename, context_dir, legacy_dir, exam_id
@@ -871,7 +932,7 @@ def crop_assets(output: dict, extraction: dict, output_dir: Path) -> dict:
 
             # Visual Crop
             visual_crop_info = _do_visual_crop(
-                pdf_path, page_num, label_rect, bbox, is_table, img, crop_filename, visual_dir, exam_id, question_region
+                pdf_path, page_num, label_rect, bbox, is_table, img, crop_filename, visual_dir, exam_id, question_region, strategy=crop_strategy
             )
 
             asset["crops"] = {"context": context_crop_info, "visual": visual_crop_info}
@@ -882,6 +943,11 @@ def crop_assets(output: dict, extraction: dict, output_dir: Path) -> dict:
             err = {"status": "failed", "reason": str(e)}
             asset["crops"] = {"context": err, "visual": err, "best": err}
             asset["crop"] = err
+
+    # ── Option-image crops for visual multiple-choice items ───────────────
+    option_dir = output_dir / "assets" / "options"
+    option_dir.mkdir(parents=True, exist_ok=True)
+    _crop_option_images(output, extraction, page_images, option_dir, exam_id, pdf_path)
 
     # ── Source document crops (for History and similar) ────────────
     sources_dir = output_dir / "assets" / "sources"
@@ -1078,8 +1144,14 @@ def _do_context_crop(img, label_rect, bbox, is_table, filename, context_dir, leg
     }
 
 
-def _do_visual_crop(pdf_path, page_num, label_rect, bbox, is_table, img, filename, visual_dir, exam_id, question_region=None) -> dict:
-    """Produce the visual crop using auto_candidate_score."""
+def _do_visual_crop(pdf_path, page_num, label_rect, bbox, is_table, img, filename, visual_dir, exam_id, question_region=None, strategy="auto") -> dict:
+    """Produce the visual crop using a strategy-driven approach.
+
+    Strategies:
+      "math"     — cluster_drawings first, then auto_candidate, then bbox
+      "physics"  — auto_candidate first (embedded handled upstream), then cluster, then bbox
+      "auto"     — auto_candidate_score, then bbox fallback
+    """
     if not pdf_path:
         return {"status": "failed", "reason": "no_pdf_path"}
 
@@ -1090,10 +1162,8 @@ def _do_visual_crop(pdf_path, page_num, label_rect, bbox, is_table, img, filenam
     if is_table:
         cropped = _visual_crop_table(pdf_path, page_num, label_rect, img, bbox)
         method = "find_tables"
-    elif label_rect:
-        # Prefer the real PDF vector cluster near the caption.  This is more
-        # stable across exams than a vision bbox because many official exam
-        # figures are vector drawings, not embedded images.
+    elif label_rect and strategy == "math":
+        # Math: cluster_drawings first (figures are mostly vectors)
         cropped, diagnostics = _visual_crop_cluster_near_label(pdf_path, page_num, label_rect, img)
         method = "cluster_drawings_near_label" if cropped is not None else ""
 
@@ -1101,32 +1171,48 @@ def _do_visual_crop(pdf_path, page_num, label_rect, bbox, is_table, img, filenam
             cropped, diagnostics = _visual_crop_figure(pdf_path, page_num, label_rect, img, question_region)
             method = "auto_candidate_score"
 
-        # If the vector/label candidate is polluted with running text, try the
-        # metadata / bbox_estimate candidate before falling back to context.
-        if bbox and _auto_visual_is_polluted(diagnostics):
-            try:
-                doc = fitz.open(pdf_path)
-                page_rect = doc[page_num - 1].rect
-                doc.close()
-            except Exception:
-                page_rect = fitz.Rect(0, 0, img.width / SCALE, img.height / SCALE)
+    elif label_rect and strategy == "physics":
+        # Physics/Chemistry: auto_candidate first (embedded images handled upstream)
+        cropped, diagnostics = _visual_crop_figure(pdf_path, page_num, label_rect, img, question_region)
+        method = "auto_candidate_score"
 
-            # Only trust the bbox when it agrees with the found caption.
-            if _bbox_is_consistent_with_label(bbox, label_rect, page_rect):
-                bbox_crop = _crop_visual_bbox(img, bbox, is_table=False)
-                if bbox_crop is not None:
-                    cropped = bbox_crop
-                    method = "bbox_estimate_visual"
-                    diagnostics = {
-                        "candidate": "bbox_estimate_visual",
-                        "fallbackReason": "auto_candidate_polluted_with_text",
-                        "previousAutoDiagnostics": diagnostics,
-                    }
-            else:
-                diagnostics = dict(diagnostics or {})
-                diagnostics["bboxRejected"] = "inconsistent_with_label_position"
+        # If auto is polluted, try cluster as fallback
+        if _auto_visual_is_polluted(diagnostics):
+            cluster_crop, cluster_diag = _visual_crop_cluster_near_label(pdf_path, page_num, label_rect, img)
+            if cluster_crop is not None:
+                cropped = cluster_crop
+                diagnostics = cluster_diag
+                method = "cluster_drawings_near_label"
 
-    elif bbox:
+    elif label_rect:
+        # Default/auto: auto_candidate_score
+        cropped, diagnostics = _visual_crop_figure(pdf_path, page_num, label_rect, img, question_region)
+        method = "auto_candidate_score"
+
+    # Bbox fallback — only if current crop is polluted and bbox is near label
+    if label_rect and bbox and _auto_visual_is_polluted(diagnostics):
+        try:
+            doc = fitz.open(pdf_path)
+            page_rect = doc[page_num - 1].rect
+            doc.close()
+        except Exception:
+            page_rect = fitz.Rect(0, 0, img.width / SCALE, img.height / SCALE)
+
+        if _bbox_is_consistent_with_label(bbox, label_rect, page_rect):
+            bbox_crop = _crop_visual_bbox(img, bbox, is_table=False)
+            if bbox_crop is not None:
+                cropped = bbox_crop
+                method = "bbox_estimate_visual"
+                diagnostics = {
+                    "candidate": "bbox_estimate_visual",
+                    "fallbackReason": "previous_candidate_polluted",
+                    "previousAutoDiagnostics": diagnostics,
+                }
+        else:
+            diagnostics = dict(diagnostics or {})
+            diagnostics["bboxRejected"] = "inconsistent_with_label_position"
+
+    elif not label_rect and bbox:
         cropped = _crop_visual_bbox(img, bbox, is_table=is_table)
         method = "bbox_estimate_visual"
         diagnostics = {"candidate": "bbox_estimate_visual", "fallbackReason": "label_not_found"}
@@ -1212,3 +1298,105 @@ def _do_visual_crop(pdf_path, page_num, label_rect, bbox, is_table, img, filenam
         result["diagnostics"] = diagnostics
 
     return result
+
+
+def _crop_option_images(output: dict, extraction: dict, page_images: dict[int, str], option_dir: Path, exam_id: str, pdf_path: str | None):
+    """Crop visual options for multiple-choice items with diagram/graph options."""
+    if not pdf_path:
+        return
+    visual_words = re.compile(r'diagramas?|esboço|curva|gráfico|forças|representa', re.I)
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return
+
+    for q in output.get("questions", []):
+        opts = q.get("options") or []
+        if q.get("type") != "multiple_choice" or len(opts) < 4:
+            continue
+        stmt = (q.get("statement") or "") + " " + (q.get("rawText") or "")
+        option_texts = [str(o.get("text", "") or "").strip() for o in opts]
+        image_like_option_texts = sum(
+            1 for t in option_texts
+            if re.search(r'\b(gráfico|grafico|diagrama|curva|esboço|esboco|eixo|pH|V\s*/\s*mL)\b', t, re.I)
+        )
+        blank_or_label_only = sum(1 for t in option_texts if len(t) <= 2)
+
+        # Only crop option images when options are truly visual:
+        # - 3+ options are blank/label-only (the VLM couldn't extract text)
+        # - 3+ options describe graphs/diagrams
+        should_crop_options = (
+            blank_or_label_only >= 3
+            or image_like_option_texts >= 3
+        )
+        if not should_crop_options:
+            # Cleanup stale option crops from older runs
+            for opt in opts:
+                opt.pop("imageUrl", None)
+                opt.pop("imageAssetId", None)
+            continue
+        page_num = q.get("sourcePage")
+        if not page_num or page_num not in page_images or page_num < 1 or page_num > doc.page_count:
+            continue
+        page = doc[page_num - 1]
+        img = Image.open(page_images[page_num])
+        q_rect = _region_to_rect(q.get("region")) or page.rect
+        q_rect = fitz.Rect(0, max(0, q_rect.y0 - 8), page.rect.width, min(page.rect.height, q_rect.y1 + 18))
+
+        labels = {}
+        for letter in "ABCD":
+            rects = []
+            for pat in (f"({letter})", ):
+                try:
+                    rects.extend(page.search_for(pat))
+                except Exception:
+                    pass
+            rects = [r for r in rects if not (fitz.Rect(r) & q_rect).is_empty]
+            if rects:
+                labels[letter] = sorted(rects, key=lambda r: (r.y0, r.x0))[-1]
+        if len(labels) < 4:
+            continue
+
+        label_items = sorted(labels.items(), key=lambda kv: (kv[1].y0, kv[1].x0))
+        rows: list[list[tuple[str, fitz.Rect]]] = []
+        for letter, rect in label_items:
+            placed = False
+            for row in rows:
+                if abs(row[0][1].y0 - rect.y0) < 45:
+                    row.append((letter, rect)); placed = True; break
+            if not placed:
+                rows.append([(letter, rect)])
+        for row in rows:
+            row.sort(key=lambda kv: kv[1].x0)
+
+        for row_idx, row in enumerate(rows):
+            row_y0 = min(r.y0 for _, r in row) - 10
+            next_row_y = min((min(r.y0 for _, r in rows[j]) for j in range(row_idx + 1, len(rows))), default=q_rect.y1)
+            row_y1 = min(max(row_y0 + 90, min(q_rect.y1, next_row_y - 8)), row_y0 + 150)
+
+            for idx, (letter, rect) in enumerate(row):
+                next_x = row[idx + 1][1].x0 if idx + 1 < len(row) else q_rect.x1
+                if len(row) == 1:
+                    x0, x1 = q_rect.x0, q_rect.x1
+                else:
+                    prev_x = row[idx - 1][1].x0 if idx > 0 else q_rect.x0
+                    x0 = (prev_x + rect.x0) / 2 if idx > 0 else q_rect.x0
+                    x1 = (rect.x0 + next_x) / 2 if idx + 1 < len(row) else q_rect.x1
+                crop_rect = fitz.Rect(max(0, x0 - 4), max(0, row_y0), min(page.rect.width, x1 + 4), min(page.rect.height, row_y1))
+                left, top = int(crop_rect.x0 * SCALE), int(crop_rect.y0 * SCALE)
+                right, bottom = int(crop_rect.x1 * SCALE), int(crop_rect.y1 * SCALE)
+                if right - left < 70 or bottom - top < 50:
+                    continue
+                cropped = img.crop((left, top, right, bottom))
+                fname = f"{q['questionId']}_option_{letter.lower()}.png"
+                cropped.save(str(option_dir / fname))
+                for opt in opts:
+                    if opt.get("letter") == letter:
+                        opt["imageUrl"] = f"/api/exams/{exam_id}/assets/options/{fname}"
+                        break
+        q["hasOptionImages"] = any(o.get("imageUrl") for o in opts)
+
+    try:
+        doc.close()
+    except Exception:
+        pass

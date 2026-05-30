@@ -6,8 +6,8 @@ import Link from 'next/link';
 import MathJaxProvider from '@/components/MathJaxProvider';
 import MathText from '@/components/MathText';
 
-interface Option { letter: string; text: string; latex?: string; }
-interface CropInfo { status: string; url?: string; quality?: string; diagnostics?: { edgeTouch?: boolean; textTouchesEdge?: boolean; contentAreaRatio?: number }; }
+interface Option { letter: string; text: string; latex?: string; imageUrl?: string; }
+interface CropInfo { status: string; url?: string; quality?: string; }
 interface Asset {
   id: string; type: string; page: number; description?: string;
   crops?: { context?: CropInfo; visual?: CropInfo; full?: CropInfo; best?: CropInfo };
@@ -24,6 +24,7 @@ interface Question {
   imageRefs?: string[]; tableRefs?: string[]; assetRefs?: string[]; sourceRefs?: { sourceId: string; childId?: string; mode: string }[];
   media?: { type: string; url: string; sourceId?: string; label?: string }[];
   points?: number; sourcePage?: number; parentQuestion?: string | null; isGroup?: boolean;
+  hasOptionImages?: boolean;
 }
 interface ExamData {
   exam_id: string; metadata: { title?: string; subject?: string; year?: string; phase?: string; stats?: { answerableItems?: number } };
@@ -42,134 +43,100 @@ export default function PreviewPage() {
 
   if (!data) return <div className="min-h-screen flex items-center justify-center text-gray-500">A carregar...</div>;
 
-  // Show all questions (including group parents with shared context)
-  const questions = data.questions.filter(q => q.statement || (q.options && q.options.length > 0));
+  // Only show answerable questions (not groups/parents)
+  const isAnswerable = (q: Question) => !q.isGroup && q.type !== 'group';
+  const questions = data.questions
+    .filter(q => isAnswerable(q) && (q.statement || (q.options && q.options.length > 0)))
+    .sort((a, b) => {
+      const ka = [a.sourcePage ?? 999, ...String(a.number || '').split('.').map(n => { const v = parseInt(n, 10); return isFinite(v) ? v : 999; })];
+      const kb = [b.sourcePage ?? 999, ...String(b.number || '').split('.').map(n => { const v = parseInt(n, 10); return isFinite(v) ? v : 999; })];
+      return ka.join('.').localeCompare(kb.join('.'), undefined, { numeric: true });
+    });
+
   const current = questions[selected];
   if (!current) return <div className="p-8">Sem perguntas.</div>;
 
-  // Get parent context for sub-questions
-  const getParentContext = (q: Question): string | null => {
-    if (!q.parentQuestion) return null;
-    const parent = data.questions.find(p => p.questionId === q.parentQuestion);
-    return parent?.statement || null;
+  // Get parent/ancestor context
+  const getAncestors = (q: Question): Question[] => {
+    const ancestors: Question[] = [];
+    let parentId = q.parentQuestion;
+    while (parentId) {
+      const parent = data.questions.find(p => p.questionId === parentId);
+      if (!parent) break;
+      ancestors.unshift(parent);
+      parentId = parent.parentQuestion;
+    }
+    return ancestors;
   };
 
   // Get best URL for an asset
   const getBestUrl = (asset?: Asset): string | null => {
     if (!asset) return null;
-    return (
-      asset.crops?.best?.url ||
-      asset.crops?.visual?.url ||
-      asset.crop?.url ||
-      asset.crops?.context?.url ||
-      asset.crops?.full?.url ||
-      null
-    );
+    return asset.crops?.best?.url || asset.crops?.visual?.url || asset.crop?.url || asset.crops?.context?.url || null;
   };
 
-  // Get images for current question
+  // Get images for a question, including inherited from parents
   const getAllImages = (q: Question): string[] => {
     const urls: string[] = [];
     const add = (url?: string | null) => { if (url && !urls.includes(url)) urls.push(url); };
 
-    const hideOptionTables = q.type === 'multi_blank_choice' && q.blanks && q.blanks.length > 0;
-    const isOptionTable = (id: string) => {
-      const a = data.assets.find(x => x.id === id);
-      return (a?.type === 'table' || id.toLowerCase().includes('tabela'));
+    const collectFromQuestion = (target: Question) => {
+      // SourceRefs
+      if (target.sourceRefs?.length) {
+        for (const ref of target.sourceRefs) {
+          const src = data.sources?.find(s => s.sourceId === ref.sourceId);
+          if (!src) continue;
+          add((src.crops as Record<string, CropInfo | undefined>)?.best?.url || src.crops?.full?.url || null);
+        }
+      }
+      // Direct refs
+      for (const refId of [...(target.imageRefs || []), ...(target.assetRefs || [])]) {
+        add(getBestUrl(data.assets.find(a => a.id === refId)));
+      }
+      // Media
+      if (target.media?.length) {
+        for (const m of target.media) add(m.url);
+      }
     };
 
-    // 1. SourceRefs first — use document crop (not internal assets)
-    if (q.sourceRefs?.length) {
-      for (const ref of q.sourceRefs) {
-        const src = data.sources?.find(s => s.sourceId === ref.sourceId);
-        if (!src) continue;
-
-        // Specific child only
-        if (ref.childId && src.assetRefs?.length) {
-          const letter = ref.childId.split('_').pop()?.toLowerCase() || 'a';
-          const idx = letter.charCodeAt(0) - 'a'.charCodeAt(0);
-          if (idx >= 0 && idx < src.assetRefs.length) {
-            add(getBestUrl(data.assets.find(a => a.id === src.assetRefs![idx])));
-          }
-          continue;
-        }
-
-        // Full document — always use source crop
-        add(
-          (src.crops as any)?.best?.url ||
-          (src.crops as any)?.document?.url ||
-          src.crops?.full?.url ||
-          null
-        );
-      }
-      // If has sourceRefs and not multi_blank, don't pull direct assetRefs
-      if (!hideOptionTables) return urls;
+    // Inherit from ancestors first
+    for (const ancestor of getAncestors(q)) {
+      collectFromQuestion(ancestor);
     }
-
-    // 2. Direct refs (skip option tables if selects exist)
-    for (const refId of [...(q.imageRefs || []), ...(q.assetRefs || []), ...(q.tableRefs || [])]) {
-      if (hideOptionTables && isOptionTable(refId)) continue;
-      add(getBestUrl(data.assets.find(a => a.id === refId)));
-    }
-
-    // 3. Text-based fallback
-    if (urls.length === 0 && q.groupId && data.sources) {
-      const text = (q.statement || '').toLowerCase();
-      const groupSources = data.sources.filter(s => s.groupId === q.groupId);
-      const docNums = [...text.matchAll(/documentos?\s+((?:\d+[\s,e]*)+)/gi)]
-        .flatMap(m => [...m[1].matchAll(/\d+/g)].map(n => n[0]));
-      const allDocs = /cada um dos documentos|dos documentos apresentados|dos dois documentos|dos três documentos/i.test(text);
-      const matched = allDocs ? groupSources : groupSources.filter(s =>
-        docNums.some(n => s.sourceId.endsWith(`_${n}`))
-      );
-      for (const src of matched) {
-        add((src.crops as any)?.best?.url || src.crops?.full?.url || null);
-      }
-    }
-
-    // 4. Media fallback
-    if (urls.length === 0 && q.media?.length) {
-      for (const m of q.media) add(m.url);
-    }
+    // Then own refs
+    collectFromQuestion(q);
 
     return urls;
   };
 
   const images = getAllImages(current);
-  const childQuestions = data.questions.filter(q => q.parentQuestion === current.questionId);
-  const isGroupParent = Boolean(current.isGroup || current.type === 'group' || childQuestions.length > 0);
 
   const getRenderableStatement = (q: Question): string => {
     const latex = q.statementLatex || '';
-    const badLatex =
-      latex.includes('�') ||
-      latex.includes('\\begin{itemize}') ||
-      latex.includes('\\begin{center}') ||
-      latex.includes('\\_\\_') ||
-      (q.textQuality?.status === 'corrupt');
-    if (badLatex) {
-      return q.statementPlain || q.statement;
-    }
+    const badLatex = latex.includes('�') || latex.includes('\\begin{itemize}') || (q.textQuality?.status === 'corrupt');
+    if (badLatex) return q.statementPlain || q.statement;
     return latex || q.statementPlain || q.statement;
   };
-  const qJson = current;
+
+  // Parent context text (combined from all ancestors)
+  const ancestorContext = getAncestors(current)
+    .map(a => a.statement)
+    .filter(Boolean)
+    .join('\n\n');
 
   return (
     <MathJaxProvider>
     <div className="h-screen flex flex-col bg-gray-50">
-      {/* Header */}
       <header className="bg-white border-b px-4 py-3 flex items-center gap-4 shrink-0">
         <Link href={`/exams/${id}`} className="text-blue-600 hover:underline text-sm">&larr; Voltar</Link>
         <h1 className="font-semibold text-lg truncate">
           {data.metadata.title || `${data.metadata.subject || 'Exame'} ${data.metadata.year || ''}`}
         </h1>
-        <span className="ml-auto text-sm text-gray-500">
-          {selected + 1} / {questions.length}
-        </span>
+        <span className="ml-auto text-sm text-gray-500">{selected + 1} / {questions.length}</span>
       </header>
 
       <div className="flex flex-1 overflow-hidden">
-        {/* Left sidebar — question nav grouped */}
+        {/* Sidebar */}
         <aside className="w-56 bg-white border-r overflow-y-auto shrink-0 p-3">
           {(() => {
             const groups = [...new Set(questions.map(q => q.group || 'Perguntas'))];
@@ -182,12 +149,9 @@ export default function PreviewPage() {
                     {groupQs.map(q => {
                       const i = questions.indexOf(q);
                       return (
-                        <button
-                          key={q.questionId}
-                          onClick={() => setSelected(i)}
+                        <button key={q.questionId} onClick={() => setSelected(i)}
                           className={`w-full aspect-square rounded text-xs font-bold flex items-center justify-center border transition-colors
-                            ${i === selected ? 'bg-blue-600 text-white border-blue-600' : answers[q.questionId] ? 'bg-blue-50 text-blue-800 border-blue-300' : 'bg-white text-gray-900 border-gray-300 hover:border-blue-400'}`}
-                        >
+                            ${i === selected ? 'bg-blue-600 text-white border-blue-600' : answers[q.questionId] ? 'bg-blue-50 text-blue-800 border-blue-300' : 'bg-white text-gray-900 border-gray-300 hover:border-blue-400'}`}>
                           {q.number}
                         </button>
                       );
@@ -199,76 +163,40 @@ export default function PreviewPage() {
           })()}
         </aside>
 
-        {/* Center — question content */}
+        {/* Main */}
         <main className="flex-1 overflow-y-auto p-6">
           <div className="max-w-2xl mx-auto space-y-5">
-            {/* Question header */}
             <div className="flex items-baseline gap-2">
               <span className="bg-blue-100 text-blue-800 text-sm font-bold px-2.5 py-0.5 rounded">
-                {current.displayNumber || (current.group ? `${current.group} - ${current.number}` : `Q${current.number}`)}
+                {current.displayNumber || current.number}
               </span>
               {current.points && <span className="text-sm text-gray-500">{current.points} pts</span>}
               <span className="text-xs text-gray-400 ml-auto">{current.type}</span>
             </div>
 
-            {/* Images */}
+            {/* Images (inherited + own) */}
             {images.length > 0 && (
               <div className="space-y-3">
                 {images.map((url, i) => (
-                  <img key={i} src={url} alt={`Documento ${i + 1}`} className="mx-auto max-h-[560px] max-w-full rounded border bg-white object-contain shadow-sm" />
+                  <img key={i} src={url} alt={`Figura ${i + 1}`} className="mx-auto max-h-[560px] max-w-full rounded border bg-white object-contain shadow-sm" />
                 ))}
               </div>
             )}
 
-            {/* Parent context for sub-questions */}
-            {getParentContext(current) && (
-              <div className="bg-gray-100 border-l-4 border-blue-300 p-4 rounded text-sm text-gray-700">
-                <MathText text={getParentContext(current)!} />
+            {/* Ancestor context */}
+            {ancestorContext && (
+              <div className="bg-gray-100 border-l-4 border-blue-300 p-4 rounded text-sm text-gray-700 whitespace-pre-wrap">
+                <MathText text={ancestorContext} />
               </div>
             )}
 
             {/* Statement */}
             <div className="text-gray-900 text-base leading-relaxed whitespace-pre-wrap">
-              <MathText text={(() => {
-                const useRaw = current.type === 'multi_blank_choice' || current.tableRefs?.length;
-                let text = useRaw ? current.statement : getRenderableStatement(current);
-                // Remove inline table text when table is shown as image asset
-                if (current.tableRefs?.length) {
-                  const tableAsset = data.assets.find(a => current.tableRefs!.includes(a.id) && a.type === 'table');
-                  if (tableAsset) {
-                    // Remove block that looks like table data (rows of numbers/text separated by spaces)
-                    text = text.replace(/(?:^|\n)(?:Ano|Year)\s+\d{4}[\s\S]*?(?:\d[\s\d]*\d)\s*(?:\n|$)/gi, '\n');
-                  }
-                }
-                return text.replace(/\n{3,}/g, '\n\n').trim();
-              })()} />
+              <MathText text={getRenderableStatement(current).replace(/\n{3,}/g, '\n\n').trim()} />
             </div>
 
             {/* Answer area */}
-            {isGroupParent ? (
-              <div className="space-y-2 rounded-lg border bg-white p-4">
-                <div className="text-sm font-semibold text-gray-700">Subquestoes</div>
-                {childQuestions.length === 0 ? (
-                  <div className="text-sm text-gray-500">Este grupo nao tem subquestoes extraidas.</div>
-                ) : (
-                  childQuestions
-                    .sort((a, b) => a.number.localeCompare(b.number, undefined, { numeric: true }))
-                    .map(child => (
-                      <button
-                        key={child.questionId}
-                        onClick={() => {
-                          const idx = questions.findIndex(q => q.questionId === child.questionId);
-                          if (idx >= 0) setSelected(idx);
-                        }}
-                        className="w-full rounded border border-gray-200 px-3 py-2 text-left text-sm hover:bg-gray-50"
-                      >
-                        <span className="font-medium text-gray-700">{child.displayNumber || child.number}</span>
-                        <span className="ml-2 text-gray-500">{child.type}</span>
-                      </button>
-                    ))
-                )}
-              </div>
-            ) : current.type === 'multi_blank_choice' && current.blanks?.length ? (
+            {current.type === 'multi_blank_choice' && current.blanks?.length ? (
               <div className="rounded-lg border bg-white p-4 space-y-3">
                 <div className="text-sm font-semibold text-gray-700">Respostas</div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -277,11 +205,8 @@ export default function PreviewPage() {
                     return (
                       <label key={blank.number} className="flex items-center gap-3 rounded border px-3 py-2">
                         <span className="w-8 font-bold text-blue-700">{blank.number}</span>
-                        <select
-                          value={answers[key] || ''}
-                          onChange={e => setAnswers(prev => ({ ...prev, [key]: e.target.value }))}
-                          className="flex-1 rounded border border-gray-300 bg-white px-2 py-1.5 text-sm text-gray-900"
-                        >
+                        <select value={answers[key] || ''} onChange={e => setAnswers(prev => ({ ...prev, [key]: e.target.value }))}
+                          className="flex-1 rounded border border-gray-300 bg-white px-2 py-1.5 text-sm text-gray-900">
                           <option value="">Selecionar...</option>
                           {blank.options.map(opt => (
                             <option key={opt.letter} value={opt.letter}>{opt.letter}) {opt.text}</option>
@@ -295,58 +220,55 @@ export default function PreviewPage() {
             ) : current.type === 'multiple_choice' && current.options && current.options.length > 0 ? (
               <div className="space-y-2">
                 {current.options.map(opt => (
-                  <label
-                    key={opt.letter}
+                  <label key={opt.letter}
                     className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors
-                      ${answers[current.questionId] === opt.letter ? 'border-blue-500 bg-blue-50' : 'border-gray-200 hover:bg-gray-50'}`}
-                  >
-                    <input
-                      type="radio"
-                      name={current.questionId}
-                      value={opt.letter}
+                      ${answers[current.questionId] === opt.letter ? 'border-blue-500 bg-blue-50' : 'border-gray-200 hover:bg-gray-50'}`}>
+                    <input type="radio" name={current.questionId} value={opt.letter}
                       checked={answers[current.questionId] === opt.letter}
                       onChange={() => setAnswers(prev => ({ ...prev, [current.questionId]: opt.letter }))}
-                      className="mt-0.5"
-                    />
+                      className="mt-0.5" />
                     <span className="font-medium text-sm text-gray-500 w-5">({opt.letter})</span>
-                    <span className="text-gray-800"><MathText text={opt.latex || opt.text} /></span>
+                    <span className="flex-1 text-gray-800">
+                      {opt.imageUrl ? (
+                        <span className="block">
+                          <img src={opt.imageUrl} alt={`Opção ${opt.letter}`} className="max-h-56 max-w-full rounded border bg-white object-contain" />
+                          {opt.text && !/^\(?[A-D]\)?\s*(Gr[aá]fico|Diagrama|Curva|Esbo[cç]o)/i.test(opt.text) && (
+                            <span className="mt-2 block text-sm text-gray-700"><MathText text={opt.text} /></span>
+                          )}
+                        </span>
+                      ) : (
+                        <MathText text={opt.latex || opt.text} />
+                      )}
+                    </span>
                   </label>
                 ))}
               </div>
             ) : (
-              <textarea
-                placeholder="Escreve a tua resposta aqui..."
+              <textarea placeholder="Escreve a tua resposta aqui..."
                 value={answers[current.questionId] || ''}
                 onChange={e => setAnswers(prev => ({ ...prev, [current.questionId]: e.target.value }))}
-                className="w-full h-32 p-3 border border-gray-300 rounded-lg resize-y text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-              />
+                className="w-full h-32 p-3 border border-gray-300 rounded-lg resize-y text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500" />
             )}
 
             {/* Navigation */}
             <div className="flex gap-3 pt-4">
-              <button
-                onClick={() => setSelected(Math.max(0, selected - 1))}
-                disabled={selected === 0}
-                className="px-4 py-2 rounded bg-white border border-gray-300 hover:bg-gray-50 disabled:opacity-40 text-sm text-gray-900 font-medium"
-              >
+              <button onClick={() => setSelected(Math.max(0, selected - 1))} disabled={selected === 0}
+                className="px-4 py-2 rounded bg-white border border-gray-300 hover:bg-gray-50 disabled:opacity-40 text-sm text-gray-900 font-medium">
                 &larr; Anterior
               </button>
-              <button
-                onClick={() => setSelected(Math.min(questions.length - 1, selected + 1))}
-                disabled={selected === questions.length - 1}
-                className="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 text-sm"
-              >
+              <button onClick={() => setSelected(Math.min(questions.length - 1, selected + 1))} disabled={selected === questions.length - 1}
+                className="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 text-sm">
                 Seguinte &rarr;
               </button>
             </div>
           </div>
         </main>
 
-        {/* Right panel — JSON */}
+        {/* JSON panel */}
         <aside className="w-96 bg-gray-900 text-gray-100 overflow-y-auto shrink-0 p-4 border-l">
           <h3 className="text-xs font-semibold text-gray-400 uppercase mb-2">JSON da Pergunta</h3>
           <pre className="text-xs leading-relaxed whitespace-pre-wrap break-words font-mono">
-            {JSON.stringify(qJson, null, 2)}
+            {JSON.stringify(current, null, 2)}
           </pre>
         </aside>
       </div>
