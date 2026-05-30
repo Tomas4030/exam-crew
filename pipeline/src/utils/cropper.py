@@ -1341,7 +1341,7 @@ def _crop_option_images(output: dict, extraction: dict, page_images: dict[int, s
         page = doc[page_num - 1]
         img = Image.open(page_images[page_num])
         q_rect = _region_to_rect(q.get("region")) or page.rect
-        q_rect = fitz.Rect(0, max(0, q_rect.y0 - 8), page.rect.width, min(page.rect.height, q_rect.y1 + 18))
+        q_rect = fitz.Rect(0, max(0, q_rect.y0 - 8), page.rect.width, min(page.rect.height, q_rect.y1 + 50))
 
         labels = {}
         for letter in "ABCD":
@@ -1370,9 +1370,9 @@ def _crop_option_images(output: dict, extraction: dict, page_images: dict[int, s
             row.sort(key=lambda kv: kv[1].x0)
 
         for row_idx, row in enumerate(rows):
-            row_y0 = min(r.y0 for _, r in row) - 10
+            row_y0 = min(r.y0 for _, r in row) - 4
             next_row_y = min((min(r.y0 for _, r in rows[j]) for j in range(row_idx + 1, len(rows))), default=q_rect.y1)
-            row_y1 = min(max(row_y0 + 90, min(q_rect.y1, next_row_y - 8)), row_y0 + 150)
+            row_y1 = min(max(row_y0 + 100, min(q_rect.y1, next_row_y - 4)), row_y0 + 220)
 
             for idx, (letter, rect) in enumerate(row):
                 next_x = row[idx + 1][1].x0 if idx + 1 < len(row) else q_rect.x1

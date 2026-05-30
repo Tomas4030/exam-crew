@@ -271,8 +271,19 @@ def math_normalize(output: dict, extraction: dict, delay: float = 2.0) -> dict:
 
         if not needs_normalization:
             # Non-math or clean text: just set quality as ok
-            q["statementPlain"] = q.get("statementPlain") or statement
-            q["statementLatex"] = q.get("statementLatex") or statement
+            raw_full = q.get("statementRaw") or q.get("rawText") or statement
+            existing_latex = q.get("statementLatex") or ""
+
+            # If statementLatex (from VLM extraction) is much shorter than the
+            # raw text, the VLM truncated content (e.g. dropped table columns).
+            content_ratio = len(existing_latex.strip()) / max(len(raw_full.strip()), 1)
+            if existing_latex and content_ratio < 0.6:
+                q["statementLatex"] = raw_full
+                q["statementPlain"] = raw_full
+            else:
+                q["statementPlain"] = q.get("statementPlain") or statement
+                q["statementLatex"] = q.get("statementLatex") or statement
+
             _apply_deterministic_math(q)
             _set_text_quality(q, "ok", "pdf_text_raw")
             continue

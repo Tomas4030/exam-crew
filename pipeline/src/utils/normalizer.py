@@ -25,6 +25,13 @@ def normalize(output: dict, extraction: dict | None = None) -> dict:
         q.setdefault("warnings", [])
         q.setdefault("subQuestions", [])
 
+    # Strip graph axis label noise from statements (PyMuPDF reads axis labels as text)
+    for q in questions:
+        if q.get("statement"):
+            q["statement"] = _strip_figure_axis_noise(q["statement"])
+        if q.get("statementRaw"):
+            q["statementRaw"] = _strip_figure_axis_noise(q["statementRaw"])
+
     # ── 0. Remove fake questions with Roman numeral numbers ──────
     # These are propositions (I, II, III, IV) inside another question, not real questions
     _remove_roman_numeral_questions(questions)
@@ -444,6 +451,31 @@ def _repair_figure_associations(questions: list[dict], assets: list[dict]):
                     q.setdefault("assetRefs", []).append(aid)
                 q["visualDependency"] = True
 
+
+
+def _strip_figure_axis_noise(text: str) -> str:
+    """Remove sequences of graph axis labels that PyMuPDF reads as text.
+
+    Detects blocks of 3+ consecutive very-short lines (axis labels like c, t, H 2)
+    that appear near a 'Figura N' caption.
+    """
+    lines = text.split('\n')
+    result = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if 0 < len(stripped) <= 5:
+            j = i
+            while j < len(lines) and len(lines[j].strip()) <= 6:
+                j += 1
+            if j - i >= 3:
+                context = '\n'.join(lines[max(0, i - 2):j + 3])
+                if re.search(r'[Ff]igura\s*\d+', context):
+                    i = j
+                    continue
+        result.append(lines[i])
+        i += 1
+    return '\n'.join(result)
 
 
 _ROMAN_NUMERALS = {"I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"}

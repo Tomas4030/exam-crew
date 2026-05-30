@@ -452,7 +452,7 @@ Text:
             scoring_entries = []
             for pr in self._last_page_results:
                 for score in pr.get("scoring", []):
-                    q_num = str(score.get("question") or score.get("number") or "").strip()
+                    q_num = str(score.get("question") or score.get("number") or "").strip().rstrip(".")
                     pts = score.get("points") or score.get("cotacao") or score.get("score")
                     if q_num and pts is not None:
                         try:
@@ -709,7 +709,7 @@ Text:
                 # I/II/III/IV and a/b/c/d inside statements are NOT sub-questions
                 has_source_grouping = subject_profile.get("has_source_grouping", False) if subject_profile else False
                 is_sub = "." in number and not has_source_grouping
-                parent_num = number.split(".")[0] if is_sub else None
+                parent_num = ".".join(number.split(".")[:-1]) if is_sub else None
 
                 # For History: flatten "2.1" → just "2" (it's the same question)
                 if has_source_grouping and "." in number:
@@ -722,7 +722,25 @@ Text:
                     number = base_num
 
                 # Generate unique ID
-                q_id = f"q{number.replace('.', '_')}"
+                if has_source_grouping:
+                    group_label = page_data.get("group", "") or page_data.get("grupo", "") or ""
+                    group_slug = re.sub(r'[^a-zA-Z0-9]', '', group_label).lower()
+                    q_id = f"{group_slug}_q{number.replace('.', '_')}" if group_slug else f"q{number.replace('.', '_')}"
+                else:
+                    q_id = f"q{number.replace('.', '_')}"
+
+                # If a synthetic group exists with this ID, merge real data into it
+                if q_id in group_questions and group_questions[q_id].get("_synthetic"):
+                    existing = group_questions[q_id]
+                    if q.get("statement"):
+                        existing["statement"] = q["statement"]
+                    if q.get("rawText"):
+                        existing["rawText"] = q["rawText"]
+                    existing["sourcePage"] = page_num
+                    existing.pop("_synthetic", None)
+                    seen_ids.add(q_id)
+                    continue
+
                 if q_id in seen_ids:
                     q_id = f"q{number.replace('.', '_')}_p{page_num}"
                 seen_ids.add(q_id)
@@ -730,7 +748,10 @@ Text:
                 # If sub-question, ensure parent group exists
                 parent_id = None
                 if parent_num:
-                    parent_id = f"q{parent_num}"
+                    if has_source_grouping and group_slug:
+                        parent_id = f"{group_slug}_q{parent_num.replace('.', '_')}"
+                    else:
+                        parent_id = f"q{parent_num}"
                     if parent_id not in group_questions:
                         group_questions[parent_id] = {
                             "questionId": parent_id,
@@ -753,6 +774,7 @@ Text:
                             "hasTable": False,
                             "isGroup": True,
                             "subQuestions": [],
+                            "_synthetic": True,
                         }
 
                 # Determine imageRefs and tableRefs
@@ -889,6 +911,14 @@ Text:
                     "calculatorAllowed": calc_allowed,
                     "points": q.get("points"),
                 }
+
+                # Detect mandatory questions (marked with ✱/* in the PDF)
+                raw_ctx = question.get("sourceTextRaw", "") or ""
+                mand_pat = re.compile(r'[✱\*❋]\s*' + re.escape(number) + r'[.\s]')
+                question["isMandatory"] = bool(
+                    mand_pat.search(raw_ctx) or mand_pat.search(statement)
+                )
+
                 all_questions.append(question)
 
                 # Track in parent group
@@ -1006,7 +1036,7 @@ Text:
         for page_data in page_results:
             for score in page_data.get("scoring", []):
                 # Accept both 'question' and 'number' keys from model
-                q_num = str(score.get("question") or score.get("number") or "").strip()
+                q_num = str(score.get("question") or score.get("number") or "").strip().rstrip(".")
                 pts = score.get("points") or score.get("cotacao") or score.get("score")
                 # Also accept group key for History scoring
                 group = score.get("group") or score.get("grupo") or ""
@@ -1085,7 +1115,7 @@ Text:
                         continue
                     if pts <= 0 or pts > 50:
                         continue
-                    q_num = q_num_str.lstrip("0") or "0"
+                    q_num = q_num_str.lstrip("0").rstrip(".") or "0"
                     for q in all_questions:
                         if q["number"] == q_num and q.get("points") is None:
                             q["points"] = pts
