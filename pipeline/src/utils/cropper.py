@@ -1341,7 +1341,7 @@ def _crop_option_images(output: dict, extraction: dict, page_images: dict[int, s
         page = doc[page_num - 1]
         img = Image.open(page_images[page_num])
         q_rect = _region_to_rect(q.get("region")) or page.rect
-        q_rect = fitz.Rect(0, max(0, q_rect.y0 - 8), page.rect.width, min(page.rect.height, q_rect.y1 + 50))
+        q_rect = fitz.Rect(0, max(0, q_rect.y0 - 8), page.rect.width, min(page.rect.height, q_rect.y1 + 18))
 
         labels = {}
         for letter in "ABCD":
@@ -1353,7 +1353,7 @@ def _crop_option_images(output: dict, extraction: dict, page_images: dict[int, s
                     pass
             rects = [r for r in rects if not (fitz.Rect(r) & q_rect).is_empty]
             if rects:
-                labels[letter] = sorted(rects, key=lambda r: (r.y0, r.x0))[-1]
+                labels[letter] = sorted(rects, key=lambda r: (r.y0, r.x0))[0]
         if len(labels) < 4:
             continue
 
@@ -1369,10 +1369,18 @@ def _crop_option_images(output: dict, extraction: dict, page_images: dict[int, s
         for row in rows:
             row.sort(key=lambda kv: kv[1].x0)
 
+        # Pre-calculate row heights, then use minimum for consistency
+        _row_heights = []
+        for row_idx, row in enumerate(rows):
+            _ry0 = min(r.y0 for _, r in row) - 4
+            _next = min((min(r.y0 for _, r in rows[j]) for j in range(row_idx + 1, len(rows))), default=q_rect.y1)
+            _ry1 = min(max(_ry0 + 100, min(q_rect.y1, _next - 4)), _ry0 + 220)
+            _row_heights.append(_ry1 - _ry0)
+        consistent_h = min(_row_heights) if _row_heights else 150
+
         for row_idx, row in enumerate(rows):
             row_y0 = min(r.y0 for _, r in row) - 4
-            next_row_y = min((min(r.y0 for _, r in rows[j]) for j in range(row_idx + 1, len(rows))), default=q_rect.y1)
-            row_y1 = min(max(row_y0 + 100, min(q_rect.y1, next_row_y - 4)), row_y0 + 220)
+            row_y1 = row_y0 + consistent_h
 
             for idx, (letter, rect) in enumerate(row):
                 next_x = row[idx + 1][1].x0 if idx + 1 < len(row) else q_rect.x1

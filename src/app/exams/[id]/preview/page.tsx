@@ -25,6 +25,7 @@ interface Question {
   media?: { type: string; url: string; sourceId?: string; label?: string }[];
   points?: number; sourcePage?: number; parentQuestion?: string | null; isGroup?: boolean;
   hasOptionImages?: boolean;
+  matchColumns?: { left: { key: string; text: string }[]; right: { key: string; text: string }[] };
 }
 interface ExamData {
   exam_id: string; metadata: { title?: string; subject?: string; year?: string; phase?: string; stats?: { answerableItems?: number } };
@@ -249,6 +250,27 @@ export default function PreviewPage() {
                     </span>
                   </label>
                 ))}
+              </div>
+            ) : current.type === 'matching' && current.matchColumns ? (
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 gap-4 border rounded-lg overflow-hidden text-sm">
+                  <div className="bg-gray-100 font-bold p-2 text-center border-b">Coluna I</div>
+                  <div className="bg-gray-100 font-bold p-2 text-center border-b">Coluna II</div>
+                  {current.matchColumns.left.map(item => (
+                    <div key={item.key} className="p-2 border-b">
+                      <span className="font-bold text-blue-700">({item.key})</span> {item.text}
+                    </div>
+                  ))}
+                  {current.matchColumns.right.map(item => (
+                    <div key={item.key} className="p-2 border-b">
+                      <span className="font-bold text-gray-600">({item.key})</span> {item.text}
+                    </div>
+                  ))}
+                </div>
+                <textarea placeholder="Ex: (a)-(2), (b)-(4), (c)-(5)"
+                  value={answers[current.questionId] || ''}
+                  onChange={e => setAnswers(prev => ({ ...prev, [current.questionId]: e.target.value }))}
+                  className="w-full h-20 p-3 border border-gray-300 rounded-lg resize-y text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500" />
               </div>
             ) : (
               <textarea placeholder="Escreve a tua resposta aqui..."

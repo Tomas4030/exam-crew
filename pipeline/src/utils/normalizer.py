@@ -25,12 +25,14 @@ def normalize(output: dict, extraction: dict | None = None) -> dict:
         q.setdefault("warnings", [])
         q.setdefault("subQuestions", [])
 
-    # Strip graph axis label noise from statements (PyMuPDF reads axis labels as text)
+    # Strip graph axis label noise from ALL text fields
+    _TEXT_FIELDS = ("statement", "statementRaw", "statementLatex", "statementPlain",
+                    "rawText", "statementFormatted", "statementLatexFormatted", "statementPlainFormatted")
     for q in questions:
-        if q.get("statement"):
-            q["statement"] = _strip_figure_axis_noise(q["statement"])
-        if q.get("statementRaw"):
-            q["statementRaw"] = _strip_figure_axis_noise(q["statementRaw"])
+        for field in _TEXT_FIELDS:
+            val = q.get(field)
+            if val and isinstance(val, str):
+                q[field] = _strip_figure_axis_noise(val)
 
     # ── 0. Remove fake questions with Roman numeral numbers ──────
     # These are propositions (I, II, III, IV) inside another question, not real questions
@@ -73,6 +75,7 @@ def normalize(output: dict, extraction: dict | None = None) -> dict:
     # ── 1. Reassociate figures by statement mentions ─────────────
     _repair_figure_associations(questions, assets)
     _repair_table_associations(questions, assets)
+    _detect_and_parse_matching(questions)
 
     # ── 1a. Recover subquestions missed by the VLM from native PDF text ──
     _recover_numbered_subquestions(output, extraction)
@@ -182,6 +185,26 @@ def _repair_table_associations(questions: list[dict], assets: list[dict]):
             best["assetRefs"].append(aid)
         best["hasTable"] = True
         best["visualDependency"] = True
+
+
+def _detect_and_parse_matching(questions: list[dict]):
+    """Detect questions with COLUNA I / COLUNA II and structure as matching."""
+    for q in questions:
+        stmt = q.get("rawText") or q.get("statement") or ""
+        if not (re.search(r'\bCOLUNA\s+I\b', stmt, re.I) and
+                re.search(r'\bCOLUNA\s+II\b', stmt, re.I)):
+            continue
+
+        q["type"] = "matching"
+
+        left_items = re.findall(r'\(([a-e])\)\s*([^\n(]+)', stmt)
+        right_items = re.findall(r'\((\d)\)\s*([^\n(]+)', stmt)
+
+        if left_items and right_items:
+            q["matchColumns"] = {
+                "left": [{"key": k, "text": v.strip()} for k, v in left_items],
+                "right": [{"key": k, "text": v.strip()} for k, v in right_items],
+            }
 
 
 def _recover_numbered_subquestions(output: dict, extraction: dict | None):
@@ -454,11 +477,7 @@ def _repair_figure_associations(questions: list[dict], assets: list[dict]):
 
 
 def _strip_figure_axis_noise(text: str) -> str:
-    """Remove sequences of graph axis labels that PyMuPDF reads as text.
-
-    Detects blocks of 3+ consecutive very-short lines (axis labels like c, t, H 2)
-    that appear near a 'Figura N' caption.
-    """
+    """Remove sequences of graph axis labels AND broken typeset formulas."""
     lines = text.split('\n')
     result = []
     i = 0
@@ -468,11 +487,27 @@ def _strip_figure_axis_noise(text: str) -> str:
             j = i
             while j < len(lines) and len(lines[j].strip()) <= 6:
                 j += 1
-            if j - i >= 3:
+            block_size = j - i
+            if block_size >= 3:
                 context = '\n'.join(lines[max(0, i - 2):j + 3])
+
+                # Case 1: axis labels near a "Figura N" caption
                 if re.search(r'[Ff]igura\s*\d+', context):
                     i = j
                     continue
+
+                # Case 2: vertically typeset formula (broken fraction)
+                # 6+ consecutive lines with ≤3 chars each, between normal text
+                if block_size >= 6:
+                    all_very_short = all(len(lines[k].strip()) <= 3 for k in range(i, j))
+                    before = [lines[k].strip() for k in range(max(0, i - 3), i)]
+                    after = [lines[k].strip() for k in range(j, min(len(lines), j + 3))]
+                    has_real_before = any(len(l) > 8 for l in before)
+                    has_real_after = any(len(l) > 8 for l in after)
+                    if all_very_short and has_real_before and has_real_after:
+                        i = j
+                        continue
+
         result.append(lines[i])
         i += 1
     return '\n'.join(result)
