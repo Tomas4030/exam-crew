@@ -69,16 +69,20 @@ export default function PreviewPage() {
     return ancestors;
   };
 
-  // Get best URL for an asset
-  const getBestUrl = (asset?: Asset): string | null => {
+  // Get visual URL for an asset (never serve context crops in quiz)
+  const getVisualUrl = (asset?: Asset): string | null => {
     if (!asset) return null;
-    return asset.crops?.best?.url || asset.crops?.visual?.url || asset.crop?.url || asset.crops?.context?.url || null;
+    const urls = [asset.crops?.visual?.url, asset.crop?.url, asset.crops?.best?.url];
+    for (const url of urls) {
+      if (url && url.includes('/assets/visual/')) return url;
+    }
+    return null;
   };
 
   // Get images for a question, including inherited from parents
   const getAllImages = (q: Question): string[] => {
     const urls: string[] = [];
-    const add = (url?: string | null) => { if (url && !urls.includes(url)) urls.push(url); };
+    const add = (url?: string | null) => { if (url && url.includes('/assets/') && !urls.includes(url)) urls.push(url); };
 
     const collectFromQuestion = (target: Question) => {
       // SourceRefs
@@ -86,16 +90,19 @@ export default function PreviewPage() {
         for (const ref of target.sourceRefs) {
           const src = data.sources?.find(s => s.sourceId === ref.sourceId);
           if (!src) continue;
-          add((src.crops as Record<string, CropInfo | undefined>)?.best?.url || src.crops?.full?.url || null);
+          const visual = src.crops?.visual?.url;
+          if (visual && visual.includes('/assets/visual/')) add(visual);
         }
       }
       // Direct refs
       for (const refId of [...(target.imageRefs || []), ...(target.assetRefs || [])]) {
-        add(getBestUrl(data.assets.find(a => a.id === refId)));
+        add(getVisualUrl(data.assets.find(a => a.id === refId)));
       }
-      // Media
+      // Media (only visual)
       if (target.media?.length) {
-        for (const m of target.media) add(m.url);
+        for (const m of target.media) {
+          if (m.url.includes('/assets/visual/')) add(m.url);
+        }
       }
     };
 
