@@ -270,6 +270,10 @@ Text:
         # Step 3.7b: Re-normalize after crops (catches cloned table assets)
         output = normalize(output, extraction)
 
+        # Step 3.7c: Profile-based normalizer (discipline-specific rules)
+        from .normalizers import normalize_by_profile
+        output = normalize_by_profile(output, extraction, subject_profile)
+
         # Step 3.8: Math normalization (LaTeX, textQuality)
         report_progress("math_normalize", "Normalizing mathematical text")
         output = math_normalize(output, extraction)

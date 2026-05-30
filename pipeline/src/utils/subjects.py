@@ -4,11 +4,14 @@ SUBJECT_PROFILES = {
     "matematica_a": {
         "keywords": ["matemática a", "matematica a", "mat a", "635"],
         "has_formula_sheet": True,
-        "formula_sheet_hint": "formulário",  # text to detect formula pages
+        "formula_sheet_hint": "formulário",
         "latex_heavy": True,
         "has_excerpts": False,
         "has_source_grouping": False,
         "question_types": ["multiple_choice", "open_answer", "calculation", "proof", "multi_blank_choice"],
+        "normalizers": ["common", "matematica"],
+        "crop_profile": "math",
+        "preview_profile": "math",
     },
     "fisica_quimica": {
         "keywords": ["física e química", "fisica e quimica", "fq", "715"],
@@ -17,7 +20,10 @@ SUBJECT_PROFILES = {
         "latex_heavy": True,
         "has_excerpts": False,
         "has_source_grouping": False,
-        "question_types": ["multiple_choice", "open_answer", "calculation"],
+        "question_types": ["multiple_choice", "open_answer", "calculation", "matching", "multi_blank_choice"],
+        "normalizers": ["common", "fisica_quimica"],
+        "crop_profile": "physics",
+        "preview_profile": "fisica_quimica",
     },
     "portugues": {
         "keywords": ["português", "portugues", "639"],
@@ -26,6 +32,9 @@ SUBJECT_PROFILES = {
         "has_excerpts": True,
         "has_source_grouping": True,
         "question_types": ["multiple_choice", "open_answer", "essay", "short_answer"],
+        "normalizers": ["common", "humanities"],
+        "crop_profile": "auto",
+        "preview_profile": "humanities",
     },
     "historia_a": {
         "keywords": ["história a", "historia a", "623"],
@@ -34,6 +43,9 @@ SUBJECT_PROFILES = {
         "has_excerpts": True,
         "has_source_grouping": True,
         "question_types": ["document_analysis", "short_answer", "essay"],
+        "normalizers": ["common", "humanities"],
+        "crop_profile": "auto",
+        "preview_profile": "humanities",
     },
     "biologia_geologia": {
         "keywords": ["biologia e geologia", "biologia", "702"],
@@ -42,6 +54,9 @@ SUBJECT_PROFILES = {
         "has_excerpts": False,
         "has_source_grouping": False,
         "question_types": ["multiple_choice", "open_answer", "classification", "ordering"],
+        "normalizers": ["common", "fisica_quimica"],
+        "crop_profile": "physics",
+        "preview_profile": "fisica_quimica",
     },
     "geografia_a": {
         "keywords": ["geografia a", "geografia", "719"],
@@ -50,6 +65,9 @@ SUBJECT_PROFILES = {
         "has_excerpts": True,
         "has_source_grouping": True,
         "question_types": ["multiple_choice", "open_answer", "document_analysis"],
+        "normalizers": ["common", "humanities"],
+        "crop_profile": "auto",
+        "preview_profile": "humanities",
     },
     "filosofia": {
         "keywords": ["filosofia", "714"],
@@ -58,6 +76,9 @@ SUBJECT_PROFILES = {
         "has_excerpts": True,
         "has_source_grouping": True,
         "question_types": ["multiple_choice", "open_answer", "essay"],
+        "normalizers": ["common", "humanities"],
+        "crop_profile": "auto",
+        "preview_profile": "humanities",
     },
     "unknown": {
         "keywords": [],
@@ -66,6 +87,9 @@ SUBJECT_PROFILES = {
         "has_excerpts": False,
         "has_source_grouping": False,
         "question_types": ["multiple_choice", "open_answer"],
+        "normalizers": ["common"],
+        "crop_profile": "auto",
+        "preview_profile": "auto",
     },
 }
 
