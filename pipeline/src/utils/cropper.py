@@ -1341,7 +1341,19 @@ def _crop_option_images(output: dict, extraction: dict, page_images: dict[int, s
         page = doc[page_num - 1]
         img = Image.open(page_images[page_num])
         q_rect = _region_to_rect(q.get("region")) or page.rect
-        q_rect = fitz.Rect(0, max(0, q_rect.y0 - 8), page.rect.width, min(page.rect.height, q_rect.y1 + 18))
+
+        # Find next question on same page to cap the search area
+        next_q_y = page.rect.height
+        for other_q in output.get("questions", []):
+            if other_q.get("sourcePage") != page_num:
+                continue
+            if other_q.get("questionId") == q.get("questionId"):
+                continue
+            other_region = _region_to_rect(other_q.get("region"))
+            if other_region and other_region.y0 > q_rect.y0 + 20:
+                next_q_y = min(next_q_y, other_region.y0)
+
+        q_rect = fitz.Rect(0, max(0, q_rect.y0 - 8), page.rect.width, min(next_q_y - 2, q_rect.y1 + 18))
 
         labels = {}
         for letter in "ABCD":

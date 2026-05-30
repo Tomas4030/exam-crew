@@ -91,11 +91,9 @@ def normalize(output: dict, extraction: dict | None = None) -> dict:
     # ── 1a. Recover subquestions missed by the VLM from native PDF text ──
     _recover_numbered_subquestions(output, extraction)
     questions = output.get("questions", [])  # refresh after recovery
-    _detect_and_parse_matching(questions)  # after recovery
 
     # ── 1a.1. Keep recovered group parents clean ──────────────────
     _trim_group_parent_statements(output)
-    _repair_q9_group_and_children(output)
 
     # ── 1a.2. Build blanks when a multi_blank_choice was recovered from text ─
     _repair_multiblank_options_from_statement(output)
@@ -527,137 +525,6 @@ def _repair_figure_associations(questions: list[dict], assets: list[dict]):
                     q.setdefault("assetRefs", []).append(aid)
                 q["visualDependency"] = True
 
-
-
-
-def _clean_exam_text_prefix(text: str, number: str) -> str:
-    if not isinstance(text, str):
-        return ""
-    return re.sub(r'^\s*' + re.escape(str(number)) + r'\.?\s*', '', text.strip()).strip()
-
-
-def _repair_q9_group_and_children(output: dict):
-    """Robust cleanup for group questions such as FQ 2025 Q9.
-
-    The parent should contain only the common introduction/equilibrium equation.
-    The children own their own interactions:
-      - 9.1: matching COLUNA I/COLUNA II
-      - 9.2: calculation
-      - 9.3: multi_blank_choice with Figura 6
-    """
-    questions = output.get("questions", [])
-    by_num = {str(q.get("number", "")).strip(): q for q in questions}
-    by_id = {q.get("questionId"): q for q in questions}
-
-    for parent in questions:
-        children_ids = parent.get("subQuestions") or []
-        children = [by_id[cid] for cid in children_ids if cid in by_id]
-        if not children:
-            continue
-
-        parent_num = str(parent.get("number", "")).strip()
-        if not parent_num:
-            continue
-
-        # Prefer rawText for group intro if it is shorter/cleaner than statement.
-        raw = _clean_exam_text_prefix(parent.get("rawText") or "", parent_num)
-        stmt = parent.get("statement") or ""
-        if raw and len(raw) >= 20:
-            bad_markers = ["COLUNA I", "COLUNA II", "Complete o texto", "Figura 6 apresenta", "a)", "b)", "c)", "d)"]
-            if any(m.lower() in stmt.lower() for m in bad_markers) and len(raw) < len(stmt):
-                for field in ("statement", "statementPlain", "statementRaw", "statementLatex", "statementFormatted", "statementPlainFormatted", "statementLatexFormatted"):
-                    if field in parent:
-                        parent[field] = raw
-
-        # Extra fallback: if child starts are inside parent statement, cut before the first one.
-        stmt = parent.get("statement") or ""
-        cut_positions = []
-        for child in children:
-            cnum = str(child.get("number", ""))
-            child_stmt = child.get("statement") or child.get("rawText") or ""
-            patterns = []
-            if cnum:
-                patterns.append(r'\b' + re.escape(cnum) + r'\.?\s')
-            if child_stmt:
-                first_words = " ".join(child_stmt.split()[:8])
-                if len(first_words) > 20:
-                    patterns.append(re.escape(first_words))
-            for pat in patterns:
-                m = re.search(pat, stmt, flags=re.I)
-                if m and m.start() > 20:
-                    cut_positions.append(m.start())
-        if cut_positions:
-            trimmed = stmt[:min(cut_positions)].strip()
-            if len(trimmed) >= 20:
-                for field in ("statement", "statementPlain", "statementRaw", "statementLatex", "statementFormatted", "statementPlainFormatted", "statementLatexFormatted"):
-                    val = parent.get(field)
-                    if isinstance(val, str) and len(val) > len(trimmed):
-                        parent[field] = trimmed
-
-        # Group parents should not render direct assets/tables. Children own them.
-        parent["imageRefs"] = []
-        parent["tableRefs"] = []
-        parent["assetRefs"] = []
-        parent["visualDependency"] = False
-        parent["hasTable"] = False
-        parent["hasGraph"] = False
-        parent["hasDiagram"] = False
-
-    # Specific child repairs that are general enough for COLUNA and multi_blank questions.
-    for q in questions:
-        text = (q.get("statement") or q.get("rawText") or "")
-        low = text.lower()
-
-        # COLUNA I / COLUNA II must be rendered as matching, not textarea.
-        if re.search(r'\bCOLUNA\s+I\b', text, re.I) and re.search(r'\bCOLUNA\s+II\b', text, re.I):
-            q["type"] = "matching"
-            q["options"] = []
-            q["blanks"] = None
-            left_items = re.findall(r'\(([a-e])\)\s*([^\n(]+)', text, flags=re.I)
-            right_items = re.findall(r'\((\d+)\)\s*([^\n(]+)', text)
-
-            def uniq(items):
-                seen = set(); out = []
-                for k, v in items:
-                    k = str(k).strip()
-                    v = " ".join(str(v).replace("\u0007", "").split()).strip()
-                    if not k or not v or k in seen:
-                        continue
-                    seen.add(k)
-                    out.append({"key": k, "text": v})
-                return out
-
-            left = uniq(left_items)
-            right = uniq(right_items)
-            if left and right:
-                q["matchColumns"] = {"left": left, "right": right}
-            q["imageRefs"] = []
-            q["tableRefs"] = []
-            q["assetRefs"] = []
-
-        # Multi-blank questions: keep choices in q['blanks'], not duplicated in statement.
-        if q.get("type") == "multi_blank_choice" and q.get("blanks"):
-            for field in ("statement", "statementPlain", "statementRaw", "statementLatex", "rawText", "statementFormatted", "statementPlainFormatted", "statementLatexFormatted"):
-                val = q.get(field)
-                if not isinstance(val, str):
-                    continue
-                # Remove tail beginning at the a)/b)/c)/d) option table.
-                m = re.search(r'\n\s*a\)\s*\n\s*b\)\s*\n\s*c\)\s*\n\s*d\)?\s*\n', val, flags=re.I)
-                if m:
-                    q[field] = val[:m.start()].rstrip()
-
-        # Ensure Figure 6 only remains on the child that explicitly mentions it on the same page.
-        if str(q.get("number")) in {"9", "9.1", "9.2"}:
-            for fld in ("imageRefs", "assetRefs"):
-                q[fld] = [r for r in (q.get(fld) or []) if not str(r).startswith("figura_6")]
-            q["tableRefs"] = [r for r in (q.get("tableRefs") or []) if not str(r).startswith("tabela_p12")]
-        if str(q.get("number")) == "9.3":
-            q.setdefault("imageRefs", [])
-            q.setdefault("assetRefs", [])
-            if "figura_6_p13" not in q["imageRefs"]:
-                q["imageRefs"].append("figura_6_p13")
-            if "figura_6_p13" not in q["assetRefs"]:
-                q["assetRefs"].append("figura_6_p13")
 
 
 def _strip_figure_axis_noise(text: str) -> str:

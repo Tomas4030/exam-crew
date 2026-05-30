@@ -122,27 +122,6 @@ export default function PreviewPage() {
 
   const images = getAllImages(current);
 
-  const parseMatchingColumns = (q: Question) => {
-    if (q.matchColumns?.left?.length && q.matchColumns?.right?.length) return q.matchColumns;
-    const text = `${q.statement || ''}\n${q.statementPlain || ''}`;
-    if (!/COLUNA\s+I/i.test(text) || !/COLUNA\s+II/i.test(text)) return null;
-    const leftMatches = [...text.matchAll(/\(([a-e])\)\s*([^\n(]+)/gi)];
-    const rightMatches = [...text.matchAll(/\((\d+)\)\s*([^\n(]+)/g)];
-    const uniq = (items: {key:string;text:string}[]) => {
-      const seen = new Set<string>();
-      return items.filter(item => {
-        if (!item.key || seen.has(item.key)) return false;
-        seen.add(item.key);
-        return true;
-      });
-    };
-    const left = uniq(leftMatches.map(m => ({ key: m[1], text: m[2].replace(/\u0007/g, '').trim() })));
-    const right = uniq(rightMatches.map(m => ({ key: m[1], text: m[2].replace(/\u0007/g, '').trim() })));
-    return left.length && right.length ? { left, right } : null;
-  };
-
-  const currentMatching = parseMatchingColumns(current);
-
   const getRenderableStatement = (q: Question): string => {
     const latex = q.statementLatex || '';
     const badLatex = latex.includes('�') || latex.includes('\\begin{itemize}') || (q.textQuality?.status === 'corrupt');
@@ -150,25 +129,9 @@ export default function PreviewPage() {
     return latex || q.statementPlain || q.statement;
   };
 
-  const cleanParentContext = (a: Question): string => {
-    const raw = (a as any).rawText || '';
-    const stmt = a.statement || '';
-    const text = raw && raw.length < stmt.length ? raw : stmt;
-    const firstChild = data.questions
-      .filter(q => q.parentQuestion === a.questionId)
-      .sort((x, y) => String(x.number).localeCompare(String(y.number), undefined, { numeric: true }))[0];
-    if (!firstChild) return text;
-    const childStart = (firstChild.statement || '').split(/\s+/).slice(0, 8).join(' ');
-    if (childStart.length > 20) {
-      const idx = text.toLowerCase().indexOf(childStart.toLowerCase());
-      if (idx > 20) return text.slice(0, idx).trim();
-    }
-    return text;
-  };
-
   // Parent context text (combined from all ancestors)
   const ancestorContext = getAncestors(current)
-    .map(cleanParentContext)
+    .map(a => a.statement)
     .filter(Boolean)
     .join('\n\n');
 
@@ -244,44 +207,7 @@ export default function PreviewPage() {
             </div>
 
             {/* Answer area */}
-            {currentMatching ? (
-              <div className="rounded-lg border bg-white p-4 space-y-4">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div>
-                    <div className="text-sm font-semibold text-gray-700 mb-2">Coluna I</div>
-                    <div className="space-y-2">
-                      {currentMatching.left.map(item => {
-                        const key = `${current.questionId}_${item.key}`;
-                        return (
-                          <label key={item.key} className="flex items-center gap-3 rounded border px-3 py-2">
-                            <span className="w-8 font-bold text-blue-700">({item.key})</span>
-                            <span className="flex-1"><MathText text={item.text} /></span>
-                            <select value={answers[key] || ''} onChange={e => setAnswers(prev => ({ ...prev, [key]: e.target.value }))}
-                              className="rounded border border-gray-300 bg-white px-2 py-1.5 text-sm text-gray-900">
-                              <option value="">...</option>
-                              {currentMatching.right.map(opt => (
-                                <option key={opt.key} value={opt.key}>({opt.key})</option>
-                              ))}
-                            </select>
-                          </label>
-                        );
-                      })}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-sm font-semibold text-gray-700 mb-2">Coluna II</div>
-                    <div className="space-y-2">
-                      {currentMatching.right.map(item => (
-                        <div key={item.key} className="rounded border px-3 py-2 text-sm">
-                          <span className="font-bold text-gray-600">({item.key})</span>{' '}
-                          <MathText text={item.text} />
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            ) : current.type === 'multi_blank_choice' && current.blanks?.length ? (
+            {current.type === 'multi_blank_choice' && current.blanks?.length ? (
               <div className="rounded-lg border bg-white p-4 space-y-3">
                 <div className="text-sm font-semibold text-gray-700">Respostas</div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
