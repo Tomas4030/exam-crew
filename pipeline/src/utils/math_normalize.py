@@ -308,6 +308,12 @@ def math_normalize(output: dict, extraction: dict, delay: float = 2.0) -> dict:
 
         if result and result.get("statementLatex"):
             latex_stmt = result["statementLatex"]
+
+            # If vision truncated content vs raw text, use raw instead
+            raw_full = q.get("statementRaw") or q.get("rawText") or statement
+            if raw_full and len(latex_stmt.strip()) < len(raw_full.strip()) * 0.6:
+                latex_stmt = raw_full
+
             checks = validate_latex(latex_stmt)
 
             # If LaTeX is valid, use it

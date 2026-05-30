@@ -69,7 +69,15 @@ def format_statement_text(text: str | None) -> str:
 
 def apply_text_formatting(output: dict) -> dict:
     """Format statement in-place; preserve original in statementRaw."""
+    from .normalizer import _strip_figure_axis_noise
+
     for q in output.get("questions", []):
+        # Final cleanup pass — math_normalize may have introduced dirty statementLatex
+        for field in ("statement", "statementLatex", "statementPlain", "rawText"):
+            val = q.get(field)
+            if val and isinstance(val, str):
+                q[field] = _strip_figure_axis_noise(val)
+
         if q.get("statement"):
             q["statementRaw"] = q["statement"]
             formatted = format_statement_text(q["statement"])

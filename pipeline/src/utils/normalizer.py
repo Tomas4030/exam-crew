@@ -319,51 +319,51 @@ def _trim_group_parent_statements(output: dict):
     by_id = {q.get("questionId"): q for q in questions}
 
     for parent in questions:
+        if not parent.get("isGroup") and parent.get("type") != "group":
+            continue
         children_ids = parent.get("subQuestions") or []
         if not children_ids:
             continue
+
+        parent_num = str(parent.get("number", ""))
+        if not parent_num:
+            continue
+
+        parent_stmt = parent.get("statement") or ""
+        if not parent_stmt:
+            continue
+
+        # Direct approach: find where the first sub-question number appears
+        # e.g. for parent "9", look for "9.1" or "9.1." in the text
         children = [by_id[cid] for cid in children_ids if cid in by_id]
         if not children:
             continue
-        children.sort(key=lambda q: tuple(
-            int(p) if p.isdigit() else 999 for p in str(q.get("number", "")).split(".")
-        ))
-        first = children[0]
+        children.sort(key=lambda q: str(q.get("number", "")))
+        first_child_num = str(children[0].get("number", ""))
 
-        parent_stmt = (parent.get("statement") or "").strip()
-        child_stmt = (first.get("statement") or "").strip()
-        if not parent_stmt or not child_stmt:
+        if not first_child_num:
             continue
 
-        prefix = re.sub(r"\s+", " ", child_stmt[:120]).strip()
-        parent_flat = re.sub(r"\s+", " ", parent_stmt)
-        pos_flat = parent_flat.find(prefix[:60])
-        if pos_flat <= 20:
-            continue
+        # Search for the child number pattern in parent statement
+        pat = re.compile(r'\b' + re.escape(first_child_num) + r'\.?\s')
+        m = pat.search(parent_stmt)
+        if m and m.start() > 20:
+            trimmed = parent_stmt[:m.start()].strip()
+            if len(trimmed) >= 20:
+                for field in ("statement", "statementLatex", "statementPlain",
+                              "statementFormatted", "statementLatexFormatted", "statementPlainFormatted"):
+                    val = parent.get(field)
+                    if val and isinstance(val, str):
+                        fm = pat.search(val)
+                        if fm and fm.start() > 20:
+                            parent[field] = val[:fm.start()].strip()
+                parent["tableRefs"] = []
+                parent["imageRefs"] = []
+                parent["assetRefs"] = []
 
-        # Map flat position back to original
-        count = 0
-        cut = None
-        for i, ch in enumerate(parent_stmt):
-            if not ch.isspace():
-                count += 1
-            if count >= len(re.sub(r"\s+", "", parent_flat[:pos_flat])):
-                cut = i
-                break
-        if cut is None:
-            continue
-
-        trimmed = parent_stmt[:cut].strip()
-        trimmed = re.sub(r"\s*\d+(?:\.\d+)+\.\s*$", "", trimmed).strip()
-        if len(trimmed) >= 30 and len(trimmed) < len(parent_stmt):
-            parent.setdefault("statementRaw", parent_stmt)
-            parent["statement"] = trimmed
-            parent["statementPlain"] = trimmed
-            if parent.get("statementLatex"):
-                parent["statementLatex"] = None
-            parent["tableRefs"] = []
-            parent["imageRefs"] = []
-            parent["assetRefs"] = []
+        # Remove blanks that belong to children
+        if parent.get("blanks") and children_ids:
+            parent["blanks"] = None
 
 
 def _repair_multiblank_options_from_statement(output: dict):
