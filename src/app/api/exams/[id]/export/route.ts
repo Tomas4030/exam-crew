@@ -76,71 +76,51 @@ export async function GET(
   });
 }
 
-/** Collect all asset relative paths actually referenced in the exam JSON. */
+/** Collect only visual asset paths referenced by questions. */
 function collectUsedAssets(examData: Record<string, unknown>): string[] {
   const paths = new Set<string>();
 
-  const addCrop = (crop?: Record<string, unknown>) => {
-    if (crop?.relativePath && typeof crop.relativePath === 'string') {
-      paths.add(crop.relativePath);
+  const addVisualPath = (rel?: unknown) => {
+    if (typeof rel === 'string' && rel.startsWith('assets/visual/')) {
+      paths.add(rel);
     }
   };
 
-  const addAssetCrops = (asset?: Record<string, unknown>) => {
+  const addVisualCrop = (crop?: Record<string, unknown>) => {
+    addVisualPath(crop?.relativePath);
+  };
+
+  const assets = (examData.assets as Record<string, unknown>[]) || [];
+  const findAsset = (id: string) => assets.find((a) => a.id === id);
+
+  const addAssetVisual = (asset?: Record<string, unknown>) => {
     if (!asset) return;
-    addCrop(asset.crop as Record<string, unknown>);
     const crops = asset.crops as Record<string, unknown> | undefined;
-    if (crops) {
-      addCrop(crops.context as Record<string, unknown>);
-      addCrop(crops.visual as Record<string, unknown>);
-    }
+    if (crops?.visual) addVisualCrop(crops.visual as Record<string, unknown>);
+    addVisualCrop(asset.crop as Record<string, unknown>);
   };
 
-  // From question.media (primary — the resolved final URLs)
   for (const q of (examData.questions as Record<string, unknown>[]) || []) {
     const media = q.media as { url?: string; relativePath?: string }[] | undefined;
     if (media) {
       for (const m of media) {
-        // media URLs are like /api/exams/{id}/assets/page4_img0.png
-        // Extract the relative path: assets/filename
+        addVisualPath(m.relativePath);
         if (m.url) {
           const match = m.url.match(/\/assets\/(.+)$/);
-          if (match) paths.add(`assets/${match[1]}`);
+          if (match) addVisualPath(`assets/${match[1]}`);
         }
       }
     }
 
-    // Also from direct assetRefs
     const allRefs = [
       ...((q.imageRefs as string[]) || []),
       ...((q.assetRefs as string[]) || []),
+      ...((q.tableRefs as string[]) || []),
     ];
     for (const refId of allRefs) {
-      const asset = ((examData.assets as Record<string, unknown>[]) || []).find(
-        (a) => a.id === refId
-      );
-      if (asset) addAssetCrops(asset);
+      const asset = findAsset(refId);
+      if (asset) addAssetVisual(asset);
     }
-  }
-
-  // From sources
-  for (const src of (examData.sources as Record<string, unknown>[]) || []) {
-    const crops = src.crops as Record<string, unknown> | undefined;
-    if (crops?.full) addCrop(crops.full as Record<string, unknown>);
-
-    // Source assetRefs
-    for (const aId of (src.assetRefs as string[]) || []) {
-      const asset = ((examData.assets as Record<string, unknown>[]) || []).find(
-        (a) => a.id === aId
-      );
-      if (asset) addAssetCrops(asset);
-    }
-  }
-
-  // Include every asset crop, even if the asset was not linked to a question.
-  // This prevents figures detected by the pipeline from disappearing from the ZIP.
-  for (const asset of (examData.assets as Record<string, unknown>[]) || []) {
-    addAssetCrops(asset);
   }
 
   return [...paths];

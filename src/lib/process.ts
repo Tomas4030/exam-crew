@@ -32,7 +32,7 @@ function writeProgress(examId: string, progress: object) {
 export function runPipeline(pdfPath: string, examId: string): Promise<ProcessResult> {
   return new Promise((resolve) => {
     const pipelineDir = path.join(process.cwd(), 'pipeline');
-    const uvPath = path.join(os.homedir(), '.local', 'bin', 'uv.exe');
+    const uvPath = process.env.UV_PATH || 'uv';
     console.log(`[Pipeline] Starting: ${examId}`);
     console.log(`[Pipeline] PDF: ${pdfPath}`);
     console.log(`[Pipeline] CWD: ${pipelineDir}`);

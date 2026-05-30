@@ -103,6 +103,20 @@ class ExamProcessingCrew:
         if formula_pages:
             report_progress("filter", f"Skipping formula pages: {formula_pages}")
 
+        # Step 1.6: Build DocumentIR and question candidates (passive, debug only)
+        try:
+            from .core.layout_ir import build_document_ir
+            from .core.question_segmenter import segment_questions
+            from .core.debug_export import export_debug
+
+            doc_ir = build_document_ir(self.pdf_path, self.exam_id)
+            skip_pages = set(formula_pages) | {1}  # skip cover + formulary
+            segmentation = segment_questions(doc_ir, skip_pages=skip_pages)
+            export_debug(self.output_dir, document_ir=doc_ir, segmentation=segmentation)
+            report_progress("layout_ir", f"DocumentIR: {doc_ir.total_pages} pages, {len(segmentation.candidates)} question candidates")
+        except Exception as e:
+            report_progress("layout_ir", f"DocumentIR generation failed (non-fatal): {e}")
+
         # Step 1.7: Create table assets from PyMuPDF detection (before vision)
         _ROMAN_HEADERS = {"I", "II", "III", "IV", "V"}
         for page_info in pages_to_process:
