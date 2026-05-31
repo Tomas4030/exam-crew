@@ -10,7 +10,6 @@ export default function ExamDetailPage() {
   const [status, setStatus] = useState<string>('');
 
   useEffect(() => {
-    let interval: ReturnType<typeof setInterval>;
     const check = () =>
       fetch(`/api/exams/${id}/status`).then(r => r.json()).then(d => {
         setStatus(d.status);
@@ -19,7 +18,7 @@ export default function ExamDetailPage() {
         }
       }).catch(() => {});
     check();
-    interval = setInterval(check, 3000);
+    const interval = setInterval(check, 3000);
     return () => clearInterval(interval);
   }, [id]);
 

@@ -1316,38 +1316,19 @@ def _crop_option_images(output: dict, extraction: dict, page_images: dict[int, s
             continue
         stmt = (q.get("statement") or "") + " " + (q.get("rawText") or "")
         option_texts = [str(o.get("text", "") or "").strip() for o in opts]
-
-        subject = str((output.get("metadata") or {}).get("subject") or "").lower()
-        is_math_subject = "matem" in subject
-
-        # Visual option crops are ONLY for questions whose statement explicitly asks
-        # the student to choose a visual object. Do not crop short mathematical options
-        # like "1", "2e", "e^2", "+inf".
-        visual_cue_in_statement = bool(re.search(
-            r'\b('
-            r'diagramas?|gráficos?|graficos?|esboços?|esbocos?|curvas?|'
-            r'opção\s+que\s+apresenta|opcao\s+que\s+apresenta|'
-            r'qual\s+dos\s+seguintes\s+(?:gráficos|graficos|diagramas|esboços|esbocos)|'
-            r'forças\s+que\s+atuam|forcas\s+que\s+atuam|representar\s+as\s+forças'
-            r')\b',
-            stmt,
-            re.I
-        ))
-
         image_like_option_texts = sum(
             1 for t in option_texts
             if re.search(r'\b(gráfico|grafico|diagrama|curva|esboço|esboco|eixo|pH|V\s*/\s*mL)\b', t, re.I)
         )
         blank_or_label_only = sum(1 for t in option_texts if len(t) <= 2)
 
+        # Only crop option images when options are truly visual:
+        # - 3+ options are blank/label-only (the VLM couldn't extract text)
+        # - 3+ options describe graphs/diagrams
         should_crop_options = (
-            visual_cue_in_statement
-            and (blank_or_label_only >= 3 or image_like_option_texts >= 3)
+            blank_or_label_only >= 3
+            or image_like_option_texts >= 3
         )
-
-        if is_math_subject and not visual_cue_in_statement:
-            should_crop_options = False
-
         if not should_crop_options:
             # Cleanup stale option crops from older runs
             for opt in opts:
