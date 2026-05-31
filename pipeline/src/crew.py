@@ -103,6 +103,26 @@ class ExamProcessingCrew:
         if formula_pages:
             report_progress("filter", f"Skipping formula pages: {formula_pages}")
 
+        # Filter out SFI/accessibility duplicate pages
+        # Some PDFs contain both the normal version and a "sem figuras" (SFI)
+        # version for accessibility. Detect and skip the duplicate.
+        sfi_pages = []
+        _SFI_MARKERS = ["sem figuras", "entrelinha 1,5", "entrelinha 1.5", "versão sfi",
+                        "prova de acessibilidade", "sem imagens"]
+        if len(pages_to_process) > 8:
+            for page in pages_to_process:
+                text_lower = (page.get("text") or "").lower()
+                if any(m in text_lower for m in _SFI_MARKERS):
+                    sfi_pages.append(page["page"])
+
+            # If SFI pages found, also skip all pages after the first SFI marker
+            # (the entire SFI section is a duplicate of the normal exam)
+            if sfi_pages:
+                first_sfi = min(sfi_pages)
+                sfi_pages = [p["page"] for p in pages_to_process if p["page"] >= first_sfi]
+                pages_to_process = [p for p in pages_to_process if p["page"] < first_sfi]
+                report_progress("filter", f"Skipping accessibility/SFI duplicate pages: {sfi_pages}")
+
         # Step 1.6: Build DocumentIR and question candidates (passive, debug only)
         try:
             from .core.layout_ir import build_document_ir

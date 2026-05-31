@@ -384,9 +384,11 @@ def _trim_group_parent_statements(output: dict):
                         fm = pat.search(val)
                         if fm and fm.start() > 20:
                             parent[field] = val[:fm.start()].strip()
-                parent["tableRefs"] = []
-                parent["imageRefs"] = []
-                parent["assetRefs"] = []
+                # Only clear asset refs if they belong to child pages, not parent's own page
+                parent_page = parent.get("sourcePage", 0)
+                parent["tableRefs"] = [r for r in parent.get("tableRefs", []) if f"_p{parent_page}" in r]
+                parent["imageRefs"] = [r for r in parent.get("imageRefs", []) if f"_p{parent_page}" in r]
+                parent["assetRefs"] = [r for r in parent.get("assetRefs", []) if f"_p{parent_page}" in r]
         else:
             # Fallback: even if we can't find the child number in text,
             # groups should NOT own assets from child pages.
@@ -594,11 +596,12 @@ def _repair_q9_group_and_children(output: dict):
                     if isinstance(val, str) and len(val) > len(trimmed):
                         parent[field] = trimmed
 
-        # Group parents should not render direct assets/tables. Children own them.
-        parent["imageRefs"] = []
-        parent["tableRefs"] = []
-        parent["assetRefs"] = []
-        parent["visualDependency"] = False
+        # Group parents should not render direct assets/tables from child pages.
+        parent_page = parent.get("sourcePage", 0)
+        parent["imageRefs"] = [r for r in parent.get("imageRefs", []) if f"_p{parent_page}" in r]
+        parent["tableRefs"] = [r for r in parent.get("tableRefs", []) if f"_p{parent_page}" in r]
+        parent["assetRefs"] = [r for r in parent.get("assetRefs", []) if f"_p{parent_page}" in r]
+        parent["visualDependency"] = bool(parent["imageRefs"] or parent["assetRefs"])
         parent["hasTable"] = False
         parent["hasGraph"] = False
         parent["hasDiagram"] = False
