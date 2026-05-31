@@ -4,7 +4,15 @@ import re
 
 _TEXT_FIELDS = ("statement","statementPlain","statementFormatted","statementPlainFormatted","statementLatex","statementLatexFormatted","rawText")
 _MATH_INDICATORS = re.compile(r"\\frac|\\sqrt|\^{|_{|[=<>≤≥±×÷∈∞πθΩ∅∪∩]|\b(sen|cos|tg|log|ln|lim)\b|\d+\s*/\s*\d+|\(-?1\)\^n", re.I)
-_VISUAL_OPTION_PROMPT = re.compile(r"\b(diagramas?|gráficos?|graficos?|figuras?|esboços?|esbocos?|curvas?)\b|qual\s+dos\s+seguintes\s+(diagramas|gráficos|graficos|esboços|esbocos)", re.I)
+_VISUAL_OPTION_PROMPT = re.compile(
+    r"\b(diagramas?|gráficos?|graficos?|figuras?|esboços?|esbocos?|curvas?|"
+    r"representad[ao]s?\s+graficamente|"
+    r"plano\s+complexo|"
+    r"conjunto\s+de\s+pontos)\b|"
+    r"qual\s+dos\s+seguintes\s+(diagramas|gráficos|graficos|esboços|esbocos)|"
+    r"em\s+qual\s+das\s+op[çc][õo]es\s+seguintes\s+est[áa]\s+representad",
+    re.I,
+)
 _SIMPLE_TEXT_OPTION = re.compile(r"^\s*(?:[+-]?\d+(?:[,.]\d+)?\s*(?:m|cm|%|pontos?)?|[A-Za-z0-9π∞Ω∅∪∩+\-−×*/^(),.\s]+)\s*$", re.I)
 
 

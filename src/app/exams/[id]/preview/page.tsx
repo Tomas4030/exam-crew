@@ -466,11 +466,27 @@ export default function PreviewPage() {
 
   const currentMatching = parseMatchingColumns(current);
 
+  function decodeEscapedPreviewText(text: string): string {
+    if (!text) return "";
+    return text
+      .replace(/\\n/g, "\n")
+      .replace(/\\t/g, "\t")
+      .replace(/\\u2022/g, "•")
+      .replace(/\\u00a0/g, " ")
+      .replace(/\u0007/g, "")
+      .replace(/\[\d+;\d+u/g, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
   const getRenderableStatement = (q: Question): string => {
     const latex = q.statementLatexFormatted || q.statementLatex || "";
     const badLatex =
       latex.includes("�") ||
       latex.includes("\\begin{itemize}") ||
+      latex.includes("\\n") ||
+      latex.includes("\\u2022") ||
+      latex.includes("\\u00") ||
       q.textQuality?.status === "corrupt";
     if (badLatex)
       return (
@@ -489,11 +505,7 @@ export default function PreviewPage() {
   };
 
   const getPreviewStatement = (q: Question): string => {
-    let text = getRenderableStatement(q)
-      .replace(/\u0007/g, '')
-      .replace(/\[\d+;\d+u/g, '')
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
+    let text = decodeEscapedPreviewText(getRenderableStatement(q));
 
     const matching = parseMatchingColumns(q);
     if (matching) {

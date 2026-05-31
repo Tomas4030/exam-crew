@@ -1335,8 +1335,12 @@ def _crop_option_images(output: dict, extraction: dict, page_images: dict[int, s
         visual_cue_in_statement = bool(re.search(
             r'\b('
             r'diagramas?|gráficos?|graficos?|esboços?|esbocos?|curvas?|'
+            r'representad[ao]s?\s+graficamente|'
+            r'plano\s+complexo|'
+            r'conjunto\s+de\s+pontos|'
             r'opção\s+que\s+apresenta|opcao\s+que\s+apresenta|'
             r'qual\s+dos\s+seguintes\s+(?:gráficos|graficos|diagramas|esboços|esbocos)|'
+            r'em\s+qual\s+das\s+op[çc][õo]es\s+seguintes\s+est[áa]\s+representad|'
             r'forças\s+que\s+atuam|forcas\s+que\s+atuam|representar\s+as\s+forças'
             r')\b',
             stmt,
