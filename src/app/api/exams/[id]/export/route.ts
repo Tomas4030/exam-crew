@@ -81,7 +81,7 @@ function collectUsedAssets(examData: Record<string, unknown>): string[] {
   const paths = new Set<string>();
 
   const addVisualPath = (rel?: unknown) => {
-    if (typeof rel === 'string' && rel.startsWith('assets/visual/')) {
+    if (typeof rel === 'string' && (rel.startsWith('assets/visual/') || rel.startsWith('assets/options/'))) {
       paths.add(rel);
     }
   };
@@ -120,6 +120,17 @@ function collectUsedAssets(examData: Record<string, unknown>): string[] {
     for (const refId of allRefs) {
       const asset = findAsset(refId);
       if (asset) addAssetVisual(asset);
+    }
+
+    // Option images
+    const options = q.options as { imageUrl?: string }[] | undefined;
+    if (options) {
+      for (const opt of options) {
+        if (opt.imageUrl) {
+          const match = opt.imageUrl.match(/\/assets\/(.+)$/);
+          if (match) addVisualPath(`assets/${match[1]}`);
+        }
+      }
     }
   }
 

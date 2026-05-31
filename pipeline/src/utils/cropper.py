@@ -1309,6 +1309,153 @@ def _do_visual_crop(pdf_path, page_num, label_rect, bbox, is_table, img, filenam
     return result
 
 
+def _option_ink_mask(img: Image.Image):
+    """Binary mask: True where pixel has content (not white)."""
+    import numpy as np
+    arr = np.array(img.convert("L"))
+    return arr < 240
+
+
+def _find_best_white_separator(mask, left: int, right: int, min_gap: int = 8) -> int | None:
+    """Find the widest vertical white gap between left and right columns."""
+    import numpy as np
+    h, w = mask.shape
+    left = max(0, min(w - 1, int(left)))
+    right = max(0, min(w - 1, int(right)))
+    if right <= left + min_gap:
+        return None
+
+    col_has_ink = mask[:, left:right].any(axis=0)
+    best_start, best_end, cur_start = None, None, None
+
+    for i, has_ink in enumerate(col_has_ink):
+        if not has_ink:
+            if cur_start is None:
+                cur_start = left + i
+        else:
+            if cur_start is not None:
+                end = left + i
+                if end - cur_start >= min_gap:
+                    if best_start is None or (end - cur_start) > (best_end - best_start):
+                        best_start, best_end = cur_start, end
+                cur_start = None
+    if cur_start is not None:
+        end = right
+        if end - cur_start >= min_gap:
+            if best_start is None or (end - cur_start) > (best_end - best_start):
+                best_start, best_end = cur_start, end
+
+    return int((best_start + best_end) / 2) if best_start is not None else None
+
+
+def _trim_option_whitespace(cropped: Image.Image, pad: int = 16) -> Image.Image:
+    """Content-aware trim: keeps main drawing + label, removes neighbor fragments."""
+    import numpy as np
+    from PIL import ImageFilter
+
+    w, h = cropped.width, cropped.height
+    if w < 60 or h < 60:
+        return cropped
+
+    # Binarize
+    gray = np.array(cropped.convert("L"))
+    mask = gray < 240
+
+    # Simple connected component labeling via scipy if available, else fallback
+    try:
+        from scipy import ndimage
+        labeled, num_features = ndimage.label(mask)
+    except ImportError:
+        # Fallback: just do simple bbox trim
+        ys, xs = np.where(mask)
+        if len(xs) == 0:
+            return cropped
+        return cropped.crop((
+            max(0, int(xs.min()) - pad), max(0, int(ys.min()) - pad),
+            min(w, int(xs.max()) + pad), min(h, int(ys.max()) + pad)
+        ))
+
+    if num_features == 0:
+        return cropped
+
+    # Score each component
+    cx_img, cy_img = w / 2, h / 2
+    components = []
+    for i in range(1, num_features + 1):
+        ys, xs = np.where(labeled == i)
+        area = len(xs)
+        if area < 15:
+            continue
+        bx0, by0, bx1, by1 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+        cx = (bx0 + bx1) / 2
+        cy = (by0 + by1) / 2
+
+        # Penalize fragments at extreme edges (likely from neighbor option)
+        edge_frac_left = max(0, 1 - bx0 / max(1, w * 0.08))
+        edge_frac_right = max(0, 1 - (w - bx1) / max(1, w * 0.08))
+        edge_penalty = (edge_frac_left + edge_frac_right) * 0.5
+
+        # Small fragments at edges are likely neighbor artifacts
+        is_marginal = (
+            area < w * h * 0.01
+            and (bx0 < w * 0.08 or bx1 > w * 0.92)
+        )
+        if is_marginal:
+            continue
+
+        # Score: prefer large, central components
+        dist = ((cx - cx_img) ** 2 + (cy - cy_img) ** 2) ** 0.5
+        score = area - dist * 0.5 - edge_penalty * area * 0.3
+
+        # Label detection: small component in top 25% is likely (A)/(B) label
+        is_label = by1 < h * 0.25 and area < w * h * 0.05
+        components.append({
+            "bbox": (bx0, by0, bx1, by1),
+            "area": area,
+            "score": score,
+            "is_label": is_label,
+        })
+
+    if not components:
+        return cropped
+
+    # Keep: largest component + label + anything overlapping the main bbox
+    components.sort(key=lambda c: c["score"], reverse=True)
+    main = components[0]
+    keep_bbox = list(main["bbox"])
+
+    for c in components[1:]:
+        # Always keep labels
+        if c["is_label"]:
+            keep_bbox[0] = min(keep_bbox[0], c["bbox"][0])
+            keep_bbox[1] = min(keep_bbox[1], c["bbox"][1])
+            keep_bbox[2] = max(keep_bbox[2], c["bbox"][2])
+            keep_bbox[3] = max(keep_bbox[3], c["bbox"][3])
+            continue
+        # Keep components that overlap or are near the main content
+        bx0, by0, bx1, by1 = c["bbox"]
+        near_main = (
+            bx0 < keep_bbox[2] + w * 0.15
+            and bx1 > keep_bbox[0] - w * 0.15
+            and by0 < keep_bbox[3] + h * 0.15
+            and by1 > keep_bbox[1] - h * 0.15
+        )
+        if near_main and c["area"] > w * h * 0.005:
+            keep_bbox[0] = min(keep_bbox[0], bx0)
+            keep_bbox[1] = min(keep_bbox[1], by0)
+            keep_bbox[2] = max(keep_bbox[2], bx1)
+            keep_bbox[3] = max(keep_bbox[3], by1)
+
+    x0 = max(0, keep_bbox[0] - pad)
+    y0 = max(0, keep_bbox[1] - pad)
+    x1 = min(w, keep_bbox[2] + pad)
+    y1 = min(h, keep_bbox[3] + pad)
+
+    if x1 - x0 < 60 or y1 - y0 < 60:
+        return cropped
+    return cropped.crop((x0, y0, x1, y1))
+
+
 def _crop_option_images(output: dict, extraction: dict, page_images: dict[int, str], option_dir: Path, exam_id: str, pdf_path: str | None):
     """Crop visual options for multiple-choice items with diagram/graph options."""
     if not pdf_path:
@@ -1351,7 +1498,10 @@ def _crop_option_images(output: dict, extraction: dict, page_images: dict[int, s
             1 for t in option_texts
             if re.search(r'\b(gráfico|grafico|diagrama|curva|esboço|esboco|eixo|pH|V\s*/\s*mL)\b', t, re.I)
         )
-        blank_or_label_only = sum(1 for t in option_texts if len(t) <= 2)
+        blank_or_label_only = sum(
+            1 for t in option_texts
+            if not t or len(t) <= 2 or re.fullmatch(r"\(?[A-D]\)?", t, re.I)
+        )
 
         should_crop_options = (
             visual_cue_in_statement
@@ -1413,33 +1563,58 @@ def _crop_option_images(output: dict, extraction: dict, page_images: dict[int, s
         for row in rows:
             row.sort(key=lambda kv: kv[1].x0)
 
-        # Pre-calculate row heights, then use minimum for consistency
-        _row_heights = []
         for row_idx, row in enumerate(rows):
-            _ry0 = min(r.y0 for _, r in row) - 4
-            _next = min((min(r.y0 for _, r in rows[j]) for j in range(row_idx + 1, len(rows))), default=q_rect.y1)
-            _ry1 = min(max(_ry0 + 100, min(q_rect.y1, _next - 4)), _ry0 + 220)
-            _row_heights.append(_ry1 - _ry0)
-        consistent_h = min(_row_heights) if _row_heights else 150
+            row_y0 = min(r.y0 for _, r in row) - 10
+            next_row_y = min((min(r.y0 for _, r in rows[j]) for j in range(row_idx + 1, len(rows))), default=q_rect.y1)
+            row_y1 = min(q_rect.y1, next_row_y - 6)
+            if row_y1 <= row_y0 + 80:
+                row_y1 = min(q_rect.y1, row_y0 + 240)
 
-        for row_idx, row in enumerate(rows):
-            row_y0 = min(r.y0 for _, r in row) - 4
-            row_y1 = row_y0 + consistent_h
+            # Crop the entire row as one image
+            row_left_px = int(max(0, q_rect.x0) * SCALE)
+            row_top_px = int(max(0, row_y0) * SCALE)
+            row_right_px = int(min(page.rect.width, q_rect.x1) * SCALE)
+            row_bottom_px = int(min(page.rect.height, row_y1) * SCALE)
+            if row_right_px - row_left_px < 100 or row_bottom_px - row_top_px < 60:
+                continue
 
-            for idx, (letter, rect) in enumerate(row):
-                next_x = row[idx + 1][1].x0 if idx + 1 < len(row) else q_rect.x1
-                if len(row) == 1:
-                    x0, x1 = q_rect.x0, q_rect.x1
+            row_img = img.crop((row_left_px, row_top_px, row_right_px, row_bottom_px))
+            row_mask = _option_ink_mask(row_img)
+
+            # Label centers in row-local pixel coords
+            label_centers = []
+            for letter, rect in row:
+                cx = int(((rect.x0 + rect.x1) / 2 - q_rect.x0) * SCALE)
+                label_centers.append((letter, rect, max(0, cx)))
+
+            # Find white separators between labels
+            separators = []
+            for i in range(len(label_centers) - 1):
+                _, _, cx_a = label_centers[i]
+                _, _, cx_b = label_centers[i + 1]
+                sep = _find_best_white_separator(row_mask, cx_a, cx_b, min_gap=int(6 * SCALE))
+                if sep is None:
+                    sep = int((cx_a + cx_b) / 2)
+                separators.append(sep)
+
+            # Crop each option using white separators
+            for idx, (letter, rect, cx) in enumerate(label_centers):
+                if len(label_centers) == 1:
+                    local_x0, local_x1 = 0, row_img.width
+                elif idx == 0:
+                    local_x0, local_x1 = 0, separators[0]
+                elif idx == len(label_centers) - 1:
+                    local_x0, local_x1 = separators[idx - 1], row_img.width
                 else:
-                    prev_x = row[idx - 1][1].x0 if idx > 0 else q_rect.x0
-                    x0 = (prev_x + rect.x0) / 2 if idx > 0 else q_rect.x0
-                    x1 = (rect.x0 + next_x) / 2 if idx + 1 < len(row) else q_rect.x1
-                crop_rect = fitz.Rect(max(0, x0 - 4), max(0, row_y0), min(page.rect.width, x1 + 4), min(page.rect.height, row_y1))
-                left, top = int(crop_rect.x0 * SCALE), int(crop_rect.y0 * SCALE)
-                right, bottom = int(crop_rect.x1 * SCALE), int(crop_rect.y1 * SCALE)
-                if right - left < 70 or bottom - top < 50:
+                    local_x0, local_x1 = separators[idx - 1], separators[idx]
+
+                local_x0 = max(0, local_x0 - int(4 * SCALE))
+                local_x1 = min(row_img.width, local_x1 + int(4 * SCALE))
+                if local_x1 - local_x0 < int(40 * SCALE):
                     continue
-                cropped = img.crop((left, top, right, bottom))
+
+                cropped = row_img.crop((local_x0, 0, local_x1, row_img.height))
+                cropped = _trim_option_whitespace(cropped)
                 fname = f"{q['questionId']}_option_{letter.lower()}.png"
                 cropped.save(str(option_dir / fname))
                 for opt in opts:
