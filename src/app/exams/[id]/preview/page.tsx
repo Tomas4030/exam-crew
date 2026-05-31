@@ -411,15 +411,33 @@ export default function PreviewPage() {
 
       if (!inherited && target.media?.length) {
         for (const m of target.media) {
-          if (m.url.includes("/assets/visual/")) add(m.url);
+          if (m.url.includes("/assets/")) add(m.url);
         }
       }
 
       if (!inherited && target.sourceRefs?.length) {
         for (const ref of target.sourceRefs) {
           const src = data.sources?.find((s) => s.sourceId === ref.sourceId);
-          const visual = src?.crops?.visual?.url;
-          if (visual && visual.includes("/assets/visual/")) add(visual);
+          if (!src) continue;
+
+          // Specific child: show the internal asset image
+          if (ref.childId && src.assetRefs?.length) {
+            const letter = String(ref.childId).split("_").pop()?.toLowerCase() || "";
+            const idx = letter.charCodeAt(0) - "a".charCodeAt(0);
+            if (idx >= 0 && idx < src.assetRefs.length) {
+              const asset = data.assets.find((a) => a.id === src.assetRefs![idx]);
+              const url = asset?.crops?.best?.url || asset?.crop?.url || asset?.crops?.visual?.url;
+              if (url && url.includes("/assets/")) { add(url); continue; }
+            }
+          }
+
+          // Full source document
+          const sourceUrl =
+            (src.crops as Record<string, any>)?.best?.url ||
+            (src.crops as Record<string, any>)?.full?.url ||
+            (src.crops as Record<string, any>)?.document?.url ||
+            (src.crops as Record<string, any>)?.visual?.url;
+          if (sourceUrl && sourceUrl.includes("/assets/")) add(sourceUrl);
         }
       }
     };

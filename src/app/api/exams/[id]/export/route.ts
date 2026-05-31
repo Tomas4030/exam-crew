@@ -81,7 +81,7 @@ function collectUsedAssets(examData: Record<string, unknown>): string[] {
   const paths = new Set<string>();
 
   const addVisualPath = (rel?: unknown) => {
-    if (typeof rel === 'string' && (rel.startsWith('assets/visual/') || rel.startsWith('assets/options/'))) {
+    if (typeof rel === 'string' && (rel.startsWith('assets/visual/') || rel.startsWith('assets/options/') || rel.startsWith('assets/sources/'))) {
       paths.add(rel);
     }
   };
@@ -130,6 +130,17 @@ function collectUsedAssets(examData: Record<string, unknown>): string[] {
           const match = opt.imageUrl.match(/\/assets\/(.+)$/);
           if (match) addVisualPath(`assets/${match[1]}`);
         }
+      }
+    }
+  }
+
+  // Source document crops (History, Portuguese)
+  for (const src of (examData.sources as Record<string, unknown>[]) || []) {
+    const crops = src.crops as Record<string, unknown> | undefined;
+    if (crops) {
+      for (const key of ['best', 'full', 'document', 'visual']) {
+        const crop = crops[key] as Record<string, unknown> | undefined;
+        if (crop?.relativePath) addVisualPath(crop.relativePath);
       }
     }
   }
