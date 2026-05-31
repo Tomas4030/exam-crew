@@ -81,7 +81,7 @@ function collectUsedAssets(examData: Record<string, unknown>): string[] {
   const paths = new Set<string>();
 
   const addVisualPath = (rel?: unknown) => {
-    if (typeof rel === 'string' && (rel.startsWith('assets/visual/') || rel.startsWith('assets/options/') || rel.startsWith('assets/sources/'))) {
+    if (typeof rel === 'string' && rel.startsWith('assets/')) {
       paths.add(rel);
     }
   };
