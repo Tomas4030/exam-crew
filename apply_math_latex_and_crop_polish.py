@@ -1,4 +1,20 @@
-"""Matemática normalizer: rules specific to Math exams."""
+from pathlib import Path
+import re
+
+ROOT = Path.cwd()
+MATH_PATH = ROOT / 'pipeline' / 'src' / 'normalizers' / 'matematica.py'
+CROPPER_PATH = ROOT / 'pipeline' / 'src' / 'utils' / 'cropper.py'
+
+if not MATH_PATH.exists():
+    raise SystemExit(f'Não encontrei {MATH_PATH}')
+if not CROPPER_PATH.exists():
+    raise SystemExit(f'Não encontrei {CROPPER_PATH}')
+
+math_backup = MATH_PATH.with_suffix('.py.bak_math_latex_crop_polish')
+if not math_backup.exists():
+    math_backup.write_text(MATH_PATH.read_text(encoding='utf-8'), encoding='utf-8')
+
+MATH_PATH.write_text(r'''"""Matemática normalizer: rules specific to Math exams."""
 from __future__ import annotations
 import re
 
@@ -12,8 +28,6 @@ def normalize_math(output: dict, extraction: dict | None = None) -> dict:
     questions = output.get("questions", []) or []
     _ensure_math_heavy_flags(questions)
     _latexify_math_text(questions)
-    _repair_math_fraction_losses(output, extraction)
-    questions = output.get("questions", [])
     _remove_non_visual_option_images(questions)
     _remove_group_parent_options(questions)
     _remove_fake_math_subquestions(output, extraction)
@@ -158,3 +172,42 @@ def _associate_figures_same_page(output: dict):
             if aid not in q.setdefault("assetRefs", []):
                 q["assetRefs"].append(aid)
             q["visualDependency"] = True
+''', encoding='utf-8')
+
+# Patch cropper: column clamp
+crop_text = CROPPER_PATH.read_text(encoding='utf-8')
+crop_backup = CROPPER_PATH.with_suffix('.py.bak_math_latex_crop_polish')
+if not crop_backup.exists():
+    crop_backup.write_text(crop_text, encoding='utf-8')
+
+needle = '''        # Safety padding.
+        pad_x = 14
+        pad_top = 12
+        pad_bottom = 10
+        crop_rect = fitz.Rect(
+'''
+insert = '''        # Column clamp: if label is clearly in one column, don't extend into the other.
+        page_mid = page_rect.width / 2
+        if label_cx > page_mid * 1.08:
+            crop_rect.x0 = max(crop_rect.x0, page_rect.width * 0.50)
+            crop_rect.x1 = min(crop_rect.x1, page_rect.width * 0.985)
+        elif label_cx < page_mid * 0.92:
+            crop_rect.x0 = max(crop_rect.x0, page_rect.width * 0.015)
+            crop_rect.x1 = min(crop_rect.x1, page_rect.width * 0.50)
+
+        # Safety padding.
+        pad_x = 14
+        pad_top = 12
+        pad_bottom = 10
+        crop_rect = fitz.Rect(
+'''
+if needle in crop_text and 'Column clamp' not in crop_text:
+    crop_text = crop_text.replace(needle, insert, 1)
+    CROPPER_PATH.write_text(crop_text, encoding='utf-8')
+    print('Patched cropper.py with column clamp')
+else:
+    print('Cropper: column clamp already present or block not found')
+
+print(f'Backup: {math_backup}')
+print(f'Backup: {crop_backup}')
+print('Done. Reprocess the exam.')

@@ -12,8 +12,6 @@ def normalize_math(output: dict, extraction: dict | None = None) -> dict:
     questions = output.get("questions", []) or []
     _ensure_math_heavy_flags(questions)
     _latexify_math_text(questions)
-    _repair_math_fraction_losses(output, extraction)
-    questions = output.get("questions", [])
     _remove_non_visual_option_images(questions)
     _remove_group_parent_options(questions)
     _remove_fake_math_subquestions(output, extraction)

@@ -352,15 +352,6 @@ def _visual_crop_cluster_near_label(
             elif centered_title:
                 crop_rect |= br
 
-        # Column clamp: if label is clearly in one column, don't extend into the other.
-        page_mid = page_rect.width / 2
-        if label_cx > page_mid * 1.08:
-            crop_rect.x0 = max(crop_rect.x0, page_rect.width * 0.50)
-            crop_rect.x1 = min(crop_rect.x1, page_rect.width * 0.985)
-        elif label_cx < page_mid * 0.92:
-            crop_rect.x0 = max(crop_rect.x0, page_rect.width * 0.015)
-            crop_rect.x1 = min(crop_rect.x1, page_rect.width * 0.50)
-
         # Safety padding.
         pad_x = 14
         pad_top = 12
