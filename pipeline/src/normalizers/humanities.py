@@ -330,11 +330,10 @@ def _attach_implicit_group_i_document(output: dict, extraction: dict | None) -> 
 
     questions = output.get("questions", [])
     sources = output.setdefault("sources", [])
-    exam_id = output.get("exam_id", "")
 
     group_i_qs = [
         q for q in questions
-        if (q.get("group") or "").lower() == "grupo i"
+        if (q.get("group") or "").strip().lower() == "grupo i"
         and not q.get("sourceRefs")
         and "documento" in f"{q.get('statement', '')} {q.get('rawText', '')}".lower()
     ]
@@ -343,32 +342,20 @@ def _attach_implicit_group_i_document(output: dict, extraction: dict | None) -> 
 
     source_id = "grupo_i_documento_1"
     if any(s.get("sourceId") == source_id for s in sources):
-        # Source exists — just link questions that are missing refs
         for q in group_i_qs:
             q["sourceRefs"] = [{"sourceId": source_id, "childId": None, "mode": "full_group"}]
             q["visualDependency"] = True
         return
 
-    # Find the page: prefer a source page (before first question page)
-    first_q_page = min(q.get("sourcePage") or 999 for q in group_i_qs)
-    pages = extraction.get("pages", [])
+    doc_page_num = _find_group_i_document_page(output, extraction, group_i_qs)
+    if not doc_page_num:
+        return
 
-    # Look for a page before the questions that has table-like content
-    doc_page = None
-    for p in sorted(pages, key=lambda x: x.get("page", 0)):
-        pnum = p.get("page", 0)
-        if pnum >= first_q_page:
-            break
-        text = p.get("text", "").lower()
-        if any(kw in text for kw in ("norte", "centro", "sul", "total", "senhorio", "documento")):
-            doc_page = p
-    if not doc_page:
-        # Fallback: use the same page as the first question
-        doc_page = next((p for p in pages if p.get("page") == first_q_page), None)
+    pages = extraction.get("pages", [])
+    doc_page = next((p for p in pages if p.get("page") == doc_page_num), None)
     if not doc_page:
         return
 
-    page_num = doc_page.get("page")
     crop_info = _create_unlabelled_doc_crop(output, extraction, doc_page)
 
     sources.append({
@@ -376,8 +363,8 @@ def _attach_implicit_group_i_document(output: dict, extraction: dict | None) -> 
         "groupId": "grupo_i",
         "label": "Documento 1",
         "kind": "table_source",
-        "pageStart": page_num,
-        "pageEnd": page_num,
+        "pageStart": doc_page_num,
+        "pageEnd": doc_page_num,
         "assetRefs": [],
         "crops": {"best": crop_info, "full": crop_info} if crop_info else {},
     })
@@ -385,6 +372,37 @@ def _attach_implicit_group_i_document(output: dict, extraction: dict | None) -> 
     for q in group_i_qs:
         q["sourceRefs"] = [{"sourceId": source_id, "childId": None, "mode": "full_group"}]
         q["visualDependency"] = True
+
+
+def _find_group_i_document_page(output: dict, extraction: dict, group_i_qs: list[dict]) -> int | None:
+    """Find the real page of the Grupo I document (not the cover page)."""
+    # 1. Questions with sourcePage > 3 that mention "documento"
+    candidates = [
+        int(q["sourcePage"]) for q in group_i_qs
+        if (q.get("sourcePage") or 0) > 3
+    ]
+    if candidates:
+        return min(candidates)
+
+    # 2. Scan extraction pages for "grupo i" + table keywords (skip cover/instructions)
+    table_kws = ("norte", "centro", "sul", "total", "senhorio", "distribuição", "localização", "titulares")
+    for p in sorted(extraction.get("pages", []), key=lambda x: x.get("page", 0)):
+        pnum = p.get("page", 0)
+        if pnum <= 3:
+            continue
+        text = (p.get("text") or "").lower()
+        if "grupo i" in text and any(kw in text for kw in table_kws):
+            return int(pnum)
+
+    # 3. Fallback: first page > 3 that has "grupo i"
+    for p in sorted(extraction.get("pages", []), key=lambda x: x.get("page", 0)):
+        pnum = p.get("page", 0)
+        if pnum <= 3:
+            continue
+        if "grupo i" in (p.get("text") or "").lower():
+            return int(pnum)
+
+    return None
 
 
 def _create_unlabelled_doc_crop(output: dict, extraction: dict, page_info: dict) -> dict | None:
