@@ -1434,9 +1434,9 @@ function cleanPath(value) {
 }
 
 function formatText(value) {
-  var text=String(value==null?'':value).replace(/\\\\textsuperscript\\{a\\}/g,'ª').replace(/\\\\textsuperscript\\{o\\}/g,'º').replace(/\\\\degree/g,'º').replace(/\\\\begin\\{itemize\\}/g,'').replace(/\\\\end\\{itemize\\}/g,'').replace(/\\\\item\\s*/g,'• ');
-  var parts=text.split(/(\\\\\\([\\s\\S]*?\\\\\\)|\\\\\\[[\\s\\S]*?\\\\\\])/g);
-  return parts.map(function(p){if(p.match(/^\\\\\\(/)||p.match(/^\\\\\\[/))return p;return esc(p).replace(/\\n/g,'<br>');}).join('');
+  var text=String(value==null?'':value).replace(/\\\\textsuperscript\{a\}/g,'ª').replace(/\\\\textsuperscript\{o\}/g,'º').replace(/\\\\degree/g,'º').replace(/\\\\begin\{itemize\}/g,'').replace(/\\\\end\{itemize\}/g,'').replace(/\\\\item\s*/g,'• ');
+  var parts=text.split(/(\\\\\([^]*?\\\\\)|\\\\\[[^]*?\\\\\])/g);
+  return parts.map(function(p){if(p.startsWith('\\\\(')||p.startsWith('\\\\['))return p;return esc(p).replace(/\n/g,'<br>');}).join('');
 }
 
 function cleanOptionText(value) {

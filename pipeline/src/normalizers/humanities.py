@@ -44,6 +44,7 @@ def normalize_humanities(output: dict, extraction: dict | None = None) -> dict:
     _generate_full_source_crop_grupo_i(output, extraction, exam_id)
     _generate_child_crops(output, extraction, exam_id)
     _attach_intro_group_visuals(output, extraction, exam_id)
+    _attach_implicit_group_i_document(output, extraction)
     _repair_document_refs(output)
     _rebuild_all_media(output)
 
@@ -126,19 +127,27 @@ def _generate_child_crops(output: dict, extraction: dict | None, exam_id: str):
     """For sources labeled 'conjunto documental', split into A/B/C/D child crops."""
     output_base = OUTPUT_DIR / exam_id
     sources_dir = output_base / "assets" / "sources"
+    assets_map = {a.get("id"): a for a in output.get("assets", [])}
 
     for source in output.get("sources", []):
-        # Only process conjunto documental sources
         text = f"{source.get('label', '')} {source.get('description', '')}".lower()
         if "conjunto documental" not in text:
             continue
         if source.get("childCrops"):
             continue
 
-        # Need a full crop or page image to split
+        # Try embedded assets first (avoids quadrant crop pollution)
+        child_crops = _create_child_crops_from_asset_refs(output, source, assets_map, output_base)
+        if child_crops:
+            source["kind"] = "image_set"
+            source["children"] = list(child_crops.keys())
+            source["childCrops"] = child_crops
+            source.setdefault("crops", {})["children"] = child_crops
+            continue
+
+        # Fallback: quadrant split of full crop or page image
         full_path = _resolve_crop_path(source, output_base)
         if not full_path:
-            # Try from rendered page
             page_num = source.get("pageStart")
             page_img = _get_page_image(extraction, page_num) if page_num else None
             if page_img and Path(page_img).exists():
@@ -175,20 +184,74 @@ def _generate_child_crops(output: dict, extraction: dict | None, exam_id: str):
         source["childCrops"] = child_crops
 
 
+def _create_child_crops_from_asset_refs(
+    output: dict, source: dict, assets_map: dict, output_base: Path
+) -> dict:
+    """Use embedded assets (page8_img0..3) as A/B/C/D crops instead of quadrant split."""
+    asset_refs = source.get("assetRefs") or []
+    if len(asset_refs) < 4:
+        return {}
+
+    exam_id = output.get("exam_id", "")
+    sources_dir = output_base / "assets" / "sources"
+    child_crops = {}
+
+    for idx, letter in enumerate(["a", "b", "c", "d"]):
+        asset = assets_map.get(asset_refs[idx])
+        if not asset:
+            return {}  # abort if any asset missing
+
+        # Find the actual image file
+        src_path = None
+        for rel in [
+            (asset.get("crops") or {}).get("best", {}).get("relativePath"),
+            (asset.get("crops") or {}).get("visual", {}).get("relativePath"),
+            (asset.get("crop") or {}).get("relativePath"),
+            asset.get("relativePath"),
+            f"assets/{asset.get('id')}.png",
+        ]:
+            if rel:
+                candidate = output_base / rel
+                if candidate.exists():
+                    src_path = candidate
+                    break
+
+        if not src_path:
+            return {}  # abort if any file missing
+
+        sources_dir.mkdir(parents=True, exist_ok=True)
+        child_id = f"{source['sourceId']}_{letter}"
+        filename = f"{child_id}.png"
+        out_path = sources_dir / filename
+
+        try:
+            img = Image.open(src_path)
+            img.save(out_path)
+        except Exception:
+            return {}
+
+        child_crops[child_id] = {
+            "status": "success",
+            "method": "embedded_asset_child_crop",
+            "relativePath": f"assets/sources/{filename}",
+            "url": f"/api/exams/{exam_id}/assets/sources/{filename}",
+            "width": img.width,
+            "height": img.height,
+        }
+
+    return child_crops
+
+
 def _quadrant_boxes(size: tuple[int, int]) -> dict[str, tuple[int, int, int, int]]:
-    """Split image into 4 quadrants A(top-left), B(top-right), C(bottom-left), D(bottom-right)."""
+    """Split image into 4 quadrants. C/D start lower to avoid A/B legends."""
     w, h = size
     mid_x = w // 2
     overlap = int(w * 0.018)
-    top = int(h * 0.035)
-    top_bottom = int(h * 0.435)
-    bottom_top = int(h * 0.410)
-    bottom_bottom = int(h * 0.835)
     return {
-        "A": (0, top, min(w, mid_x + overlap), top_bottom),
-        "B": (max(0, mid_x - overlap), top, w, top_bottom),
-        "C": (0, bottom_top, min(w, mid_x + overlap), bottom_bottom),
-        "D": (max(0, mid_x - overlap), bottom_top, w, bottom_bottom),
+        "A": (0,                      int(h * 0.04), min(w, mid_x + overlap), int(h * 0.43)),
+        "B": (max(0, mid_x - overlap), int(h * 0.04), w,                      int(h * 0.43)),
+        "C": (0,                      int(h * 0.47), min(w, mid_x + overlap), int(h * 0.86)),
+        "D": (max(0, mid_x - overlap), int(h * 0.47), w,                      int(h * 0.86)),
     }
 
 
@@ -254,6 +317,135 @@ def _attach_intro_group_visuals(output: dict, extraction: dict | None, exam_id: 
 
 
 # ══════════════════════════════════════════════════════════════════
+# IMPLICIT GROUP I DOCUMENT (no "Documento 1" label in PDF)
+# ══════════════════════════════════════════════════════════════════
+
+def _attach_implicit_group_i_document(output: dict, extraction: dict | None) -> None:
+    """Create grupo_i_documento_1 when questions mention 'documento' but no source exists.
+
+    Handles exams like 2022 where the table/document has no explicit label.
+    """
+    if not extraction:
+        return
+
+    questions = output.get("questions", [])
+    sources = output.setdefault("sources", [])
+    exam_id = output.get("exam_id", "")
+
+    group_i_qs = [
+        q for q in questions
+        if (q.get("group") or "").lower() == "grupo i"
+        and not q.get("sourceRefs")
+        and "documento" in f"{q.get('statement', '')} {q.get('rawText', '')}".lower()
+    ]
+    if not group_i_qs:
+        return
+
+    source_id = "grupo_i_documento_1"
+    if any(s.get("sourceId") == source_id for s in sources):
+        # Source exists — just link questions that are missing refs
+        for q in group_i_qs:
+            q["sourceRefs"] = [{"sourceId": source_id, "childId": None, "mode": "full_group"}]
+            q["visualDependency"] = True
+        return
+
+    # Find the page: prefer a source page (before first question page)
+    first_q_page = min(q.get("sourcePage") or 999 for q in group_i_qs)
+    pages = extraction.get("pages", [])
+
+    # Look for a page before the questions that has table-like content
+    doc_page = None
+    for p in sorted(pages, key=lambda x: x.get("page", 0)):
+        pnum = p.get("page", 0)
+        if pnum >= first_q_page:
+            break
+        text = p.get("text", "").lower()
+        if any(kw in text for kw in ("norte", "centro", "sul", "total", "senhorio", "documento")):
+            doc_page = p
+    if not doc_page:
+        # Fallback: use the same page as the first question
+        doc_page = next((p for p in pages if p.get("page") == first_q_page), None)
+    if not doc_page:
+        return
+
+    page_num = doc_page.get("page")
+    crop_info = _create_unlabelled_doc_crop(output, extraction, doc_page)
+
+    sources.append({
+        "sourceId": source_id,
+        "groupId": "grupo_i",
+        "label": "Documento 1",
+        "kind": "table_source",
+        "pageStart": page_num,
+        "pageEnd": page_num,
+        "assetRefs": [],
+        "crops": {"best": crop_info, "full": crop_info} if crop_info else {},
+    })
+
+    for q in group_i_qs:
+        q["sourceRefs"] = [{"sourceId": source_id, "childId": None, "mode": "full_group"}]
+        q["visualDependency"] = True
+
+
+def _create_unlabelled_doc_crop(output: dict, extraction: dict, page_info: dict) -> dict | None:
+    """Crop the document/table area from a page, stopping before the first question."""
+    page_image_path = page_info.get("page_image_path")
+    if not page_image_path or not Path(page_image_path).exists():
+        return None
+
+    exam_id = output.get("exam_id", "")
+    output_base = OUTPUT_DIR / exam_id
+    sources_dir = output_base / "assets" / "sources"
+    sources_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        img = Image.open(page_image_path)
+    except Exception:
+        return None
+
+    w, h = img.size
+
+    # Try to find where question 1 starts from PDF blocks
+    bottom_frac = 0.88
+    for block in page_info.get("blocks", []):
+        text = (block.get("text") or "").strip()
+        if re.match(r"^1[\.\s]", text):
+            bbox = block.get("bbox") or []
+            if len(bbox) == 4:
+                y_px = float(bbox[1]) * (200 / 72)
+                frac = y_px / h
+                if 0.2 < frac < 0.95:
+                    bottom_frac = max(0.25, frac - 0.02)
+                    break
+
+    cropped = img.crop((int(w * 0.03), int(h * 0.04), int(w * 0.97), int(h * bottom_frac)))
+
+    filename = "grupo_i_documento_1_full.png"
+    out_path = sources_dir / filename
+    cropped.save(out_path)
+
+    return {
+        "status": "success",
+        "method": "history_unlabelled_doc_crop",
+        "relativePath": f"assets/sources/{filename}",
+        "url": f"/api/exams/{exam_id}/assets/sources/{filename}",
+        "width": cropped.width,
+        "height": cropped.height,
+    }
+
+
+def _dedupe_refs(refs: list[dict]) -> list[dict]:
+    seen: set = set()
+    out = []
+    for ref in refs:
+        key = (ref.get("sourceId"), ref.get("childId"), ref.get("mode"))
+        if key not in seen:
+            seen.add(key)
+            out.append(ref)
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════
 # REPAIR DOCUMENT REFS
 # ══════════════════════════════════════════════════════════════════
 
@@ -284,7 +476,7 @@ def _repair_document_refs(output: dict) -> None:
 
         new_refs = _parse_refs_from_text(text, group_id, source_index, group_sources)
         if new_refs:
-            q["sourceRefs"] = new_refs
+            q["sourceRefs"] = _dedupe_refs(new_refs)
             q["visualDependency"] = True
 
 
