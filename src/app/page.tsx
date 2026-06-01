@@ -7,12 +7,15 @@ export default function Home() {
       <p className="text-lg text-gray-600 mb-8 text-center max-w-md">
         Processamento inteligente de exames com IA. Faz upload de um PDF e obtém resultados estruturados.
       </p>
-      <div className="flex gap-4">
+      <div className="flex gap-4 flex-wrap justify-center">
         <Link href="/upload" className="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
           Upload de Exame
         </Link>
         <Link href="/exams" className="px-6 py-3 border border-gray-300 rounded-lg hover:bg-gray-50">
           Ver Exames
+        </Link>
+        <Link href="/preload" className="px-6 py-3 border border-gray-300 rounded-lg hover:bg-gray-50">
+          Preload por URLs
         </Link>
       </div>
     </div>

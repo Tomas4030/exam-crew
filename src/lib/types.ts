@@ -1,4 +1,4 @@
-export type ExamStatus = 'pending' | 'processing' | 'completed' | 'error';
+export type ExamStatus = 'queued' | 'pending' | 'processing' | 'completed' | 'error';
 
 export interface ExamJob {
   id: string;
@@ -7,6 +7,9 @@ export interface ExamJob {
   createdAt: string;
   updatedAt: string;
   error?: string;
+  sourceUrl?: string;
+  batchId?: string;
+  batchIndex?: number;
 }
 
 export interface ProcessResult {

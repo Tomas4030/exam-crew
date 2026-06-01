@@ -79,6 +79,15 @@ class ExamProcessingCrew:
         self.extracted_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Preflight: detect document type and watermark
+        from .utils.pdf_preflight import run_pdf_preflight
+        report_progress("preflight", "Checking PDF type and watermark/noise")
+        preflight = run_pdf_preflight(self.pdf_path)
+        if preflight.should_abort:
+            msg = preflight.abort_reason or "PDF rejected by preflight"
+            report_progress("error", msg)
+            raise RuntimeError(msg)
+
         # Step 1: Extract PDF
         report_progress("extract", "Rendering PDF pages as images")
         extractor = PDFExtractorTool()
@@ -220,6 +229,7 @@ Text:
         output = self._assemble_output(extraction, page_results, subject_profile)
         output["metadata"]["subject"] = subject_key.replace("_", " ").title() if subject_key != "unknown" else None
         output["metadata"]["formula_pages"] = formula_pages
+        output["metadata"]["preflight"] = preflight.to_dict()
 
         # Step 3.2: Extract table data for tables without rows
         from .tools.vision_tool import _extract_table_data

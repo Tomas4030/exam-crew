@@ -8,6 +8,8 @@ from crewai.tools import BaseTool
 from pydantic import BaseModel, Field
 
 from ..config import MIN_IMAGE_SIZE_PX
+from ..utils.pdf_preflight import run_pdf_preflight, clean_watermark_text
+from ..utils.watermark_cleaner import clean_rendered_page_watermark
 
 
 class PDFExtractorInput(BaseModel):
@@ -22,6 +24,7 @@ class PDFExtractorTool(BaseTool):
 
     def _run(self, pdf_path: str, output_dir: str) -> str:
         doc = fitz.open(pdf_path)
+        preflight = run_pdf_preflight(pdf_path)
         out = Path(output_dir)
         pages_dir = out / "pages"
         assets_dir = out / "assets"
@@ -38,7 +41,7 @@ class PDFExtractorTool(BaseTool):
             page = doc[page_num]
 
             # Extract text
-            text = page.get_text("text")
+            text = clean_watermark_text(page.get_text("text"))
 
             # Extract layout blocks with bboxes
             text_dict = page.get_text("dict")
@@ -48,6 +51,7 @@ class PDFExtractorTool(BaseTool):
                     block_text = ""
                     for line in block.get("lines", []):
                         block_text += "".join(span["text"] for span in line.get("spans", []))
+                    block_text = clean_watermark_text(block_text)
                     if block_text.strip():
                         blocks.append({
                             "type": "text",
@@ -76,6 +80,9 @@ class PDFExtractorTool(BaseTool):
             pix = page.get_pixmap(matrix=mat)
             page_path = pages_dir / f"page_{page_num + 1}.png"
             pix.save(str(page_path))
+            watermark_cleaned = clean_rendered_page_watermark(
+                page_path, watermark_detected=preflight.watermark_detected
+            )
 
             # Extract embedded images
             page_images = page.get_images(full=True)
@@ -124,6 +131,7 @@ class PDFExtractorTool(BaseTool):
                 "page_image_path": str(page_path),
                 "has_images": image_count > 0,
                 "image_count": image_count,
+                "watermark_cleaned": watermark_cleaned,
             })
 
         doc.close()

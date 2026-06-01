@@ -1,9 +1,11 @@
 import { NextResponse } from 'next/server';
 import { writeFile, mkdir } from 'fs/promises';
 import path from 'path';
-import { createJob, updateJob } from '@/lib/storage';
-import { runPipeline } from '@/lib/process';
+import { createJob } from '@/lib/storage';
+import { enqueuePipeline } from '@/lib/pipelineQueue';
 import { ExamJob } from '@/lib/types';
+
+export const runtime = 'nodejs';
 
 export async function POST(request: Request) {
   const formData = await request.formData();
@@ -18,26 +20,18 @@ export async function POST(request: Request) {
   await mkdir(uploadsDir, { recursive: true });
 
   const filePath = path.join(uploadsDir, `${examId}.pdf`);
-  const buffer = Buffer.from(await file.arrayBuffer());
-  await writeFile(filePath, buffer);
+  await writeFile(filePath, Buffer.from(await file.arrayBuffer()));
 
   const job: ExamJob = {
     id: examId,
     filename: file.name,
-    status: 'processing',
+    status: 'queued',
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
   await createJob(job);
 
-  // Launch pipeline in background
-  runPipeline(filePath, examId).then(async (result) => {
-    if (result.success) {
-      await updateJob(examId, { status: 'completed' });
-    } else {
-      await updateJob(examId, { status: 'error', error: result.error });
-    }
-  });
+  enqueuePipeline({ examId, pdfPath: filePath });
 
-  return NextResponse.json({ exam_id: examId, status: 'processing' });
+  return NextResponse.json({ exam_id: examId, status: 'queued' });
 }

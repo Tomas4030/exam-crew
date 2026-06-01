@@ -7,6 +7,7 @@ import { ProcessResult } from './types';
 const PROGRESS_DIR = path.join(process.cwd(), 'data');
 
 const PIPELINE_STEPS = [
+  { id: 'preflight', label: 'Verificar PDF', pct: 3 },
   { id: 'extract', label: 'Extrair PDF', pct: 5 },
   { id: 'extract_done', label: 'PDF extraído', pct: 10 },
   { id: 'subject', label: 'Detetar disciplina', pct: 12 },
