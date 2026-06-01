@@ -986,7 +986,7 @@ def crop_assets(output: dict, extraction: dict, output_dir: Path) -> dict:
             # Fallback: full page content area
             if not cropped:
                 w, h = img.size
-                margin_x = int(w * 0.03)
+                margin_x = int(w * 0.01)
                 margin_top = int(h * 0.05)
                 margin_bottom = int(h * 0.05)
                 cropped = img.crop((margin_x, margin_top, w - margin_x, h - margin_bottom))
@@ -1083,8 +1083,8 @@ def _crop_by_document_label(pdf_path: str, page_num: int, doc_num: int, img: Ima
 
     y0 = max(0, current_y - 6)
     y1 = min(boundaries) - 8 if boundaries else page_rect.height * 0.94
-    x0 = page_rect.width * 0.035
-    x1 = page_rect.width * 0.965
+    x0 = page_rect.width * 0.01
+    x1 = page_rect.width * 0.995
 
     doc.close()
 

@@ -38,12 +38,15 @@ interface Source {
   label?: string;
   kind?: string;
   pageStart?: number;
+  children?: string[];
+  childCrops?: Record<string, CropInfo>;
   crops?: {
     best?: CropInfo;
     full?: CropInfo;
     visual?: CropInfo;
     context?: CropInfo;
     document?: CropInfo;
+    children?: Record<string, CropInfo>;
   };
   assetRefs?: string[];
 }
@@ -409,7 +412,7 @@ export default function PreviewPage() {
         add(getVisualUrl(asset));
       }
 
-      if (!inherited && target.media?.length) {
+      if (!inherited && target.media?.length && !target.sourceRefs?.length) {
         for (const m of target.media) {
           if (m.url.includes("/assets/")) add(m.url);
         }
@@ -420,14 +423,30 @@ export default function PreviewPage() {
           const src = data.sources?.find((s) => s.sourceId === ref.sourceId);
           if (!src) continue;
 
-          // Specific child: show the internal asset image
-          if (ref.childId && src.assetRefs?.length) {
-            const letter = String(ref.childId).split("_").pop()?.toLowerCase() || "";
-            const idx = letter.charCodeAt(0) - "a".charCodeAt(0);
-            if (idx >= 0 && idx < src.assetRefs.length) {
-              const asset = data.assets.find((a) => a.id === src.assetRefs![idx]);
-              const url = asset?.crops?.best?.url || asset?.crop?.url || asset?.crops?.visual?.url;
-              if (url && url.includes("/assets/")) { add(url); continue; }
+          // Specific child: show image A/B/C/D from source child crop first
+          if (ref.childId) {
+            const childCrop =
+              (src.crops as Record<string, any>)?.children?.[ref.childId]?.url ||
+              (src as any).childCrops?.[ref.childId]?.url;
+
+            if (childCrop && childCrop.includes("/assets/")) {
+              add(childCrop);
+              continue;
+            }
+
+            // Fallback: usar assetRefs por índice
+            if (src.assetRefs?.length) {
+              const letter = String(ref.childId).split("_").pop()?.toLowerCase() || "";
+              const idx = letter.charCodeAt(0) - "a".charCodeAt(0);
+              if (idx >= 0 && idx < src.assetRefs.length) {
+                const asset = data.assets.find((a) => a.id === src.assetRefs![idx]);
+                const url =
+                  asset?.crops?.best?.url ||
+                  asset?.crop?.url ||
+                  asset?.crops?.visual?.url ||
+                  asset?.crops?.context?.url;
+                if (url && url.includes("/assets/")) { add(url); continue; }
+              }
             }
           }
 

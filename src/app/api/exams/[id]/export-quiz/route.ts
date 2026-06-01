@@ -260,12 +260,21 @@ function collectAssetsFromQuestion(
     const source = sourcesById.get(ref.sourceId);
     if (!source) continue;
 
-    // Specific child — use internal asset
-    if (ref.childId && source.assetRefs?.length) {
-      const letter = String(ref.childId).split('_').pop()?.toLowerCase() || 'a';
-      const idx = letter.charCodeAt(0) - 'a'.charCodeAt(0);
-      if (idx >= 0 && idx < source.assetRefs.length) {
-        addAsset(getBestAssetPath(assetsById.get(source.assetRefs[idx])), examDir, assetsDir, state);
+    // Specific child — use childCrops first, then assetRefs by index
+    if (ref.childId) {
+      const childCrops = (source as AnyObj).childCrops as AnyObj | undefined;
+      const cropsChildren = (source.crops as AnyObj)?.children as AnyObj | undefined;
+      const childCrop = childCrops?.[ref.childId] || cropsChildren?.[ref.childId];
+      if (childCrop) {
+        addAsset(childCrop.relativePath || childCrop.url, examDir, assetsDir, state);
+        continue;
+      }
+      if (source.assetRefs?.length) {
+        const letter = String(ref.childId).split('_').pop()?.toLowerCase() || 'a';
+        const idx = letter.charCodeAt(0) - 'a'.charCodeAt(0);
+        if (idx >= 0 && idx < source.assetRefs.length) {
+          addAsset(getBestAssetPath(assetsById.get(source.assetRefs[idx])), examDir, assetsDir, state);
+        }
       }
       continue;
     }
@@ -862,10 +871,30 @@ function init() {
   if (!card) return;
 
   if (!state.exam) {
-    card.innerHTML = '<p class="empty">Não foi possível carregar os dados do exame.</p>';
+    fetch('./data/exam.json')
+      .then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function(data) {
+        state.exam = data;
+        bootApp();
+      })
+      .catch(function(err) {
+        card.innerHTML =
+          '<main style="padding:24px;font-family:sans-serif">' +
+          '<h1>Erro ao carregar quiz</h1>' +
+          '<p>' + esc(err.message) + '</p>' +
+          '<p>Extrai o ZIP primeiro e abre o index.html dentro da pasta extraída.</p>' +
+          '</main>';
+      });
     return;
   }
 
+  bootApp();
+}
+
+function bootApp() {
   state.storageKey = 'quiz_answers_' + safeStorageKey(state.exam.exam_id || document.title || 'local');
   state.answers = loadAnswers();
   state.questions = getVisibleQuestions(state.exam.questions || []);
@@ -1180,8 +1209,8 @@ function collectImagePaths(q) {
     paths.push(getAssetPath(findAsset(rid)));
   }
 
-  // 3. Media fallback
-  if (!paths.some(Boolean) && q.media && q.media.length) {
+  // 3. Media fallback — only when no sourceRefs (avoids stale/duplicated images in História)
+  if (!paths.some(Boolean) && !(q.sourceRefs && q.sourceRefs.length) && q.media && q.media.length) {
     for (var m = 0; m < q.media.length; m++) {
       paths.push(q.media[m].relativePath || q.media[m].url);
     }
@@ -1191,7 +1220,19 @@ function collectImagePaths(q) {
 }
 
 function getChildAssetPath(source, childId) {
-  if (!source || !source.assetRefs || !source.assetRefs.length || !childId) return '';
+  if (!source || !childId) return '';
+
+  if (source.childCrops && source.childCrops[childId]) {
+    var p1 = getPath(source.childCrops[childId]);
+    if (p1) return p1;
+  }
+
+  if (source.crops && source.crops.children && source.crops.children[childId]) {
+    var p2 = getPath(source.crops.children[childId]);
+    if (p2) return p2;
+  }
+
+  if (!source.assetRefs || !source.assetRefs.length) return '';
 
   var last = String(childId).split('_').pop().toLowerCase();
 
