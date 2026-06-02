@@ -38,6 +38,9 @@ def normalize(output: dict, extraction: dict | None = None) -> dict:
     # These are propositions (I, II, III, IV) inside another question, not real questions
     _remove_roman_numeral_questions(questions)
 
+    # ── 0a. Remove questions that are scoring/cotações page artifacts ──────
+    _remove_scoring_artifact_questions(questions)
+
     # ── 0b. Merge false multi_blank_choice subquestions ───────────
     # When pipeline creates q2 (group) + q2_1/q2_2 (multi_blank_choice),
     # but the real exam has just one question with blanks I/II/III/IV
@@ -716,6 +719,23 @@ def _remove_roman_numeral_questions(questions: list[dict]):
             to_remove.append(i)
 
     # Remove in reverse order to preserve indices
+    for i in reversed(to_remove):
+        questions.pop(i)
+
+
+def _remove_scoring_artifact_questions(questions: list[dict]) -> None:
+    """Remove questions whose statement is a scoring/cotações page artifact."""
+    _SCORING_SIGNALS = ("cotação", "cotaçõ", "cotacoes", "subtotal", "classificação final da prova")
+
+    to_remove = []
+    for i, q in enumerate(questions):
+        text = " ".join(filter(None, [
+            q.get("statement"), q.get("statementPlain"), q.get("rawText"),
+        ])).lower()
+        hits = sum(1 for s in _SCORING_SIGNALS if s in text)
+        if hits >= 2:
+            to_remove.append(i)
+
     for i in reversed(to_remove):
         questions.pop(i)
 

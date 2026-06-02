@@ -56,8 +56,12 @@ def extract_questions_from_text_pages(extraction: dict, subject_profile: dict | 
         if "criterios de classificacao" in lowered:
             continue
 
-        # Nao usar a pagina de cotacoes como perguntas.
-        if "cotacoes" in lowered and "grupo" in lowered:
+        # Nao usar paginas de cotacoes como perguntas.
+        is_scoring = (
+            ("cotacoes" in lowered or "cotação" in lowered or "cotaçõ" in lowered)
+            and ("grupo" in lowered or "subtotal" in lowered)
+        )
+        if is_scoring:
             continue
 
         matches = list(QUESTION_START_RE.finditer(text))

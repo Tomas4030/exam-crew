@@ -48,9 +48,34 @@ def normalize_humanities(output: dict, extraction: dict | None = None) -> dict:
     _attach_implicit_group_i_document(output, extraction)
     _repair_multi_blank_questions(output, extraction)
     _repair_document_refs(output)
+    _strip_cross_group_refs(output)
     _rebuild_all_media(output)
 
     return output
+
+
+def _strip_cross_group_refs(output: dict) -> None:
+    """Remove sourceRefs where sourceId belongs to a different group than the question.
+
+    This is the BLOCKER 'wrong_cross_group_image_source' from the audit.
+    """
+    for q in output.get("questions", []):
+        gid = q.get("groupId")
+        if not gid:
+            continue
+        refs = q.get("sourceRefs") or []
+        clean = [
+            ref for ref in refs
+            if str(ref.get("sourceId", "")).startswith(gid + "_")
+        ]
+        if len(clean) < len(refs):
+            removed = [r["sourceId"] for r in refs if r not in clean]
+            q["sourceRefs"] = clean
+            q.setdefault("warnings", []).append({
+                "type": "cross_group_ref_stripped",
+                "message": f"Removed cross-group sourceRefs: {removed}",
+            })
+            q["needsHumanReview"] = True
 
 
 def _repair_multi_blank_questions(output: dict, extraction: dict | None) -> None:

@@ -105,11 +105,18 @@ def _build_page_group_map(extraction: dict | None, questions: list[dict]) -> dic
 
     for page_num in sorted(page_texts.keys()):
         text = page_texts[page_num]
-        # Skip cover/instructions (typically pages 1-3)
-        if page_num <= 2:
+        text_lower = text.lower()
+
+        # Skip true cover/instructions: only if page has no group/document marker.
+        # História antiga tem GRUPO I logo na página 2 — nunca ignorar por número.
+        has_group = bool(_GROUP_PATTERN.search(text))
+        has_doc = "documento" in text_lower or "doc." in text_lower
+        is_cover = page_num == 1 and not has_group and not has_doc
+        if is_cover:
             continue
+
         # Skip scoring page (contains COTAÇÕES table with group references)
-        if "cotaç" in text.lower() or "cotaçõ" in text.lower():
+        if "cotaç" in text_lower or "cotaçõ" in text_lower:
             if current_group:
                 page_group_map[page_num] = current_group
             continue
