@@ -14,6 +14,7 @@ from pathlib import Path
 from PIL import Image
 
 from ..config import OUTPUT_DIR
+from ..utils.multiblank import repair_multiblank_question_from_page
 
 
 # ── Regex patterns ────────────────────────────────────────────────
@@ -45,10 +46,55 @@ def normalize_humanities(output: dict, extraction: dict | None = None) -> dict:
     _generate_child_crops(output, extraction, exam_id)
     _attach_intro_group_visuals(output, extraction, exam_id)
     _attach_implicit_group_i_document(output, extraction)
+    _repair_multi_blank_questions(output, extraction)
     _repair_document_refs(output)
     _rebuild_all_media(output)
 
     return output
+
+
+def _repair_multi_blank_questions(output: dict, extraction: dict | None) -> None:
+    """Convert malformed open_answer questions into multi_blank_choice when pattern is clear."""
+    if not output.get("questions"):
+        return
+
+    pages_map = {
+        p.get("page"): p
+        for p in (extraction or {}).get("pages", [])
+        if isinstance(p, dict) and p.get("page")
+    }
+
+    repaired = 0
+    for q in output.get("questions", []):
+        page = pages_map.get(q.get("sourcePage")) or {}
+        if repair_multiblank_question_from_page(q, page):
+            repaired += 1
+
+    if repaired:
+        output.setdefault("warnings", []).append({
+            "type": "history_multiblank_repaired",
+            "message": f"Repaired {repaired} História multi_blank_choice question(s).",
+        })
+
+
+def _normalize_table_rows(table: object) -> list[list]:
+    if isinstance(table, dict):
+        for key in ("rows", "cells", "data", "matrix"):
+            value = table.get(key)
+            if isinstance(value, list):
+                if value and isinstance(value[0], list):
+                    return value
+                if key == "cells":
+                    return [value]
+    if isinstance(table, list) and table and isinstance(table[0], list):
+        return table
+    return []
+
+
+def _cell_text(cell: object) -> str:
+    if isinstance(cell, dict):
+        return str(cell.get("text") or cell.get("value") or cell.get("content") or "").strip()
+    return str(cell or "").strip()
 
 
 # ══════════════════════════════════════════════════════════════════

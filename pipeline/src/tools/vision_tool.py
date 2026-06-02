@@ -2,6 +2,7 @@
 import base64
 import json
 import time
+import re
 
 import httpx
 
@@ -166,66 +167,155 @@ Respond ONLY with JSON:
 
 def analyze_exam_pages(pages_data: list[dict], delay: float = 2.0) -> list[dict]:
     """Analyze all pages using pre-scan + per-question extraction."""
+    def _question_numbers_from_text(text: str) -> list[str]:
+        if not text:
+            return []
+
+        numbers: list[str] = []
+        for match in re.finditer(r"(?m)^\s*(\d{1,2}(?:\.\d+)?)\.\s+\S", text):
+            n = match.group(1).strip()
+            if n not in numbers:
+                numbers.append(n)
+        return numbers
+
+    def _native_prescan_fallback(page_num: int, page_text: str) -> dict | None:
+        q_numbers = _question_numbers_from_text(page_text or "")
+        if not q_numbers:
+            return {
+                "page": page_num,
+                "pageType": "degraded",
+                "questionNumbers": [],
+                "figures": [],
+                "hasScoring": False,
+                "_prescanFailed": True,
+                "_fallback": "native_text_no_question_numbers",
+            }
+        return {
+            "page": page_num,
+            "pageType": "questions",
+            "questionNumbers": q_numbers,
+            "figures": [],
+            "hasScoring": False,
+            "_prescanFailed": True,
+            "_fallback": "native_text_question_numbers",
+        }
+
     results = []
     total = len(pages_data)
 
     for idx, page_info in enumerate(pages_data):
         page_num = page_info["page"]
         image_path = page_info["page_image_path"]
-        print(json.dumps({"stage": "vision", "message": f"Pre-scanning page {page_num} ({idx+1}/{total})"}), flush=True)
+        page_text = page_info.get("text", "") or ""
+        diagnostics = {
+            "prescan_ok": False,
+            "prescan_fallback_used": False,
+            "prescan_fallback_kind": None,
+            "native_text_len": len(page_text.strip()),
+            "page_degraded": False,
+            "questions_found": 0,
+            "figures_found": 0,
+            "warnings": [],
+        }
 
-        # Step 1: Pre-scan
-        scan = _prescan_page(image_path, page_num)
-        time.sleep(delay)
+        try:
+            print(json.dumps({"stage": "vision", "message": f"Pre-scanning page {page_num} ({idx+1}/{total})"}), flush=True)
 
-        if not scan:
-            # Fallback: try text-based prescan
-            text = page_info.get("text", "")
-            fallback_prompt = f"List question numbers in this text. Respond JSON: {{\"page\": {page_num}, \"pageType\": \"questions\", \"questionNumbers\": [], \"figures\": []}}\n\nText:\n{text[:3000]}"
-            content = _call_text(fallback_prompt, 256)
-            scan = _parse_json(content) if content else None
+            # Step 1: Pre-scan (vision)
+            scan = _prescan_page(image_path, page_num)
             time.sleep(delay)
+            diagnostics["prescan_ok"] = bool(scan)
 
-        if not scan:
-            results.append({"page": page_num, "error": "Pre-scan failed", "questions": [], "figures": []})
+            # Step 1b: text-model prescan fallback
+            if not scan:
+                fallback_prompt = (
+                    f"List question numbers in this text. Respond JSON: "
+                    f"{{\"page\": {page_num}, \"pageType\": \"questions\", \"questionNumbers\": [], \"figures\": []}}\n\n"
+                    f"Text:\n{page_text[:3000]}"
+                )
+                content = _call_text(fallback_prompt, 256)
+                scan = _parse_json(content) if content else None
+                time.sleep(delay)
+                if scan:
+                    diagnostics["prescan_fallback_used"] = True
+                    diagnostics["prescan_fallback_kind"] = "llm_text_prescan"
+
+            # Step 1c: native text deterministic fallback (non-blocking)
+            if not scan:
+                scan = _native_prescan_fallback(page_num, page_text)
+                diagnostics["prescan_fallback_used"] = True
+                diagnostics["prescan_fallback_kind"] = scan.get("_fallback")
+                diagnostics["warnings"].append("prescan_failed_used_native_text_fallback")
+
+            page_type = scan.get("pageType", "questions")
+
+            # Handle scoring / non-question pages
+            if page_type != "questions":
+                result = {
+                    "page": page_num,
+                    "pageType": page_type,
+                    "questions": [],
+                    "figures": [],
+                }
+                if page_type == "scoring" or scan.get("hasScoring"):
+                    scoring = _extract_scoring(image_path, page_num)
+                    result["scoring"] = scoring or []
+                if page_type == "degraded":
+                    diagnostics["page_degraded"] = True
+                    result["error"] = "Pre-scan failed and no question numbers found in native text."
+                result["_diagnostics"] = diagnostics
+                results.append(result)
+                time.sleep(delay)
+                continue
+
+            # Step 2: Extract each question
+            page_questions = []
+            q_numbers = scan.get("questionNumbers", []) or []
+            print(json.dumps({"stage": "vision", "message": f"Page {page_num}: extracting {len(q_numbers)} questions"}), flush=True)
+
+            for q_num in q_numbers:
+                try:
+                    q_data = _extract_question(image_path, page_num, q_num, total)
+                    if q_data:
+                        page_questions.append(q_data)
+                except Exception as q_err:
+                    diagnostics["warnings"].append(f"question_extract_error:{q_num}:{q_err}")
+                time.sleep(delay)
+
+            # Step 3: Extract figures
+            page_figures = []
+            for fig_label in scan.get("figures", []) or []:
+                try:
+                    fig_data = _extract_figure(image_path, page_num, fig_label)
+                    if fig_data:
+                        page_figures.append(fig_data)
+                except Exception as fig_err:
+                    diagnostics["warnings"].append(f"figure_extract_error:{fig_label}:{fig_err}")
+                time.sleep(delay)
+
+            diagnostics["questions_found"] = len(page_questions)
+            diagnostics["figures_found"] = len(page_figures)
+
+            results.append({
+                "page": page_num,
+                "pageType": "questions",
+                "questions": page_questions,
+                "figures": page_figures,
+                "_diagnostics": diagnostics,
+            })
+        except Exception as e:
+            diagnostics["page_degraded"] = True
+            diagnostics["warnings"].append(f"page_exception:{e}")
+            results.append({
+                "page": page_num,
+                "pageType": "degraded",
+                "error": str(e),
+                "questions": [],
+                "figures": [],
+                "warnings": [{"type": "page_exception", "message": str(e)}],
+                "_diagnostics": diagnostics,
+            })
             continue
-
-        page_type = scan.get("pageType", "questions")
-        if page_type != "questions":
-            # Handle scoring page
-            if page_type == "scoring" or scan.get("hasScoring"):
-                scoring = _extract_scoring(image_path, page_num)
-                results.append({"page": page_num, "pageType": page_type, "questions": [], "figures": [], "scoring": scoring or []})
-            else:
-                results.append({"page": page_num, "pageType": page_type, "questions": [], "figures": []})
-            time.sleep(delay)
-            continue
-
-        # Step 2: Extract each question
-        page_questions = []
-        q_numbers = scan.get("questionNumbers", [])
-        print(json.dumps({"stage": "vision", "message": f"Page {page_num}: extracting {len(q_numbers)} questions"}), flush=True)
-
-        for q_num in q_numbers:
-            q_data = _extract_question(image_path, page_num, q_num, total)
-            if q_data:
-                page_questions.append(q_data)
-            time.sleep(delay)
-
-        # Step 3: Extract figures
-        page_figures = []
-        for fig_label in scan.get("figures", []):
-            fig_data = _extract_figure(image_path, page_num, fig_label)
-            if fig_data:
-                page_figures.append(fig_data)
-            time.sleep(delay)
-
-        results.append({
-            "page": page_num,
-            "pageType": "questions",
-            "questions": page_questions,
-            "figures": page_figures,
-        })
 
     return results
 

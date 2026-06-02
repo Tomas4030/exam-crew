@@ -12,6 +12,8 @@ from .utils.math_normalize import math_normalize
 from .utils.text_format import apply_text_formatting
 from .utils.subjects import detect_subject, is_formula_page
 from .utils.source_grouping import apply_source_grouping
+from .utils.page_diagnostics import write_page_diagnostics
+from .utils.asset_integrity import enforce_asset_integrity
 
 
 def _find_question_anchor_y(blocks: list[dict], q_number: str) -> float | None:
@@ -177,6 +179,11 @@ class ExamProcessingCrew:
         # Step 2: Analyze pages (pre-scan + per-question)
         report_progress("vision", f"Analyzing {len(pages_to_process)} pages with Qwen3-VL")
         page_results = analyze_exam_pages(pages_to_process)
+        try:
+            diag_file = write_page_diagnostics(self.output_dir, self.exam_id, page_results, extraction)
+            report_progress("diagnostics", f"Page diagnostics saved: {diag_file}")
+        except Exception as diag_err:
+            report_progress("diagnostics", f"Failed to write page diagnostics (non-fatal): {diag_err}")
 
         # Step 2.5: Dedicated scoring extraction from last page
         # Try vision first, then text fallback. Also collect any scoring from pre-scan.
@@ -230,6 +237,28 @@ Text:
         output["metadata"]["subject"] = subject_key.replace("_", " ").title() if subject_key != "unknown" else None
         output["metadata"]["formula_pages"] = formula_pages
         output["metadata"]["preflight"] = preflight.to_dict()
+
+        # Fallback textual se a visão/assemble não extraiu perguntas
+        if not output.get("questions"):
+            from .utils.text_question_fallback import extract_questions_from_text_pages
+
+            fallback_questions = extract_questions_from_text_pages(extraction, subject_profile)
+
+            if fallback_questions:
+                output["questions"] = fallback_questions
+                output.setdefault("warnings", []).append({
+                    "type": "text_fallback_used",
+                    "message": f"Vision/assemble returned 0 questions; recovered {len(fallback_questions)} questions from extracted text.",
+                })
+                output["needsHumanReview"] = True
+                report_progress("retry", f"Recovered {len(fallback_questions)} questions using text fallback")
+            else:
+                output.setdefault("warnings", []).append({
+                    "type": "empty_output",
+                    "message": "Vision/assemble returned 0 questions and text fallback recovered 0 questions.",
+                })
+                output["status"] = "partial_failed"
+                output["needsHumanReview"] = True
 
         # Step 3.2: Extract table data for tables without rows
         from .tools.vision_tool import _extract_table_data
@@ -333,6 +362,31 @@ Text:
         # Runs last so validate/retry changes are captured. Overwrites statement
         # with formatted version; original preserved in statementRaw.
         output = apply_text_formatting(output)
+
+        # Step 4.92: remove broken asset/media references before final save
+        output = enforce_asset_integrity(output, self.output_dir)
+
+        # Step 4.95: Final quality gate
+        question_count = len(output.get("questions") or [])
+
+        if question_count == 0:
+            output.setdefault("warnings", []).append({
+                "type": "empty_questions",
+                "severity": "critical",
+                "message": "Pipeline completed but extracted 0 questions.",
+            })
+            output["status"] = "partial_failed"
+            output["needsHumanReview"] = True
+
+            out_file = self.output_dir / f"{self.exam_id}.json"
+            out_file.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            report_progress(
+                "error",
+                "O pipeline terminou, mas não extraiu perguntas. JSON guardado como partial_failed."
+            )
+
+            raise RuntimeError("Pipeline completed with 0 questions")
 
         # Step 5: Save
         out_file = self.output_dir / f"{self.exam_id}.json"

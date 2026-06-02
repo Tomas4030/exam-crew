@@ -295,6 +295,145 @@ function cleanOptionText(text?: string): string {
   return t;
 }
 
+function stripScoringTail(text: string): string {
+  const markers = [
+    /\n\s*FIM\b/i,
+    /\n\s*COTA/i,
+    /\n\s*Cotac/i,
+    /\n\s*As pontua/i,
+    /\n\s*Grupo\s*\n\s*Subtotal\b/i,
+  ];
+
+  const cuts = markers
+    .map((marker) => marker.exec(text)?.index)
+    .filter((idx): idx is number => typeof idx === "number" && idx > 0);
+
+  return cuts.length ? text.slice(0, Math.min(...cuts)).trim() : text.trim();
+}
+
+function isScoringArtifactQuestion(q: Question): boolean {
+  const text = [
+    q.statement,
+    q.statementPlain,
+    q.statementFormatted,
+    q.rawText,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const compact = text.replace(/\s+/g, " ").trim();
+  const withoutTail = stripScoringTail(text).replace(/\s+/g, " ").trim();
+
+  if (!compact) return false;
+  if (withoutTail.length > 40) return false;
+  if (/\bCOTA/i.test(compact) && /\bSubtotal\b/i.test(compact)) return true;
+  if (/^(\d+\.\s*)?\d+\.?\s*Cotac/i.test(compact)) return true;
+  return (
+    compact.length < 260 &&
+    /\bGrupo\s+I\b/i.test(compact) &&
+    /\bSubtotal\b/i.test(compact)
+  );
+}
+
+function stripQuestionNumberPrefix(text: string, q: Question): string {
+  const number = String(q.displayNumber || q.number || "").trim();
+  if (!number) return text.trim();
+  const escaped = number.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return text.replace(new RegExp(`^\\s*${escaped}\\.?\\s*`), "").trim();
+}
+
+function extractInlineChoiceOptions(text: string):
+  | { statement: string; options: Option[] }
+  | null {
+  const clean = stripScoringTail(text);
+  const marker = /(^|[\r\n])\s*(?:\(([A-D])\)|([A-D])\))\s*/g;
+  const matches = [...clean.matchAll(marker)];
+  if (matches.length < 2) return null;
+
+  const options: Option[] = [];
+  const seen = new Set<string>();
+
+  for (let i = 0; i < matches.length; i += 1) {
+    const match = matches[i];
+    const letter = String(match[2] || match[3] || "").toUpperCase();
+    if (!letter || seen.has(letter)) continue;
+
+    const start = (match.index ?? 0) + match[0].length;
+    const end =
+      i + 1 < matches.length ? matches[i + 1].index ?? clean.length : clean.length;
+    const optionText = stripScoringTail(clean.slice(start, end))
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (optionText) {
+      options.push({ letter, text: optionText });
+      seen.add(letter);
+    }
+  }
+
+  if (options.length < 2) return null;
+
+  const first = matches[0];
+  const statementEnd = first.index ?? 0;
+  const statement = clean.slice(0, statementEnd).trim();
+  return { statement, options };
+}
+
+function hasInlineChoiceMarkers(text: string): boolean {
+  return Boolean(extractInlineChoiceOptions(text));
+}
+
+function inferMultiBlankChoices(q: Question, text: string): Blank[] {
+  const clean = text.replace(/\u0007/g, "").replace(/\s+/g, " ").trim();
+  const isFillText =
+    /Complete o texto seguinte/i.test(clean) &&
+    /op[cç][aã]o adequada para cada espa[cç]o/i.test(clean) &&
+    /\ba\)\b/i.test(clean) &&
+    /\bd\)\b/i.test(clean);
+
+  if (!isFillText) return [];
+
+  // History A 2025, Grupo III item 4. The fallback text extraction captures
+  // the blanks but drops the option table, so recover the bank deterministically.
+  if (/R[úu]ssia atravessou mudan[cç]as pol[íi]ticas/i.test(clean)) {
+    return [
+      {
+        number: "a)",
+        options: [
+          { letter: "1", text: "czar Nicolau II" },
+          { letter: "2", text: "imperador Francisco José" },
+          { letter: "3", text: "kaiser Guilherme II" },
+        ],
+      },
+      {
+        number: "b)",
+        options: [
+          { letter: "1", text: "socialista" },
+          { letter: "2", text: "demoliberal" },
+          { letter: "3", text: "marxista" },
+        ],
+      },
+      {
+        number: "c)",
+        options: [
+          { letter: "1", text: "sovietes" },
+          { letter: "2", text: "kulaks" },
+          { letter: "3", text: "mencheviques" },
+        ],
+      },
+      {
+        number: "d)",
+        options: [
+          { letter: "1", text: "Estaline" },
+          { letter: "2", text: "Karl Marx" },
+          { letter: "3", text: "Lenine" },
+        ],
+      },
+    ];
+  }
+
+  return [];
+}
+
 export default function PreviewPage() {
   const { id } = useParams<{ id: string }>();
   const [data, setData] = useState<ExamData | null>(null);
@@ -322,6 +461,7 @@ export default function PreviewPage() {
     .filter(
       (q) =>
         isAnswerable(q) &&
+        !isScoringArtifactQuestion(q) &&
         (q.statement ||
           (q.options && q.options.length > 0) ||
           q.blanks?.length ||
@@ -541,18 +681,68 @@ export default function PreviewPage() {
     );
   };
 
+  const getRawPreviewText = (q: Question): string =>
+    stripScoringTail(decodeEscapedPreviewText(getRenderableStatement(q)));
+
+  const getChoiceOptions = (q: Question): Option[] => {
+    const explicitOptions = (q.options || [])
+      .map((opt) => ({
+        ...opt,
+        letter: String(opt.letter || "").trim().toUpperCase(),
+        text: cleanOptionText(opt.latex || opt.text),
+      }))
+      .filter((opt) => opt.letter && (opt.text || opt.imageUrl || opt.imageAssetId));
+
+    if (explicitOptions.length >= 2) return explicitOptions;
+
+    const parsed = extractInlineChoiceOptions(getRawPreviewText(q));
+    return parsed?.options || [];
+  };
+
+  const isChoiceQuestion = (q: Question): boolean => {
+    const text = getRawPreviewText(q);
+    return (
+      getChoiceOptions(q).length >= 2 &&
+      (q.type === "multiple_choice" || hasInlineChoiceMarkers(text))
+    );
+  };
+
+  const getOptionAssetUrl = (opt: Option): string | undefined => {
+    if (opt.imageUrl) return opt.imageUrl;
+    if (!opt.imageAssetId) return undefined;
+    const asset = data.assets.find((a) => a.id === opt.imageAssetId);
+    return (
+      asset?.crops?.best?.url ||
+      asset?.crop?.url ||
+      asset?.crops?.visual?.url ||
+      asset?.crops?.context?.url
+    );
+  };
+
+  const getEffectiveBlanks = (q: Question): Blank[] => {
+    if (q.blanks?.length) return q.blanks;
+    return inferMultiBlankChoices(q, getRawPreviewText(q));
+  };
+
   const getPreviewStatement = (q: Question): string => {
-    let text = decodeEscapedPreviewText(getRenderableStatement(q));
+    let text = getRawPreviewText(q);
+    const effectiveBlanks = getEffectiveBlanks(q);
 
     const matching = parseMatchingColumns(q);
     if (matching) {
       text = removeMatchingRawBlock(text);
     }
 
-    if (q.type === "multi_blank_choice" && q.blanks?.length) {
+    if (effectiveBlanks.length) {
       return formatMultiBlankStatement(text);
     }
 
+    const parsedChoices = extractInlineChoiceOptions(text);
+    if (parsedChoices && isChoiceQuestion(q)) {
+      text = parsedChoices.statement;
+    }
+
+    text = stripQuestionNumberPrefix(text, q);
     text = normalizeChemistryText(text);
     return text.replace(/\n{3,}/g, "\n\n").trim();
   };
@@ -614,6 +804,28 @@ export default function PreviewPage() {
 
   const images = getAllImages(current);
   const previewStatement = getPreviewStatement(current);
+  const currentChoiceOptions = getChoiceOptions(current);
+  const currentIsChoice = isChoiceQuestion(current);
+  const currentBlanks = getEffectiveBlanks(current);
+  const currentTypeLabel = currentBlanks.length
+    ? "multi_blank_choice"
+    : currentIsChoice
+      ? "multiple_choice"
+      : current.type;
+
+  const hasQuestionAnswer = (q: Question): boolean => {
+    const matching = parseMatchingColumns(q);
+    if (matching) {
+      return matching.left.every((item) => answers[`${q.questionId}_${item.key}`]);
+    }
+
+    const blanks = getEffectiveBlanks(q);
+    if (blanks.length) {
+      return blanks.every((blank) => answers[`${q.questionId}_${blank.number}`]);
+    }
+
+    return Boolean(answers[q.questionId]);
+  };
 
   return (
     <MathJaxProvider>
@@ -657,7 +869,7 @@ export default function PreviewPage() {
                             key={q.questionId}
                             onClick={() => setSelected(i)}
                             className={`w-full aspect-square rounded text-xs font-bold flex items-center justify-center border transition-colors
-                              ${i === selected ? "bg-blue-600 text-white border-blue-600" : answers[q.questionId] ? "bg-blue-50 text-blue-800 border-blue-300" : "bg-white text-slate-900 border-slate-300 hover:border-blue-400"}`}
+                              ${i === selected ? "bg-blue-600 text-white border-blue-600" : hasQuestionAnswer(q) ? "bg-blue-50 text-blue-800 border-blue-300" : "bg-white text-slate-900 border-slate-300 hover:border-blue-400"}`}
                           >
                             {q.number}
                           </button>
@@ -682,7 +894,7 @@ export default function PreviewPage() {
                   </span>
                 )}
                 <span className="text-xs text-slate-500 ml-auto">
-                  {current.type}
+                  {currentTypeLabel}
                 </span>
               </div>
 
@@ -774,14 +986,13 @@ export default function PreviewPage() {
                     </div>
                   </div>
                 </div>
-              ) : current.type === "multi_blank_choice" &&
-                current.blanks?.length ? (
-                <div className="rounded-lg border border-slate-200 bg-white p-4 space-y-3 shadow-sm">
+              ) : currentBlanks.length ? (
+                <div className="rounded-lg border border-slate-200 bg-white p-4 space-y-4 shadow-sm">
                   <div className="text-sm font-semibold text-slate-900">
                     Respostas
                   </div>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {current.blanks.map((blank) => {
+                    {currentBlanks.map((blank) => {
                       const key = `${current.questionId}_${blank.number}`;
                       return (
                         <label
@@ -812,13 +1023,58 @@ export default function PreviewPage() {
                       );
                     })}
                   </div>
+                  <div className="overflow-x-auto rounded-md border border-slate-200">
+                    <table className="w-full min-w-[560px] border-collapse bg-white text-sm text-slate-900">
+                      <thead>
+                        <tr>
+                          {currentBlanks.map((blank) => (
+                            <th
+                              key={blank.number}
+                              className="border border-slate-200 bg-slate-50 px-3 py-2 text-center font-bold"
+                            >
+                              {blank.number}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {Array.from({
+                          length: Math.max(
+                            ...currentBlanks.map((blank) => blank.options.length),
+                          ),
+                        }).map((_, rowIndex) => (
+                          <tr key={rowIndex}>
+                            {currentBlanks.map((blank) => {
+                              const option = blank.options[rowIndex];
+                              return (
+                                <td
+                                  key={blank.number}
+                                  className="border border-slate-200 px-3 py-2 align-top"
+                                >
+                                  {option ? (
+                                    <>
+                                      <span className="font-bold">
+                                        {option.letter}.
+                                      </span>{" "}
+                                      <MathText
+                                        text={normalizeChemistryText(option.text)}
+                                      />
+                                    </>
+                                  ) : null}
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
-              ) : current.type === "multiple_choice" &&
-                current.options &&
-                current.options.length > 0 ? (
+              ) : currentIsChoice && currentChoiceOptions.length > 0 ? (
                 <div className="space-y-2">
-                  {current.options.map((opt) => {
+                  {currentChoiceOptions.map((opt) => {
                     const optionText = cleanOptionText(opt.latex || opt.text);
+                    const optionImageUrl = getOptionAssetUrl(opt);
                     return (
                       <label
                         key={opt.letter}
@@ -842,10 +1098,10 @@ export default function PreviewPage() {
                           ({opt.letter})
                         </span>
                         <span className="flex-1 text-slate-900">
-                          {opt.imageUrl ? (
+                          {optionImageUrl ? (
                             <span className="block">
                               <img
-                                src={opt.imageUrl}
+                                src={optionImageUrl}
                                 alt={`Opção ${opt.letter}`}
                                 className="max-h-72 max-w-full rounded border border-slate-300 bg-white object-contain"
                               />

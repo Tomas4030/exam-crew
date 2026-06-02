@@ -47,6 +47,7 @@ export function runPipeline(pdfPath: string, examId: string): Promise<ProcessRes
 
     let stdout = '';
     let stderr = '';
+    let lastProgressError = '';
 
     child.stdout.on('data', (data) => {
       const line = data.toString();
@@ -60,6 +61,18 @@ export function runPipeline(pdfPath: string, examId: string): Promise<ProcessRes
           try {
             const evt = JSON.parse(trimmed);
             const stepDef = PIPELINE_STEPS.find(s => s.id === evt.stage);
+
+            if (evt.stage === 'error') {
+              lastProgressError = evt.message || 'Erro no pipeline';
+              writeProgress(examId, {
+                step: 'error',
+                label: 'Erro',
+                pct: 100,
+                message: lastProgressError,
+              });
+              continue;
+            }
+
             if (stepDef) {
               writeProgress(examId, {
                 step: evt.stage,
@@ -81,11 +94,30 @@ export function runPipeline(pdfPath: string, examId: string): Promise<ProcessRes
 
     child.on('close', (code) => {
       console.log(`[Pipeline] ${examId} exited with code ${code}`);
-      writeProgress(examId, { step: 'done', label: 'Concluído', pct: 100, message: '' });
+
       if (code === 0) {
+        writeProgress(examId, {
+          step: 'done',
+          label: 'Concluído',
+          pct: 100,
+          message: '',
+        });
+
         resolve({ success: true, examId });
       } else {
-        resolve({ success: false, examId, error: stderr || `Exit code ${code}` });
+        const errorMessage =
+          lastProgressError ||
+          stderr.trim() ||
+          `Exit code ${code}`;
+
+        writeProgress(examId, {
+          step: 'error',
+          label: 'Erro',
+          pct: 100,
+          message: errorMessage,
+        });
+
+        resolve({ success: false, examId, error: errorMessage });
       }
     });
 
