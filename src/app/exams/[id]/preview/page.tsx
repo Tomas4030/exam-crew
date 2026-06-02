@@ -987,7 +987,7 @@ export default function PreviewPage() {
                   </div>
                 </div>
               ) : currentBlanks.length ? (
-                <div className="rounded-lg border border-slate-200 bg-white p-4 space-y-4 shadow-sm">
+                <div className="rounded-lg border border-slate-200 bg-white p-4 space-y-3 shadow-sm">
                   <div className="text-sm font-semibold text-slate-900">
                     Respostas
                   </div>
@@ -997,7 +997,7 @@ export default function PreviewPage() {
                       return (
                         <label
                           key={blank.number}
-                          className="flex items-center gap-3 rounded-md border border-slate-200 bg-white px-3 py-2"
+                          className="min-w-0 flex items-center gap-3 rounded-md border border-slate-200 bg-white px-3 py-2"
                         >
                           <span className="w-8 font-bold text-blue-700">
                             {blank.number}
@@ -1010,64 +1010,18 @@ export default function PreviewPage() {
                                 [key]: e.target.value,
                               }))
                             }
-                            className="flex-1 rounded border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-900"
+                            className="min-w-0 flex-1 rounded border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-900"
                           >
                             <option value="">Selecionar...</option>
                             {blank.options.map((opt) => (
                               <option key={opt.letter} value={opt.letter}>
-                                {opt.letter}) {normalizeChemistryText(opt.text)}
+                                {opt.letter}. {normalizeChemistryText(opt.text)}
                               </option>
                             ))}
                           </select>
                         </label>
                       );
                     })}
-                  </div>
-                  <div className="overflow-x-auto rounded-md border border-slate-200">
-                    <table className="w-full min-w-[560px] border-collapse bg-white text-sm text-slate-900">
-                      <thead>
-                        <tr>
-                          {currentBlanks.map((blank) => (
-                            <th
-                              key={blank.number}
-                              className="border border-slate-200 bg-slate-50 px-3 py-2 text-center font-bold"
-                            >
-                              {blank.number}
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {Array.from({
-                          length: Math.max(
-                            ...currentBlanks.map((blank) => blank.options.length),
-                          ),
-                        }).map((_, rowIndex) => (
-                          <tr key={rowIndex}>
-                            {currentBlanks.map((blank) => {
-                              const option = blank.options[rowIndex];
-                              return (
-                                <td
-                                  key={blank.number}
-                                  className="border border-slate-200 px-3 py-2 align-top"
-                                >
-                                  {option ? (
-                                    <>
-                                      <span className="font-bold">
-                                        {option.letter}.
-                                      </span>{" "}
-                                      <MathText
-                                        text={normalizeChemistryText(option.text)}
-                                      />
-                                    </>
-                                  ) : null}
-                                </td>
-                              );
-                            })}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
                   </div>
                 </div>
               ) : currentIsChoice && currentChoiceOptions.length > 0 ? (
