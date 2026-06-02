@@ -102,6 +102,9 @@ class PDFExtractorTool(BaseTool):
                         continue
 
                     rect = img_rects[0]
+                    pw, ph = page.rect.width, page.rect.height
+                    x0 = max(0.0, rect.x0)
+                    y0 = max(0.0, rect.y0)
                     asset_id = f"page{page_num + 1}_img{img_idx}"
                     asset_path = assets_dir / f"{asset_id}.png"
                     pix_img.save(str(asset_path))
@@ -112,10 +115,10 @@ class PDFExtractorTool(BaseTool):
                         "path": str(asset_path),
                         "page": page_num + 1,
                         "bbox": {
-                            "x": round(rect.x0),
-                            "y": round(rect.y0),
-                            "width": round(rect.width),
-                            "height": round(rect.height),
+                            "x": round(x0),
+                            "y": round(y0),
+                            "width": round(min(rect.width, pw - x0)),
+                            "height": round(min(rect.height, ph - y0)),
                         },
                         "img_width": pix_img.width,
                         "img_height": pix_img.height,

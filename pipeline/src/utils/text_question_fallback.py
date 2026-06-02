@@ -15,6 +15,20 @@ TABLE_HEADER_RE = re.compile(r"^\s*([a-f])\)\s*$", re.IGNORECASE)
 TABLE_OPTION_RE = re.compile(r"^\s*(\d{1,2})[.)]?\s+(.+?)\s*$")
 
 
+def _extract_multiple_choice_options(block: str) -> list[dict]:
+    """Extrai opções (A)...(D) de texto com multiple choice."""
+    options = []
+    matches = list(re.finditer(r"\(([A-D])\)\s*([^\n(]+)", block, re.IGNORECASE))
+    if not matches:
+        matches = list(re.finditer(r"(?m)^\s*([A-D])\s*[-–—]\s*(.+)$", block, re.IGNORECASE))
+    for m in matches:
+        letter = m.group(1).upper()
+        text = re.sub(r"\s+", " ", m.group(2)).strip()
+        if text and not any(o.get("letter") == letter for o in options):
+            options.append({"letter": letter, "text": text})
+    return options if len(options) >= 2 else []
+
+
 def extract_questions_from_text_pages(extraction: dict, subject_profile: dict | None = None) -> list[dict]:
     """
     Fallback deterministico:
@@ -65,9 +79,11 @@ def extract_questions_from_text_pages(extraction: dict, subject_profile: dict | 
 
             q_type = "open_answer"
             blanks = []
+            options = []
 
             if re.search(r"\([A-D]\)", block) or re.search(r"(?m)^\s*[A-D]\s*(?:-|\u2013|\))", block):
                 q_type = "multiple_choice"
+                options = _extract_multiple_choice_options(block)
             elif _looks_like_multi_blank_choice(block):
                 q_type = "multi_blank_choice"
                 blanks = _extract_blanks_from_page(page, block)
@@ -79,7 +95,7 @@ def extract_questions_from_text_pages(extraction: dict, subject_profile: dict | 
                 "sourcePage": page_num,
                 "statement": block,
                 "rawText": block,
-                "options": [],
+                "options": options,
                 "blanks": blanks,
                 "imageRefs": [],
                 "tableRefs": [],

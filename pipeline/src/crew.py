@@ -1291,12 +1291,26 @@ Text:
 
         # Add embedded images from PDF extraction as assets (with REAL bbox)
         for asset in extraction.get("assets", []):
+            abs_path = asset.get("path")
+            # Build portable relative path and public URL — never expose the absolute local path.
+            if abs_path:
+                from pathlib import Path as _Path
+                try:
+                    rel = _Path(abs_path).relative_to(self.output_dir / self.exam_id)
+                    rel_str = rel.as_posix()
+                except ValueError:
+                    rel_str = f"assets/{_Path(abs_path).name}"
+                public_url = f"/api/exams/{self.exam_id}/assets/{_Path(abs_path).name}"
+            else:
+                rel_str = None
+                public_url = None
             all_assets.append({
                 "id": asset["id"],
                 "type": "embedded_image",
                 "page": asset["page"],
                 "bbox": asset["bbox"],
-                "url": asset["path"],
+                "relativePath": rel_str,
+                "url": public_url,
                 "img_width": asset.get("img_width"),
                 "img_height": asset.get("img_height"),
             })
