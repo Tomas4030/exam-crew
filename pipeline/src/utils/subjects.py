@@ -42,7 +42,7 @@ SUBJECT_PROFILES = {
         "latex_heavy": False,
         "has_excerpts": True,
         "has_source_grouping": True,
-        "question_types": ["document_analysis", "short_answer", "essay"],
+        "question_types": ["document_analysis", "short_answer", "essay", "multi_select"],
         "normalizers": ["common", "humanities"],
         "crop_profile": "auto",
         "preview_profile": "humanities",

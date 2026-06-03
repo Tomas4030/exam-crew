@@ -1029,6 +1029,17 @@ function render() {
 }
 
 function bindQuestionEvents(root) {
+  root.querySelectorAll('[data-multi-select-key]').forEach(function(el) {
+    var key = el.getAttribute('data-multi-select-key');
+    if (!key) return;
+
+    el.addEventListener('change', function() {
+      var values = Array.prototype.slice.call(root.querySelectorAll('[data-multi-select-key="' + key + '"]:checked'))
+        .map(function(input) { return input.value; });
+      setAnswer(key, values.join(','));
+    });
+  });
+
   root.querySelectorAll('[data-answer-key]').forEach(function(el) {
     var key = el.getAttribute('data-answer-key');
     if (!key) return;
@@ -1300,6 +1311,10 @@ function renderAnswer(q) {
     return renderOptions(q);
   }
 
+  if (q.type === 'multi_select' && q.options && q.options.length) {
+    return renderMultiSelect(q);
+  }
+
   if (q.type === 'multi_blank_choice' && q.blanks && q.blanks.length) {
     return renderBlanks(q);
   }
@@ -1323,6 +1338,28 @@ function renderOptions(q) {
         '<input type="radio" name="' + esc(q.questionId) + '" value="' + esc(option.letter) + '" ' +
         (isSelected ? 'checked' : '') +
         ' data-answer-key="' + esc(q.questionId) + '">' +
+        '<span class="option-letter">(' + esc(option.letter) + ')</span>' +
+        '<span class="option-text">' + formatInlineText(text) + '</span>' +
+      '</label>';
+    }).join('') +
+  '</div>';
+}
+
+function renderMultiSelect(q) {
+  var selected = String(state.answers[q.questionId] || '')
+    .split(',')
+    .map(function(letter) { return letter.trim(); })
+    .filter(Boolean);
+
+  return '<div class="options" data-question-id="' + esc(q.questionId) + '">' +
+    q.options.map(function(option) {
+      var isSelected = selected.indexOf(option.letter) >= 0;
+      var text = cleanOptionText(option.latex || option.text || '');
+
+      return '<label class="option ' + (isSelected ? 'selected' : '') + '">' +
+        '<input type="checkbox" value="' + esc(option.letter) + '" ' +
+        (isSelected ? 'checked' : '') +
+        ' data-multi-select-key="' + esc(q.questionId) + '">' +
         '<span class="option-letter">(' + esc(option.letter) + ')</span>' +
         '<span class="option-text">' + formatInlineText(text) + '</span>' +
       '</label>';
@@ -1406,6 +1443,7 @@ function renderGroupChildren(children) {
 function labelType(type) {
   var labels = {
     multiple_choice: 'Escolha múltipla',
+    multi_select: 'Seleção múltipla',
     multi_blank_choice: 'Associação / espaços',
     open_answer: 'Resposta aberta',
     group: 'Grupo'

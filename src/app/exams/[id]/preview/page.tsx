@@ -68,6 +68,7 @@ interface Question {
   mathSpans?: { plain: string; latex: string; confidence?: number }[];
   textQuality?: { status?: string };
   options?: Option[];
+  maxSelections?: number;
   blanks?: Blank[] | null;
   group?: string;
   groupId?: string;
@@ -703,7 +704,7 @@ export default function PreviewPage() {
     const text = getRawPreviewText(q);
     return (
       getChoiceOptions(q).length >= 2 &&
-      (q.type === "multiple_choice" || hasInlineChoiceMarkers(text))
+      (q.type === "multiple_choice" || q.type === "multi_select" || hasInlineChoiceMarkers(text))
     );
   };
 
@@ -805,10 +806,13 @@ export default function PreviewPage() {
   const images = getAllImages(current);
   const previewStatement = getPreviewStatement(current);
   const currentChoiceOptions = getChoiceOptions(current);
+  const currentIsMultiSelect = current.type === "multi_select";
   const currentIsChoice = isChoiceQuestion(current);
   const currentBlanks = getEffectiveBlanks(current);
   const currentTypeLabel = currentBlanks.length
     ? "multi_blank_choice"
+    : currentIsMultiSelect
+      ? "multi_select"
     : currentIsChoice
       ? "multiple_choice"
       : current.type;
@@ -1023,6 +1027,58 @@ export default function PreviewPage() {
                       );
                     })}
                   </div>
+                </div>
+              ) : currentIsMultiSelect && currentChoiceOptions.length > 0 ? (
+                <div className="space-y-2">
+                  {currentChoiceOptions.map((opt) => {
+                    const optionText = cleanOptionText(opt.latex || opt.text);
+                    const selected = new Set(
+                      String(answers[current.questionId] || "")
+                        .split(",")
+                        .map((letter) => letter.trim())
+                        .filter(Boolean),
+                    );
+                    const isSelected = selected.has(opt.letter);
+                    return (
+                      <label
+                        key={opt.letter}
+                        className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors
+                          ${isSelected ? "border-blue-500 bg-blue-50" : "border-slate-200 bg-white hover:bg-slate-50"}`}
+                      >
+                        <input
+                          type="checkbox"
+                          value={opt.letter}
+                          checked={isSelected}
+                          onChange={() =>
+                            setAnswers((prev) => {
+                              const next = new Set(
+                                String(prev[current.questionId] || "")
+                                  .split(",")
+                                  .map((letter) => letter.trim())
+                                  .filter(Boolean),
+                              );
+                              if (next.has(opt.letter)) {
+                                next.delete(opt.letter);
+                              } else if (next.size < (current.maxSelections || 2)) {
+                                next.add(opt.letter);
+                              }
+                              return {
+                                ...prev,
+                                [current.questionId]: Array.from(next).join(","),
+                              };
+                            })
+                          }
+                          className="mt-0.5"
+                        />
+                        <span className="font-medium text-sm text-slate-700 w-5">
+                          ({opt.letter})
+                        </span>
+                        <span className="flex-1 text-slate-900">
+                          <MathText text={optionText} />
+                        </span>
+                      </label>
+                    );
+                  })}
                 </div>
               ) : currentIsChoice && currentChoiceOptions.length > 0 ? (
                 <div className="space-y-2">

@@ -115,11 +115,12 @@ def _extract_question(image_path: str, page_num: int, q_number: str, total_pages
 Respond ONLY with JSON:
 {{
   "number": "{q_number}",
-  "type": "multiple_choice|open_answer|multi_blank_choice|calculation|proof",
+  "type": "multiple_choice|multi_select|open_answer|multi_blank_choice|calculation|proof",
   "statement": "texto EXATO da pergunta",
   "rawText": "texto original com fórmulas se houver dúvida",
   "mathUncertain": false,
   "options": [{{"letter": "A", "text": "..."}}],
+  "maxSelections": null,
   "blanks": null,
   "calculatorAllowed": null,
   "points": null,
@@ -138,6 +139,7 @@ Rules:
   ]
   Do NOT collapse blanks into a single multiple choice A/B/C/D.
 - For normal multiple choice (A)/(B)/(C)/(D), use type "multiple_choice" with options.
+- If the question asks to select/identify two options from I-V or a-e, use type "multi_select", set options, and set maxSelections=2.
 - calculatorAllowed: false only if text says "sem recorrer à calculadora", else null.
 - groupContext: shared text before sub-questions (e.g. function definition).
 - referencesTable: true if the question uses a table shown on the page.

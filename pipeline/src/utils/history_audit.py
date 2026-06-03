@@ -159,9 +159,7 @@ def summarize_issues(issues: list[Issue]) -> dict[str, Any]:
 
 
 def apply_history_audit_gate(output: dict[str, Any], asset_base: str | Path) -> tuple[dict[str, Any], list[Issue], dict[str, Any]]:
-    subject = str((output.get("metadata") or {}).get("subject") or "").lower()
-    exam_id = str(output.get("exam_id") or "").lower()
-    if "hist" not in subject and "hist" not in exam_id:
+    if not _is_probably_history_output(output):
         return output, [], {"verdict": "SKIPPED", "reason": "not_history"}
 
     issues = audit_output(output, asset_base)
@@ -192,6 +190,29 @@ def apply_history_audit_gate(output: dict[str, Any], asset_base: str | Path) -> 
         output["needsHumanReview"] = False
 
     return output, issues, summary
+
+
+def _is_probably_history_output(output: dict[str, Any]) -> bool:
+    metadata = output.get("metadata") or {}
+    marker = f"{metadata.get('subject') or ''} {metadata.get('title') or ''} {output.get('exam_id') or ''}".lower()
+    if "hist" in marker:
+        return True
+
+    sources = output.get("sources") or []
+    source_marker = " ".join(
+        str(src.get(key) or "")
+        for src in sources
+        if isinstance(src, dict)
+        for key in ("id", "label", "title", "type")
+    ).lower()
+    if sources and ("doc" in source_marker or "documento" in source_marker):
+        return True
+
+    questions = output.get("questions") or []
+    group_ids = {str(q.get("groupId") or q.get("group") or "").lower() for q in questions}
+    has_roman_groups = any(group.startswith("grupo_") for group in group_ids)
+    has_source_refs = any(q.get("sourceRefs") for q in questions)
+    return has_roman_groups and has_source_refs
 
 
 def _audit_counts(root: str, questions: list[dict], metadata: dict, issues: list[Issue]) -> None:
@@ -254,6 +275,15 @@ def _audit_question_types(root: str, questions: list[dict], issues: list[Issue])
         if qtype == "multiple_choice" and len(options) < 2:
             issues.append(Issue(root, "HIGH", "MULTIPLE_CHOICE_WITHOUT_OPTIONS",
                                 "multiple_choice item has fewer than 2 options", qid, _group_id(q), str(q.get("number") or "")))
+
+        if qtype == "multi_select":
+            max_selections = q.get("maxSelections")
+            if len(options) < 3:
+                issues.append(Issue(root, "HIGH", "MULTI_SELECT_WITHOUT_OPTIONS",
+                                    "multi_select item has fewer than 3 options", qid, _group_id(q), str(q.get("number") or "")))
+            if max_selections is None or int(max_selections or 0) < 2:
+                issues.append(Issue(root, "MEDIUM", "MULTI_SELECT_SELECTION_COUNT",
+                                    "multi_select item is missing maxSelections >= 2", qid, _group_id(q), str(q.get("number") or "")))
 
         if qtype == "multi_blank_choice":
             invalid = not blanks or any(not (b.get("options") or []) for b in blanks if isinstance(b, dict))

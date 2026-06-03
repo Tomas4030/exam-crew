@@ -14,6 +14,7 @@ from .utils.subjects import detect_subject, is_formula_page
 from .utils.source_grouping import apply_source_grouping
 from .utils.page_diagnostics import write_page_diagnostics
 from .utils.asset_integrity import enforce_asset_integrity
+from .utils.question_cleanup import cleanup_history_questions
 
 
 def _find_question_anchor_y(blocks: list[dict], q_number: str) -> float | None:
@@ -395,6 +396,10 @@ Text:
             report_progress("retry", f"Retrying extraction for {len(missing_q_warnings)} missing question(s)")
             output = self._targeted_retry(output, extraction, pages_to_process, missing_q_warnings)
 
+        # Step 4.7: Remove deterministic duplicates/source excerpts before final audit.
+        output = cleanup_history_questions(output)
+        output = validate_and_fix(output, extraction)
+
         # Step 4.9: Deterministic readable line breaks for frontend display
         # Runs last so validate/retry changes are captured. Overwrites statement
         # with formatted version; original preserved in statementRaw.
@@ -572,6 +577,8 @@ Text:
 
             output = normalize(output, extraction)
             output = normalize_by_profile(output, extraction, subject_profile)
+            output = cleanup_history_questions(output)
+            output = validate_and_fix(output, extraction)
             output = apply_text_formatting(output)
             output = enforce_asset_integrity(output, self.output_dir)
 
@@ -692,6 +699,7 @@ Text:
                         "rawText": q_data.get("rawText"),
                         "blanks": q_data.get("blanks"),
                         "options": q_data.get("options", []),
+                        "maxSelections": q_data.get("maxSelections"),
                         "imageRefs": [],
                         "tableRefs": [],
                         "assetRefs": [],
@@ -874,6 +882,9 @@ Text:
                 if gid:
                     results.append({"question": items_seq[k], "points": points_seq[k], "group": gid})
 
+        opt_match = re.search(r'(\d+)\s*[Ã×x]\s*(\d+)\s*pontos', scoring_text, re.IGNORECASE)
+        optional_points = int(opt_match.group(2)) if opt_match else 13
+
         # Also parse optional items section (e.g. "Grupo I\n2.\nGrupo III\n2.\n5.\n...")
         if "Destes" in scoring_text or "contribuem" in scoring_text:
             optional_group = None
@@ -885,8 +896,7 @@ Text:
                     continue
                 item_m = re.match(r'^(\d+)\.$', line)
                 if item_m and optional_group:
-                    # Optional items are 13 points each (standard for Portuguese national exams)
-                    results.append({"question": item_m.group(1), "points": 13, "group": optional_group})
+                    results.append({"question": item_m.group(1), "points": optional_points, "group": optional_group})
 
         return results
 
@@ -1166,6 +1176,7 @@ Text:
                     "rawText": q.get("rawText") or None,
                     "blanks": q.get("blanks") or None,
                     "options": q.get("options", []),
+                    "maxSelections": q.get("maxSelections"),
                     "imageRefs": image_refs,
                     "tableRefs": table_refs,
                     "assetRefs": [],
@@ -1337,7 +1348,7 @@ Text:
             if entry_group:
                 for q in all_questions:
                     q_group = q.get("groupId") or q.get("group", "")
-                    if q["number"] == q_num and entry_group.lower() in q_group.lower() and q.get("points") is None:
+                    if q["number"] == q_num and entry_group.lower() in q_group.lower():
                         q["points"] = pts
                         matched = True
                         break

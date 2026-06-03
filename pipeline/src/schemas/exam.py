@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 # ── Question Types (generic, works for all subjects) ──────────────
 class QuestionType(str, Enum):
     MULTIPLE_CHOICE = "multiple_choice"
+    MULTI_SELECT = "multi_select"
     OPEN_ANSWER = "open_answer"
     SHORT_ANSWER = "short_answer"
     ESSAY = "essay"
@@ -166,6 +167,7 @@ class Question(BaseModel):
     mathSpans: list[MathSpan] = Field(default_factory=list)
     textQuality: Optional[TextQuality] = None
     options: list[Option] = []
+    maxSelections: Optional[int] = None
     # Asset references
     imageRefs: list[str] = []
     tableRefs: list[str] = []

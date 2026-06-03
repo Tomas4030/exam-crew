@@ -64,6 +64,10 @@ def normalize_humanities(output: dict, extraction: dict | None = None) -> dict:
     _attach_intro_group_visuals(output, extraction, exam_id)
     _attach_implicit_group_i_document(output, extraction)
     _repair_multi_blank_questions(output, extraction)
+    _repair_multi_select_questions(output)
+    _repair_history_text_typos(output)
+    _normalize_source_labels(output)
+    _repair_known_history_points(output)
     _repair_document_refs(output)
     _strip_cross_group_refs(output)
     _rebuild_all_media(output)
@@ -116,6 +120,185 @@ def _repair_multi_blank_questions(output: dict, extraction: dict | None) -> None
         output.setdefault("warnings", []).append({
             "type": "history_multiblank_repaired",
             "message": f"Repaired {repaired} História multi_blank_choice question(s).",
+        })
+
+
+def _repair_multi_select_questions(output: dict) -> None:
+    """Convert História prompts that ask for two selected options into multi_select."""
+    repaired = 0
+    for q in output.get("questions", []):
+        if q.get("type") == "multi_select" and q.get("options"):
+            q.setdefault("maxSelections", 2)
+            continue
+        if q.get("type") != "open_answer":
+            continue
+
+        prompt_text = _question_prompt_text(q)
+        if not _looks_like_choose_two_prompt(prompt_text):
+            continue
+
+        text = _combined_question_text(q)
+        options = _extract_roman_options(text) or _extract_letter_options(text)
+        if len(options) < 4:
+            continue
+
+        q["type"] = "multi_select"
+        q["options"] = options
+        q["maxSelections"] = 2
+        q.setdefault("disciplineData", {})["selectionMode"] = "choose_two"
+        _strip_embedded_multi_select_options(q, options)
+        repaired += 1
+
+    if repaired:
+        output.setdefault("warnings", []).append({
+            "type": "history_multi_select_repaired",
+            "message": f"Repaired {repaired} História choose-two question(s).",
+        })
+
+
+def _combined_question_text(q: dict) -> str:
+    parts = [
+        str(q.get("statement") or ""),
+        str(q.get("statementPlain") or ""),
+        str(q.get("sourceTextRaw") or ""),
+        str(q.get("rawText") or ""),
+    ]
+    return "\n".join(part for part in parts if part).replace("\x07", " ")
+
+
+def _question_prompt_text(q: dict) -> str:
+    parts = [
+        str(q.get("statement") or ""),
+        str(q.get("statementPlain") or ""),
+        str(q.get("rawText") or ""),
+    ]
+    return "\n".join(part for part in parts if part).replace("\x07", " ")
+
+
+def _looks_like_choose_two_prompt(text: str) -> bool:
+    low = text.lower()
+    if not re.search(r"\b(duas|2)\b", low):
+        return False
+    if "complete o texto" in low:
+        return False
+    return bool(
+        re.search(r"\bidentifique\s+as\s+duas\b", low)
+        or re.search(r"\bselecione\s+as\s+duas\b", low)
+        or "duas opções selecionadas" in low
+        or "duas opcoes selecionadas" in low
+        or "alíneas que identificam as duas" in low
+        or "alineas que identificam as duas" in low
+    )
+
+
+def _extract_roman_options(text: str) -> list[dict]:
+    matches = list(re.finditer(
+        r"(?ms)(?:^|\n)\s*(IV|V|III|II|I)\.\s*(.*?)(?=\n\s*(?:IV|V|III|II|I)\.\s*|\n\s*(?:Identifique|Selecione|Escreva|No quadro|QUADRO)\b|\Z)",
+        text,
+    ))
+    options = []
+    seen = set()
+    for match in matches:
+        letter = match.group(1).strip()
+        if letter in seen:
+            continue
+        option_text = _clean_option_text(match.group(2))
+        if option_text:
+            options.append({"letter": letter, "text": option_text})
+            seen.add(letter)
+    roman_order = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5}
+    options.sort(key=lambda opt: roman_order.get(opt["letter"], 99))
+    return options if len(options) >= 4 else []
+
+
+def _extract_letter_options(text: str) -> list[dict]:
+    matches = list(re.finditer(
+        r"(?ms)(?:^|\n)\s*([a-e])\)\s*(.*?)(?=\n\s*[a-e]\)\s*|\Z)",
+        text,
+    ))
+    options = []
+    seen = set()
+    for match in matches:
+        letter = match.group(1).strip()
+        if letter in seen:
+            continue
+        option_text = _clean_option_text(match.group(2))
+        if option_text:
+            options.append({"letter": letter, "text": option_text})
+            seen.add(letter)
+    options.sort(key=lambda opt: opt["letter"])
+    return options if len(options) >= 4 else []
+
+
+def _clean_option_text(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", text.replace("\x07", " ")).strip(" .\n\t")
+    return f"{cleaned}." if cleaned else ""
+
+
+def _strip_embedded_multi_select_options(q: dict, options: list[dict]) -> None:
+    option_letters = {str(opt.get("letter") or "") for opt in options}
+    if not option_letters:
+        return
+    roman = option_letters <= {"I", "II", "III", "IV", "V"}
+    pattern = (
+        r"(?ms)(?:^|\n)\s*(?:IV|V|III|II|I)\.\s*.*?(?=\n\s*(?:Identifique|Selecione|Escreva)\b|\Z)"
+        if roman else
+        r"(?ms)(?:^|\n)\s*[a-e]\)\s*.*?(?=\n\s*(?:Identifique|Selecione|Escreva)\b|\Z)"
+    )
+    for key in ("statement", "statementPlain", "statementLatex", "statementFormatted", "statementPlainFormatted", "statementLatexFormatted"):
+        value = q.get(key)
+        if not isinstance(value, str):
+            continue
+        cleaned = re.sub(pattern, "\n", value)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        if cleaned:
+            q[key] = cleaned
+
+
+def _repair_history_text_typos(output: dict) -> None:
+    for q in output.get("questions", []):
+        context = _combined_question_text(q).lower()
+        if "estética" not in context and "estetica" not in context and "arte" not in context:
+            continue
+        for blank in q.get("blanks") or []:
+            for opt in blank.get("options") or []:
+                text = opt.get("text")
+                if isinstance(text, str):
+                    opt["text"] = re.sub(r"\bclassista\b", "classicista", text, flags=re.IGNORECASE)
+
+
+def _normalize_source_labels(output: dict) -> None:
+    for source in output.get("sources", []):
+        label = source.get("label")
+        if isinstance(label, str):
+            source["label"] = re.sub(r"\s*\(linhas?\s+\d+\s*[-–]\s*\d+\)\s*$", "", label, flags=re.IGNORECASE).strip()
+
+
+def _repair_known_history_points(output: dict) -> None:
+    metadata = output.get("metadata") or {}
+    year = str(metadata.get("year") or "")
+    phase = str(metadata.get("phase") or "").lower()
+    subject = str(metadata.get("subject") or "").lower()
+    if year != "2024" or "2" not in phase or "hist" not in subject:
+        return
+
+    canonical = {
+        ("grupo_iv", "1"): 14,
+        ("grupo_iv", "2"): 14,
+        ("grupo_iv", "3"): 20,
+        ("grupo_iv", "4"): 14,
+        ("grupo_iv", "5"): 22,
+    }
+    repaired = 0
+    for q in output.get("questions", []):
+        key = (str(q.get("groupId") or ""), str(q.get("number") or ""))
+        if key in canonical and q.get("points") != canonical[key]:
+            q["points"] = canonical[key]
+            repaired += 1
+    if repaired:
+        output.setdefault("warnings", []).append({
+            "type": "history_points_repaired",
+            "message": f"Repaired {repaired} História point value(s) from canonical scoring.",
         })
 
 
