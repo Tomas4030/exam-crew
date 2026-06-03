@@ -1,8 +1,8 @@
 import { spawn } from 'child_process';
 import path from 'path';
 import os from 'os';
-import { writeFileSync } from 'fs';
-import { ProcessResult } from './types';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { ExamStatus, ProcessResult } from './types';
 
 const PROGRESS_DIR = path.join(process.cwd(), 'data');
 
@@ -22,12 +22,34 @@ const PIPELINE_STEPS = [
   { id: 'math_normalize', label: 'Normalizar fórmulas', pct: 85 },
   { id: 'validate', label: 'Validar', pct: 90 },
   { id: 'retry', label: 'Recuperar perguntas', pct: 93 },
+  { id: 'audit', label: 'Auditar resultado', pct: 96 },
+  { id: 'audit_retry', label: 'Corrigir auditoria', pct: 97 },
   { id: 'done', label: 'Concluído', pct: 100 },
 ];
 
 function writeProgress(examId: string, progress: object) {
   const file = path.join(PROGRESS_DIR, `progress_${examId}.json`);
   try { writeFileSync(file, JSON.stringify(progress)); } catch {}
+}
+
+function readFinalStatus(examId: string): ExamStatus {
+  const file = path.join(process.cwd(), 'data', 'output', `${examId}.json`);
+  if (!existsSync(file)) return 'completed';
+
+  try {
+    const data = JSON.parse(readFileSync(file, 'utf8'));
+    const status = data.processingStatus;
+    if (
+      status === 'completed' ||
+      status === 'completed_with_warnings' ||
+      status === 'needs_review' ||
+      status === 'partial_failed'
+    ) {
+      return status;
+    }
+  } catch {}
+
+  return 'completed';
 }
 
 export function runPipeline(pdfPath: string, examId: string): Promise<ProcessResult> {
@@ -96,14 +118,15 @@ export function runPipeline(pdfPath: string, examId: string): Promise<ProcessRes
       console.log(`[Pipeline] ${examId} exited with code ${code}`);
 
       if (code === 0) {
+        const finalStatus = readFinalStatus(examId);
         writeProgress(examId, {
           step: 'done',
           label: 'Concluído',
           pct: 100,
-          message: '',
+          message: finalStatus === 'completed' ? '' : `Estado final: ${finalStatus}`,
         });
 
-        resolve({ success: true, examId });
+        resolve({ success: true, examId, status: finalStatus });
       } else {
         const errorMessage =
           lastProgressError ||

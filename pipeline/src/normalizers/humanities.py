@@ -14,6 +14,7 @@ from pathlib import Path
 from PIL import Image
 
 from ..config import OUTPUT_DIR
+from ..utils.doc_refs import doc_nums_from_source_refs, resolve_doc_numbers
 from ..utils.multiblank import repair_multiblank_question_from_page
 
 
@@ -28,9 +29,24 @@ _DOC_CHILD_RE = re.compile(
 )
 # "documento 1", "documentos 2 e 3", "documentos 1, 2 e 3"
 _DOC_REF_RE = re.compile(r'\bdocumentos?\s+((?:\d+[\s,;e]+)*\d+)', re.IGNORECASE)
-# "cada um dos documentos" / "dos documentos apresentados"
+# "documentos 1 a 5" / "documentos de 1 a 4" / "docs. 1-4"
+_RANGE_RE = re.compile(
+    r'\bdocumentos?\s+(?:de\s+)?(\d+)\s*(?:a|ao|-|–)\s*(\d+)\b',
+    re.IGNORECASE,
+)
+# "a partir dos documentos de 1 a N" — range na mesma frase
+_RANGE_FROM_RE = re.compile(
+    r'a\s+partir\s+dos\s+documentos\s+de\s+(\d+)\s+a\s+(\d+)',
+    re.IGNORECASE,
+)
+# "cada um dos documentos" / "dos documentos apresentados" / "dados disponíveis nos documentos"
 _ALL_DOCS_RE = re.compile(
-    r'cada um dos documentos|dos documentos apresentados|dos dois documentos|dos três documentos',
+    r'cada um dos documentos'
+    r'|dos documentos apresentados'
+    r'|dos dois documentos'
+    r'|dos tr[eê]s documentos'
+    r'|dados dispon[ií]veis nos documentos'
+    r'|a partir dos documentos(?!\s+de\s+\d)',  # "a partir dos documentos" sem range
     re.IGNORECASE,
 )
 
@@ -43,6 +59,7 @@ def normalize_humanities(output: dict, extraction: dict | None = None) -> dict:
 
     _ensure_virtual_children(sources, assets)
     _generate_full_source_crop_grupo_i(output, extraction, exam_id)
+    _generate_label_based_document_crops(output, extraction, exam_id)
     _generate_child_crops(output, extraction, exam_id)
     _attach_intro_group_visuals(output, extraction, exam_id)
     _attach_implicit_group_i_document(output, extraction)
@@ -194,6 +211,164 @@ def _generate_full_source_crop_grupo_i(output: dict, extraction: dict | None, ex
 # CHILD CROPS FOR CONJUNTO DOCUMENTAL
 # ══════════════════════════════════════════════════════════════════
 
+def _generate_label_based_document_crops(output: dict, extraction: dict | None, exam_id: str) -> None:
+    """Split multiple Documento N sources on the same page using label positions."""
+    if not extraction or not exam_id:
+        return
+
+    pages = {p.get("page"): p for p in extraction.get("pages", []) if isinstance(p, dict)}
+    sources_by_page: dict[tuple[str, int], list[dict]] = {}
+
+    for source in output.get("sources", []):
+        page_num = source.get("pageStart")
+        group_id = source.get("groupId")
+        doc_num = _doc_num_from_source(source)
+        if not page_num or not group_id or doc_num is None:
+            continue
+        sources_by_page.setdefault((group_id, int(page_num)), []).append(source)
+
+    for (_group_id, page_num), sources in sources_by_page.items():
+        if len(sources) < 2:
+            continue
+
+        page = pages.get(page_num)
+        page_image_path = page.get("page_image_path") if page else None
+        if not page or not page_image_path or not Path(page_image_path).exists():
+            continue
+
+        labels = _find_document_label_blocks(page, {_doc_num_from_source(s) for s in sources})
+        if len(labels) < 2:
+            continue
+
+        try:
+            img = Image.open(page_image_path)
+        except Exception:
+            continue
+
+        output_base = OUTPUT_DIR / exam_id
+        sources_dir = output_base / "assets" / "sources"
+        sources_dir.mkdir(parents=True, exist_ok=True)
+
+        for source in sources:
+            doc_num = _doc_num_from_source(source)
+            label = labels.get(doc_num)
+            if not label:
+                continue
+
+            crop_box = _document_crop_box_from_labels(img.size, label, labels, page)
+            if not crop_box:
+                continue
+
+            cropped = img.crop(crop_box)
+            if cropped.width < 80 or cropped.height < 80:
+                continue
+
+            filename = f"{source['sourceId']}_full.png"
+            path = sources_dir / filename
+            cropped.save(path)
+
+            crop_info = {
+                "status": "success",
+                "method": "history_document_label_split",
+                "relativePath": f"assets/sources/{filename}",
+                "url": f"/api/exams/{exam_id}/assets/sources/{filename}",
+                "width": cropped.width,
+                "height": cropped.height,
+            }
+            crops = source.setdefault("crops", {})
+            crops["full"] = crop_info
+            crops["best"] = crop_info
+
+
+def _doc_num_from_source(source: dict) -> int | None:
+    match = re.search(r"_documento_(\d+)$", str(source.get("sourceId") or ""))
+    return int(match.group(1)) if match else None
+
+
+def _find_document_label_blocks(page: dict, wanted: set[int | None]) -> dict[int, dict]:
+    wanted_nums = {n for n in wanted if isinstance(n, int)}
+    labels: dict[int, dict] = {}
+
+    for block in page.get("blocks") or []:
+        text = " ".join(str(block.get("text") or "").split())
+        match = re.search(r"\bDocumento\s+(\d+)\b", text, re.IGNORECASE)
+        bbox = block.get("bbox") or []
+        if not match or len(bbox) != 4:
+            continue
+        doc_num = int(match.group(1))
+        if wanted_nums and doc_num not in wanted_nums:
+            continue
+        labels[doc_num] = {"docNum": doc_num, "bbox": [float(v) for v in bbox]}
+
+    return labels
+
+
+def _document_crop_box_from_labels(
+    image_size: tuple[int, int],
+    label: dict,
+    labels: dict[int, dict],
+    page: dict,
+) -> tuple[int, int, int, int] | None:
+    img_w, img_h = image_size
+    label_bbox = label.get("bbox") or []
+    if len(label_bbox) != 4:
+        return None
+
+    all_boxes = [l["bbox"] for l in labels.values() if len(l.get("bbox") or []) == 4]
+    if not all_boxes:
+        return None
+
+    page_w = max([595.0] + [b[2] for b in all_boxes])
+    page_h = max([842.0] + [b[3] for b in all_boxes])
+    scale_x = img_w / page_w
+    scale_y = img_h / page_h
+
+    x0, y0, x1, _y1 = label_bbox
+    centers_x = [(b[0] + b[2]) / 2 for b in all_boxes]
+    centers_y = [(b[1] + b[3]) / 2 for b in all_boxes]
+    same_row = (max(centers_y) - min(centers_y) < 55) and (max(centers_x) - min(centers_x) > page_w * 0.22)
+
+    top = max(0.0, y0 - 12)
+    bottom = _first_question_y_after(page, y0) or (page_h * 0.94)
+
+    if same_row:
+        ordered = sorted(all_boxes, key=lambda b: (b[0] + b[2]) / 2)
+        idx = ordered.index(label_bbox)
+        left = 0.0 if idx == 0 else ((ordered[idx - 1][2] + x0) / 2)
+        right = page_w if idx == len(ordered) - 1 else ((x1 + ordered[idx + 1][0]) / 2)
+        left = max(0.0, left - page_w * 0.035)
+        right = min(page_w, right + page_w * 0.035)
+    else:
+        ordered = sorted(all_boxes, key=lambda b: (b[1], b[0]))
+        idx = ordered.index(label_bbox)
+        left = page_w * 0.025
+        right = page_w * 0.985
+        if idx < len(ordered) - 1:
+            bottom = min(bottom, max(top + 35, ordered[idx + 1][1] - 8))
+
+    px_box = (
+        max(0, int(left * scale_x)),
+        max(0, int(top * scale_y)),
+        min(img_w, int(right * scale_x)),
+        min(img_h, int(bottom * scale_y)),
+    )
+    if px_box[2] <= px_box[0] or px_box[3] <= px_box[1]:
+        return None
+    return px_box
+
+
+def _first_question_y_after(page: dict, y_start: float) -> float | None:
+    candidates = []
+    for block in page.get("blocks") or []:
+        text = str(block.get("text") or "").strip()
+        bbox = block.get("bbox") or []
+        if len(bbox) != 4 or float(bbox[1]) <= y_start:
+            continue
+        if re.match(r"^\d{1,2}\.\s+", text):
+            candidates.append(float(bbox[1]))
+    return min(candidates) - 10 if candidates else None
+
+
 def _generate_child_crops(output: dict, extraction: dict | None, exam_id: str):
     """For sources labeled 'conjunto documental', split into A/B/C/D child crops."""
     output_base = OUTPUT_DIR / exam_id
@@ -262,6 +437,7 @@ def _create_child_crops_from_asset_refs(
     asset_refs = source.get("assetRefs") or []
     if len(asset_refs) < 4:
         return {}
+    asset_refs = sorted(asset_refs, key=lambda aid: _asset_position_key(assets_map.get(aid) or {}))
 
     exam_id = output.get("exam_id", "")
     sources_dir = output_base / "assets" / "sources"
@@ -313,16 +489,32 @@ def _create_child_crops_from_asset_refs(
     return child_crops
 
 
+def _asset_position_key(asset: dict) -> tuple[float, float, str]:
+    bbox = asset.get("bbox") or asset.get("bbox_estimate") or {}
+    if isinstance(bbox, dict):
+        y = float(bbox.get("y", bbox.get("y_pct", 9999)) or 9999)
+        x = float(bbox.get("x", bbox.get("x_pct", 9999)) or 9999)
+    elif isinstance(bbox, (list, tuple)) and len(bbox) >= 2:
+        x = float(bbox[0])
+        y = float(bbox[1])
+    else:
+        x = 9999.0
+        y = 9999.0
+    return (y, x, str(asset.get("id") or ""))
+
+
 def _quadrant_boxes(size: tuple[int, int]) -> dict[str, tuple[int, int, int, int]]:
     """Split image into 4 quadrants. C/D start lower to avoid A/B legends."""
     w, h = size
     mid_x = w // 2
     overlap = int(w * 0.018)
+    top_bottom = int(h * 0.36)
+    lower_top = int(h * 0.36)
     return {
-        "A": (0,                      int(h * 0.04), min(w, mid_x + overlap), int(h * 0.43)),
-        "B": (max(0, mid_x - overlap), int(h * 0.04), w,                      int(h * 0.43)),
-        "C": (0,                      int(h * 0.47), min(w, mid_x + overlap), int(h * 0.86)),
-        "D": (max(0, mid_x - overlap), int(h * 0.47), w,                      int(h * 0.86)),
+        "A": (0,                       int(h * 0.04), min(w, mid_x + overlap), top_bottom),
+        "B": (max(0, mid_x - overlap), int(h * 0.04), w,                       top_bottom),
+        "C": (0,                       lower_top,      min(w, mid_x + overlap), int(h * 0.86)),
+        "D": (max(0, mid_x - overlap), lower_top,      w,                       int(h * 0.86)),
     }
 
 
@@ -552,6 +744,11 @@ def _repair_document_refs(output: dict) -> None:
     group_sources: dict[str, list[dict]] = defaultdict(list)
     for s in sources:
         group_sources[s.get("groupId", "")].append(s)
+    group_doc_nums: dict[str, list[int]] = defaultdict(list)
+    for s in sources:
+        m = re.search(r'_(\d+)$', s.get("sourceId", ""))
+        if m:
+            group_doc_nums[s.get("groupId", "")].append(int(m.group(1)))
 
     for q in output.get("questions", []):
         text = f"{q.get('statement', '')} {q.get('rawText', '')}"
@@ -563,10 +760,29 @@ def _repair_document_refs(output: dict) -> None:
         if not group_id:
             continue
 
+        expected_docs = resolve_doc_numbers(text, sorted(group_doc_nums.get(group_id, [])))
         new_refs = _parse_refs_from_text(text, group_id, source_index, group_sources)
         if new_refs:
             q["sourceRefs"] = _dedupe_refs(new_refs)
             q["visualDependency"] = True
+            actual_docs = set(doc_nums_from_source_refs(q["sourceRefs"]))
+            missing = sorted(set(expected_docs) - actual_docs)
+            if missing:
+                q.setdefault("warnings", []).append({
+                    "type": "missing_required_documents",
+                    "message": f"Question references document(s) {expected_docs}, but sourceRefs are missing {missing}.",
+                    "expected": expected_docs,
+                    "actual": sorted(actual_docs),
+                })
+                q["needsHumanReview"] = True
+        elif expected_docs:
+            q.setdefault("warnings", []).append({
+                "type": "missing_required_documents",
+                "message": f"Question references document(s) {expected_docs}, but no matching sources were found in {group_id}.",
+                "expected": expected_docs,
+                "actual": [],
+            })
+            q["needsHumanReview"] = True
 
 
 def _parse_refs_from_text(text: str, group_id: str, source_index: dict,
@@ -595,6 +811,15 @@ def _parse_refs_from_text(text: str, group_id: str, source_index: dict,
         for s in group_sources.get(group_id, []):
             refs.append({"sourceId": s["sourceId"], "childId": None, "mode": "full_group"})
         return refs
+
+    group_doc_nums = []
+    for source in group_sources.get(group_id, []):
+        m = re.search(r'_(\d+)$', source.get("sourceId", ""))
+        if m:
+            group_doc_nums.append(int(m.group(1)))
+    resolved_doc_nums = resolve_doc_numbers(text, sorted(group_doc_nums))
+    if resolved_doc_nums:
+        all_doc_nums = {str(n) for n in resolved_doc_nums}
 
     if not all_doc_nums:
         return []

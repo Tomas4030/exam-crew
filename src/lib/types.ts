@@ -1,4 +1,12 @@
-export type ExamStatus = 'queued' | 'pending' | 'processing' | 'completed' | 'error';
+export type ExamStatus =
+  | 'queued'
+  | 'pending'
+  | 'processing'
+  | 'completed'
+  | 'completed_with_warnings'
+  | 'needs_review'
+  | 'partial_failed'
+  | 'error';
 
 export interface ExamJob {
   id: string;
@@ -15,6 +23,7 @@ export interface ExamJob {
 export interface ProcessResult {
   success: boolean;
   examId: string;
+  status?: ExamStatus;
   error?: string;
 }
 

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from __future__ import annotations
-
 import re
 
 from .multiblank import repair_multiblank_question_from_page
@@ -10,7 +8,7 @@ from .multiblank import repair_multiblank_question_from_page
 QUESTION_START_RE = re.compile(
     r"(?m)^\s*(\d{1,2})(?:\.)\s+(.+)"
 )
-LETTER_MARKER_RE = re.compile(r"\b([a-f])\)\s*_*\b", re.IGNORECASE)
+LETTER_MARKER_RE = re.compile(r"\b([a-f])\)\s*_*", re.IGNORECASE)
 TABLE_HEADER_RE = re.compile(r"^\s*([a-f])\)\s*$", re.IGNORECASE)
 TABLE_OPTION_RE = re.compile(r"^\s*(\d{1,2})[.)]?\s+(.+?)\s*$")
 
@@ -27,6 +25,23 @@ def _extract_multiple_choice_options(block: str) -> list[dict]:
         if text and not any(o.get("letter") == letter for o in options):
             options.append({"letter": letter, "text": text})
     return options if len(options) >= 2 else []
+
+
+def _strip_scoring_tail(text: str) -> str:
+    value = text or ""
+    patterns = [
+        r"(?im)^\s*FIM\s*$",
+        r"(?im)^\s*COTA[ÇC][ÕO]ES\b",
+        r"(?im)^\s*Cotacoes\b",
+    ]
+    cut_positions = []
+    for pattern in patterns:
+        match = re.search(pattern, value)
+        if match:
+            cut_positions.append(match.start())
+    if cut_positions:
+        return value[:min(cut_positions)].strip()
+    return value
 
 
 def extract_questions_from_text_pages(extraction: dict, subject_profile: dict | None = None) -> list[dict]:
@@ -62,7 +77,11 @@ def extract_questions_from_text_pages(extraction: dict, subject_profile: dict | 
             and ("grupo" in lowered or "subtotal" in lowered)
         )
         if is_scoring:
-            continue
+            question_part = _strip_scoring_tail(text)
+            if not QUESTION_START_RE.search(question_part):
+                continue
+            text = question_part
+            lowered = text.lower()
 
         matches = list(QUESTION_START_RE.finditer(text))
 
@@ -140,6 +159,81 @@ def extract_questions_from_text_pages(extraction: dict, subject_profile: dict | 
     return deduped
 
 
+def repair_corrupt_questions_from_text(output: dict, extraction: dict) -> int:
+    """Replace visibly corrupted model text with native PDF text for same page/number.
+
+    The VLM sometimes returns Portuguese text with mojibake-style '?' characters
+    (e.g. "op??o", "econ?mico"). Native PDF text is usually clean, so use it
+    as an automatic repair source without changing media/source associations.
+    """
+    if not output.get("questions") or not extraction:
+        return 0
+
+    fallback_questions = extract_questions_from_text_pages(extraction)
+    fallback_by_key = {
+        (q.get("sourcePage"), str(q.get("number", "")).strip()): q
+        for q in fallback_questions
+    }
+
+    repaired = 0
+    for q in output.get("questions", []):
+        key = (q.get("sourcePage"), str(q.get("number", "")).strip())
+        fallback = fallback_by_key.get(key)
+        if not fallback:
+            continue
+
+        current_text = str(q.get("statement") or "")
+        replacement_text = str(fallback.get("statement") or "")
+        if not _should_replace_corrupt_text(current_text, replacement_text):
+            continue
+
+        q["statementRaw"] = q.get("statementRaw") or current_text
+        q["statement"] = replacement_text
+        q["rawText"] = fallback.get("rawText") or replacement_text
+
+        if fallback.get("options"):
+            q["options"] = fallback["options"]
+        if fallback.get("blanks"):
+            q["blanks"] = fallback["blanks"]
+        if fallback.get("type") in {"multiple_choice", "multi_blank_choice"}:
+            q["type"] = fallback["type"]
+
+        q.setdefault("warnings", []).append({
+            "type": "corrupt_text_repaired_from_pdf",
+            "message": "Question text was replaced with native PDF text because model text contained corrupted characters.",
+        })
+        repaired += 1
+
+    if repaired:
+        output.setdefault("warnings", []).append({
+            "type": "corrupt_text_repaired_from_pdf",
+            "message": f"Repaired {repaired} question statement(s) using native PDF text.",
+        })
+        output["needsHumanReview"] = True
+
+    return repaired
+
+
+def _should_replace_corrupt_text(current: str, replacement: str) -> bool:
+    if not current or not replacement:
+        return False
+    if len(replacement) < 40:
+        return False
+    if replacement.count("?") > max(1, current.count("?") // 2):
+        return False
+
+    qmarks = current.count("?")
+    if qmarks < 2:
+        return False
+
+    current_words = max(1, len(re.findall(r"\w+", current)))
+    replacement_words = max(1, len(re.findall(r"\w+", replacement)))
+    if replacement_words < current_words * 0.45:
+        return False
+
+    return (qmarks / current_words) >= 0.015 or qmarks >= 4
+
+
 def _looks_like_multi_blank_choice(block: str) -> bool:
     lowered = block.lower()
     if "opcao adequada para cada espaco" in lowered:
@@ -166,7 +260,7 @@ def _extract_blanks_from_page(page: dict, block: str) -> list[dict]:
     letters = sorted(set(m.lower() for m in LETTER_MARKER_RE.findall(block)))
     if not letters:
         letters = ["a", "b", "c", "d"]
-    return [{"blankId": letter, "label": f"{letter})", "options": []} for letter in letters]
+    return [{"number": f"{letter})", "options": []} for letter in letters]
 
 
 def _extract_blanks_from_tables(tables: list) -> list[dict]:
@@ -189,7 +283,7 @@ def _extract_blanks_from_tables(tables: list) -> list[dict]:
             continue
 
         for letter in col_map.values():
-            merged.setdefault(letter, {"blankId": letter, "label": f"{letter})", "options": []})
+            merged.setdefault(letter, {"number": f"{letter})", "options": []})
 
         for row in rows[1:]:
             for col_idx, letter in col_map.items():
@@ -203,13 +297,8 @@ def _extract_blanks_from_tables(tables: list) -> list[dict]:
                 option_text = m_opt.group(2).strip()
                 if not option_text:
                     continue
-                option_id = f"{letter}{option_no}"
-                if not any(o.get("id") == option_id for o in merged[letter]["options"]):
-                    merged[letter]["options"].append({
-                        "id": option_id,
-                        "label": option_no,
-                        "text": option_text,
-                    })
+                if not any(o.get("letter") == option_no for o in merged[letter]["options"]):
+                    merged[letter]["options"].append({"letter": option_no, "text": option_text})
 
     if not merged:
         return []
@@ -217,7 +306,7 @@ def _extract_blanks_from_tables(tables: list) -> list[dict]:
     ordered = []
     for letter in sorted(merged.keys()):
         item = merged[letter]
-        item["options"].sort(key=lambda o: int(o.get("label", "0")))
+        item["options"].sort(key=lambda o: int(o.get("letter", "0")))
         ordered.append(item)
     return ordered
 
@@ -236,8 +325,7 @@ def _extract_blanks_from_text(block: str) -> list[dict]:
         if letter_match:
             current_letter = letter_match.group(1).lower()
             blanks.setdefault(current_letter, {
-                "blankId": current_letter,
-                "label": f"{current_letter})",
+                "number": f"{current_letter})",
                 "options": [],
             })
             continue
@@ -254,13 +342,8 @@ def _extract_blanks_from_text(block: str) -> list[dict]:
         if not opt_text:
             continue
 
-        option_id = f"{current_letter}{opt_no}"
-        if not any(o.get("id") == option_id for o in blanks[current_letter]["options"]):
-            blanks[current_letter]["options"].append({
-                "id": option_id,
-                "label": opt_no,
-                "text": opt_text,
-            })
+        if not any(o.get("letter") == opt_no for o in blanks[current_letter]["options"]):
+            blanks[current_letter]["options"].append({"letter": opt_no, "text": opt_text})
 
     if not blanks:
         return []
@@ -268,7 +351,7 @@ def _extract_blanks_from_text(block: str) -> list[dict]:
     ordered = []
     for letter in sorted(blanks.keys()):
         item = blanks[letter]
-        item["options"].sort(key=lambda o: int(o.get("label", "0")))
+        item["options"].sort(key=lambda o: int(o.get("letter", "0")))
         ordered.append(item)
     return ordered
 

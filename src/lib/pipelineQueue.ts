@@ -24,7 +24,7 @@ async function runNext() {
       await updateJob(item.examId, { status: "processing" });
       const result = await runPipeline(item.pdfPath, item.examId);
       await updateJob(item.examId, result.success
-        ? { status: "completed" }
+        ? { status: result.status || "completed" }
         : { status: "error", error: result.error || "Pipeline failed" }
       );
     }

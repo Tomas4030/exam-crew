@@ -79,7 +79,7 @@ def extract_multiblank_options_from_page_text(page_text: str, markers: list[str]
     zone = compact[header.end():]
 
     # Parar antes da próxima pergunta.
-    next_q = re.search(r"\s+\d{1,2}\.\s+[A-ZÁÉÍÓÚÂÊÔÃÕÀÇ]", zone)
+    next_q = re.search(r"(?m)^\s+\d{1,2}\.\s+[A-ZÁÉÍÓÚÂÊÔÃÕÀÇ]", zone)
     if next_q:
         zone = zone[:next_q.start()]
 
@@ -91,15 +91,39 @@ def extract_multiblank_options_from_page_text(page_text: str, markers: list[str]
         if value and len(value) <= 90:
             cleaned.append({"letter": num, "text": value})
 
-    per_blank = 3
-    if len(cleaned) < len(markers) * per_blank:
+    marker_count = len(markers)
+    if len(cleaned) < marker_count * 2:
         return []
 
+    per_blank = len(cleaned) // marker_count
+    if per_blank < 2:
+        return []
+
+    numbers = [item["letter"] for item in cleaned[: marker_count * per_blank]]
+    row_wise = False
+    if len(numbers) >= marker_count * 2:
+        first_row = numbers[:marker_count]
+        second_row = numbers[marker_count: marker_count * 2]
+        row_wise = (
+            len(set(first_row)) == 1
+            and len(set(second_row)) == 1
+            and first_row[0] != second_row[0]
+        )
+
     blanks = []
-    idx = 0
-    for marker in markers:
-        blanks.append({"number": marker, "options": cleaned[idx: idx + per_blank]})
-        idx += per_blank
+    if row_wise:
+        for col_idx, marker in enumerate(markers):
+            options = []
+            for row_idx in range(per_blank):
+                item_idx = row_idx * marker_count + col_idx
+                if item_idx < len(cleaned):
+                    options.append(cleaned[item_idx])
+            blanks.append({"number": marker, "options": options})
+    else:
+        idx = 0
+        for marker in markers:
+            blanks.append({"number": marker, "options": cleaned[idx: idx + per_blank]})
+            idx += per_blank
     return blanks
 
 
@@ -142,7 +166,20 @@ def extract_multiblank_options_from_tables(page: dict, markers: list[str]) -> li
 def repair_multiblank_question_from_page(q: dict, page: dict) -> bool:
     text = f"{q.get('statement', '')}\n{q.get('rawText', '')}"
 
-    if q.get("type") == "multi_blank_choice" and q.get("blanks"):
+    existing_blanks = q.get("blanks") or []
+    has_valid_blanks = q.get("type") == "multi_blank_choice" and bool(existing_blanks)
+    if has_valid_blanks:
+        for blank in existing_blanks:
+            if not isinstance(blank, dict):
+                has_valid_blanks = False
+                break
+            if not blank.get("number"):
+                has_valid_blanks = False
+                break
+            if not isinstance(blank.get("options"), list) or not blank.get("options"):
+                has_valid_blanks = False
+                break
+    if has_valid_blanks:
         return False
 
     if not looks_like_multi_blank_choice(text):

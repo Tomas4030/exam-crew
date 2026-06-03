@@ -6,6 +6,8 @@ documents within each group, then assign questions, then resolve refs.
 import re
 from collections import defaultdict
 
+from .doc_refs import doc_nums_from_source_refs, resolve_doc_numbers
+
 
 # ── Patterns ──────────────────────────────────────────────────────
 _GROUP_PATTERN = re.compile(r'grupo\s+(I{1,3}V?|IV)\b', re.IGNORECASE)
@@ -251,11 +253,11 @@ def _detect_sources(assets: list[dict], questions: list[dict],
             # Find assets on this page — prefer embedded (clean PDF images)
             embedded = sorted(
                 [a for a in assets if a.get("page") == page and a.get("type") == "embedded_image"],
-                key=lambda a: a.get("id", "")
+                key=_asset_position_key
             )
             detected = sorted(
                 [a for a in assets if a.get("page") == page and a.get("type") != "embedded_image"],
-                key=lambda a: a.get("id", "")
+                key=_asset_position_key
             )
             all_page_assets = embedded if embedded else detected
 
@@ -266,10 +268,8 @@ def _detect_sources(assets: list[dict], questions: list[dict],
                 if len(all_page_assets) >= n_docs:
                     # Enough assets to split evenly
                     doc_idx = docs_on_page.index(doc_num)
-                    chunk_size = max(1, len(all_page_assets) // n_docs)
-                    start = doc_idx * chunk_size
-                    end = start + chunk_size if doc_idx < n_docs - 1 else len(all_page_assets)
-                    page_assets = all_page_assets[start:end]
+                    ordered_assets = sorted(all_page_assets, key=_asset_position_key)
+                    page_assets = [ordered_assets[doc_idx]]
                 else:
                     # Fewer assets than documents — don't assign (use source.crops.full)
                     page_assets = []
@@ -283,7 +283,7 @@ def _detect_sources(assets: list[dict], questions: list[dict],
             # Multiple visual assets on same page → image_set with children
             if len(page_assets) > 1:
                 kind = "image_set"
-                for i, a in enumerate(sorted(page_assets, key=lambda x: x.get("id", ""))):
+                for i, a in enumerate(sorted(page_assets, key=_asset_position_key)):
                     letter = chr(ord('a') + i)
                     child_id = f"{source_id}_{letter}"
                     children.append(child_id)
@@ -331,6 +331,12 @@ def _resolve_scoped_refs(questions: list[dict], sources: list[dict]):
     for s in sources:
         group_sources[s["groupId"]].append(s)
 
+    group_doc_nums: dict[str, list[int]] = defaultdict(list)
+    for s in sources:
+        m = re.search(r'_(\d+)$', s["sourceId"])
+        if m:
+            group_doc_nums[s["groupId"]].append(int(m.group(1)))
+
     for q in questions:
         gid = q.get("groupId")
         if not gid:
@@ -357,6 +363,11 @@ def _resolve_scoped_refs(questions: list[dict], sources: list[dict]):
             for s in group_sources.get(gid, []):
                 source_refs.append({"sourceId": s["sourceId"], "childId": None, "mode": "full_group"})
 
+        resolved_doc_nums = resolve_doc_numbers(text, sorted(group_doc_nums.get(gid, [])))
+        if resolved_doc_nums:
+            source_refs = []
+            doc_nums = {str(n) for n in resolved_doc_nums}
+
         child_letters = [c.upper() for c in _CHILD_REF_PATTERN.findall(text)]
 
         for doc_num in sorted(doc_nums):
@@ -382,6 +393,27 @@ def _resolve_scoped_refs(questions: list[dict], sources: list[dict]):
 
         if source_refs:
             q["sourceRefs"] = source_refs
+            expected = resolve_doc_numbers(text, sorted(group_doc_nums.get(gid, [])))
+            actual = set(doc_nums_from_source_refs(source_refs))
+            missing = sorted(set(expected) - actual)
+            if missing:
+                q.setdefault("warnings", []).append({
+                    "type": "missing_required_documents",
+                    "message": f"Question references document(s) {expected}, but sourceRefs are missing {missing}.",
+                    "expected": expected,
+                    "actual": sorted(actual),
+                })
+                q["needsHumanReview"] = True
+        else:
+            expected = resolve_doc_numbers(text, sorted(group_doc_nums.get(gid, [])))
+            if expected:
+                q.setdefault("warnings", []).append({
+                    "type": "missing_required_documents",
+                    "message": f"Question references document(s) {expected}, but no matching sources were found in {gid}.",
+                    "expected": expected,
+                    "actual": [],
+                })
+                q["needsHumanReview"] = True
 
     # Fallback: if a group has exactly 1 source and questions have no refs, auto-associate
     group_sources = defaultdict(list)
@@ -392,6 +424,12 @@ def _resolve_scoped_refs(questions: list[dict], sources: list[dict]):
         if q.get("sourceRefs"):
             continue
         gid = q.get("groupId")
+        expected_docs = resolve_doc_numbers(
+            q.get("statement") or "",
+            sorted(group_doc_nums.get(gid, [])),
+        ) if gid else []
+        if expected_docs:
+            continue
         if gid and len(group_sources.get(gid, [])) == 1:
             sole_source = group_sources[gid][0]
             q["sourceRefs"] = [{"sourceId": sole_source["sourceId"], "childId": None, "mode": "full_group"}]
@@ -432,6 +470,20 @@ def _simple_source_grouping(output: dict, assets: list[dict], questions: list[di
 # ══════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════
+
+def _asset_position_key(asset: dict) -> tuple[float, float, str]:
+    bbox = asset.get("bbox") or asset.get("bbox_estimate") or {}
+    if isinstance(bbox, dict):
+        y = float(bbox.get("y", bbox.get("y_pct", 9999)) or 9999)
+        x = float(bbox.get("x", bbox.get("x_pct", 9999)) or 9999)
+    elif isinstance(bbox, (list, tuple)) and len(bbox) >= 2:
+        x = float(bbox[0])
+        y = float(bbox[1])
+    else:
+        x = 9999.0
+        y = 9999.0
+    return (y, x, str(asset.get("id") or ""))
+
 
 def _infer_kind(assets: list[dict], page_text: str) -> str:
     """Infer document kind from assets and page text."""

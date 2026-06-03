@@ -24,6 +24,8 @@ const STEPS = [
   { id: 'crop', label: 'Cortar imagens' },
   { id: 'math_normalize', label: 'Normalizar fórmulas' },
   { id: 'validate', label: 'Validar' },
+  { id: 'audit', label: 'Auditar' },
+  { id: 'audit_retry', label: 'Corrigir' },
   { id: 'done', label: 'Concluído' },
 ];
 
@@ -35,7 +37,7 @@ export default function ProcessingStatus({ examId }: { examId: string }) {
     const fetchStatus = () =>
       fetch(`/api/exams/${examId}/status`).then(r => r.json()).then(d => {
         setData(d);
-        if (['completed', 'error', 'completed_with_warnings', 'needs_review'].includes(d.status)) {
+        if (['completed', 'error', 'completed_with_warnings', 'needs_review', 'partial_failed'].includes(d.status)) {
           clearInterval(interval);
         }
       }).catch(() => {});
@@ -46,7 +48,7 @@ export default function ProcessingStatus({ examId }: { examId: string }) {
 
   if (!data) return <div className="p-4 text-gray-500">A carregar...</div>;
 
-  if (data.status === 'completed' || data.status === 'completed_with_warnings' || data.status === 'needs_review') {
+  if (data.status === 'completed' || data.status === 'completed_with_warnings') {
     return (
       <div className="p-4 border border-green-200 bg-green-50 rounded-lg">
         <div className="flex items-center gap-2">
@@ -55,6 +57,20 @@ export default function ProcessingStatus({ examId }: { examId: string }) {
           </svg>
           <span className="font-semibold text-green-800">Processamento concluído</span>
         </div>
+      </div>
+    );
+  }
+
+  if (data.status === 'needs_review' || data.status === 'partial_failed') {
+    return (
+      <div className="p-4 border border-amber-200 bg-amber-50 rounded-lg">
+        <div className="flex items-center gap-2">
+          <svg className="w-5 h-5 text-amber-600" fill="currentColor" viewBox="0 0 20 20">
+            <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l6.518 11.59c.75 1.334-.214 2.985-1.742 2.985H3.48c-1.528 0-2.492-1.65-1.742-2.985l6.518-11.59zM11 14a1 1 0 10-2 0 1 1 0 002 0zm-1-2a1 1 0 01-1-1V7a1 1 0 112 0v4a1 1 0 01-1 1z" clipRule="evenodd" />
+          </svg>
+          <span className="font-semibold text-amber-800">Revisao necessaria</span>
+        </div>
+        {data.progress?.message && <p className="mt-1 text-sm text-amber-700">{data.progress.message}</p>}
       </div>
     );
   }

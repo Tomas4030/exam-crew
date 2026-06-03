@@ -123,17 +123,27 @@ def segment_questions(ir: DocumentIR, skip_pages: set[int] | None = None) -> Seg
                 continue
 
     # Build candidates with regions
-    seen_numbers: set[str] = set()
+    anchor_scopes: list[str | None] = []
+    current_group: str | None = None
+    for _page, number, _block, method in anchors:
+        if method == "group":
+            current_group = number
+        anchor_scopes.append(current_group)
+
+    seen_numbers: set[tuple[str | None, str]] = set()
     for i, (page, number, block, method) in enumerate(anchors):
-        if number in seen_numbers:
+        scope = anchor_scopes[i]
+        key = (scope, number)
+        if key in seen_numbers:
             # Duplicate — lower confidence
             result.warnings.append({
                 "type": "duplicate_anchor",
                 "number": number,
                 "page": page,
+                "scope": scope,
             })
             continue
-        seen_numbers.add(number)
+        seen_numbers.add(key)
 
         # Region: from this anchor to the next anchor on the same page,
         # or to the bottom of the page

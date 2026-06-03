@@ -240,7 +240,7 @@ Text:
 
         # Fallback textual se a visão/assemble não extraiu perguntas
         if not output.get("questions"):
-            from .utils.text_question_fallback import extract_questions_from_text_pages
+            from .utils.text_question_fallback import extract_questions_from_text_pages, repair_corrupt_questions_from_text
 
             fallback_questions = extract_questions_from_text_pages(extraction, subject_profile)
 
@@ -259,6 +259,43 @@ Text:
                 })
                 output["status"] = "partial_failed"
                 output["needsHumanReview"] = True
+
+            repaired_text = repair_corrupt_questions_from_text(output, extraction)
+            if repaired_text:
+                report_progress("normalize", f"Repaired {repaired_text} corrupted question text(s) from native PDF text")
+        else:
+            from .utils.text_question_fallback import extract_questions_from_text_pages, repair_corrupt_questions_from_text
+
+            fallback_questions = extract_questions_from_text_pages(extraction, subject_profile)
+            existing = {
+                (q.get("sourcePage"), str(q.get("number", "")).strip())
+                for q in output.get("questions", [])
+            }
+            recovered = []
+            for q in fallback_questions:
+                key = (q.get("sourcePage"), str(q.get("number", "")).strip())
+                if key in existing:
+                    continue
+                recovered.append(q)
+                existing.add(key)
+
+            if recovered:
+                output.setdefault("questions", []).extend(recovered)
+                output["questions"].sort(key=lambda q: (
+                    q.get("sourcePage") or 999,
+                    int(str(q.get("number") or "999").split(".", 1)[0]) if str(q.get("number") or "").split(".", 1)[0].isdigit() else 999,
+                    str(q.get("number") or ""),
+                ))
+                output.setdefault("warnings", []).append({
+                    "type": "partial_text_fallback_used",
+                    "message": f"Recovered {len(recovered)} question(s) missing from vision output using extracted PDF text.",
+                })
+                output["needsHumanReview"] = True
+                report_progress("retry", f"Recovered {len(recovered)} missing question(s) using text fallback")
+
+            repaired_text = repair_corrupt_questions_from_text(output, extraction)
+            if repaired_text:
+                report_progress("normalize", f"Repaired {repaired_text} corrupted question text(s) from native PDF text")
 
         # Step 3.2: Extract table data for tables without rows
         from .tools.vision_tool import _extract_table_data
@@ -366,6 +403,50 @@ Text:
         # Step 4.92: remove broken asset/media references before final save
         output = enforce_asset_integrity(output, self.output_dir)
 
+        # Step 4.94: Subject-specific audit gate before any "done" status.
+        from .utils.history_audit import apply_history_audit_gate
+        max_audit_retries = 2
+        history_audit_issues = []
+        history_audit_summary = {"verdict": "SKIPPED"}
+        for audit_attempt in range(max_audit_retries + 1):
+            report_progress("audit", f"Running Historia quality audit (attempt {audit_attempt + 1})")
+            output, history_audit_issues, history_audit_summary = apply_history_audit_gate(
+                output,
+                self.output_dir / self.exam_id,
+            )
+            if history_audit_summary.get("verdict") != "FAIL":
+                break
+            if audit_attempt >= max_audit_retries:
+                break
+
+            retryable = self._retryable_history_audit_issues(history_audit_issues)
+            if not retryable:
+                break
+
+            report_progress(
+                "audit_retry",
+                f"Retrying deterministic repairs for {len(retryable)} Historia audit issue(s)",
+            )
+            output = self._repair_history_audit_issues(
+                output,
+                extraction,
+                subject_profile,
+                retryable,
+            )
+            output.setdefault("metadata", {})["historyAuditRetries"] = audit_attempt + 1
+
+        if history_audit_summary.get("verdict") == "FAIL":
+            out_file = self.output_dir / f"{self.exam_id}.json"
+            out_file.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+            top = history_audit_issues[0].code if history_audit_issues else "UNKNOWN"
+            message = (
+                "Historia audit failed before completion: "
+                f"{history_audit_summary.get('blocker', 0)} blocker(s), "
+                f"{history_audit_summary.get('high', 0)} high issue(s). Top issue: {top}."
+            )
+            report_progress("error", message)
+            raise RuntimeError(message)
+
         # Step 4.95: Final quality gate
         question_count = len(output.get("questions") or [])
 
@@ -392,6 +473,108 @@ Text:
         out_file = self.output_dir / f"{self.exam_id}.json"
         out_file.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
         report_progress("done", f"Saved to {out_file}")
+        return output
+
+    def _retryable_history_audit_issues(self, issues: list) -> list:
+        retryable_codes = {
+            "GROUP_NUMBER_GAP",
+            "CORRUPT_TEXT",
+            "MULTIPLE_CHOICE_WITHOUT_OPTIONS",
+            "MULTIBLANK_WITHOUT_OPTIONS",
+            "MULTIBLANK_MISCLASSIFIED",
+            "CHOICE_LIKE_OPEN_ANSWER",
+            "BROKEN_SOURCE_REF",
+            "BROKEN_CHILD_REF",
+            "CROSS_GROUP_SOURCE_REF",
+            "SOURCE_REFS_WITHOUT_MEDIA",
+            "MENTIONS_SOURCE_WITHOUT_REF",
+            "MISSING_EXPECTED_DOCUMENTS",
+            "MISSING_MEDIA_FILE",
+            "MISSING_SOURCE_CROP_FILE",
+            "MISSING_CHILD_CROP_FILE",
+            "DUPLICATE_SOURCE_CROPS",
+        }
+        return [issue for issue in issues if getattr(issue, "code", "") in retryable_codes]
+
+    def _repair_history_audit_issues(
+        self,
+        output: dict,
+        extraction: dict,
+        subject_profile: dict,
+        issues: list,
+    ) -> dict:
+        codes = {getattr(issue, "code", "") for issue in issues}
+        output.setdefault("metadata", {}).pop("historyAudit", None)
+
+        if "CORRUPT_TEXT" in codes:
+            from .utils.text_question_fallback import repair_corrupt_questions_from_text
+            repaired = repair_corrupt_questions_from_text(output, extraction)
+            if repaired:
+                report_progress("audit_retry", f"Repaired {repaired} corrupt text item(s)")
+
+        if "GROUP_NUMBER_GAP" in codes:
+            from .utils.text_question_fallback import extract_questions_from_text_pages
+            fallback_questions = extract_questions_from_text_pages(extraction, subject_profile)
+            existing = {
+                (q.get("groupId") or "", str(q.get("number") or "").strip(), q.get("sourcePage"))
+                for q in output.get("questions", [])
+            }
+            recovered = []
+            for q in fallback_questions:
+                key = (q.get("groupId") or "", str(q.get("number") or "").strip(), q.get("sourcePage"))
+                if key in existing:
+                    continue
+                recovered.append(q)
+                existing.add(key)
+            if recovered:
+                output.setdefault("questions", []).extend(recovered)
+                output["questions"].sort(key=lambda q: (
+                    q.get("sourcePage") or 999,
+                    q.get("groupId") or "",
+                    int(str(q.get("number") or "999").split(".", 1)[0]) if str(q.get("number") or "").split(".", 1)[0].isdigit() else 999,
+                    str(q.get("number") or ""),
+                ))
+                output.setdefault("warnings", []).append({
+                    "type": "history_audit_retry_recovered_questions",
+                    "message": f"Recovered {len(recovered)} question(s) from text fallback during audit retry.",
+                })
+                report_progress("audit_retry", f"Recovered {len(recovered)} missing question(s)")
+
+        needs_structure_pass = bool(codes & {
+            "MULTIPLE_CHOICE_WITHOUT_OPTIONS",
+            "MULTIBLANK_WITHOUT_OPTIONS",
+            "MULTIBLANK_MISCLASSIFIED",
+            "CHOICE_LIKE_OPEN_ANSWER",
+            "BROKEN_SOURCE_REF",
+            "BROKEN_CHILD_REF",
+            "CROSS_GROUP_SOURCE_REF",
+            "SOURCE_REFS_WITHOUT_MEDIA",
+            "MENTIONS_SOURCE_WITHOUT_REF",
+            "MISSING_EXPECTED_DOCUMENTS",
+            "MISSING_MEDIA_FILE",
+            "MISSING_SOURCE_CROP_FILE",
+            "MISSING_CHILD_CROP_FILE",
+            "DUPLICATE_SOURCE_CROPS",
+            "GROUP_NUMBER_GAP",
+        })
+        if needs_structure_pass:
+            output = apply_source_grouping(output, subject_profile, extraction)
+            output = normalize(output, extraction)
+
+            from .normalizers import normalize_by_profile
+            output = normalize_by_profile(output, extraction, subject_profile)
+
+            from .utils.cropper import crop_assets
+            crop_output_dir = self.output_dir / self.exam_id
+            output["_pdf_path"] = self.pdf_path
+            output = crop_assets(output, extraction, crop_output_dir)
+            output.pop("_pdf_path", None)
+
+            output = normalize(output, extraction)
+            output = normalize_by_profile(output, extraction, subject_profile)
+            output = apply_text_formatting(output)
+            output = enforce_asset_integrity(output, self.output_dir)
+
         return output
 
     def _targeted_retry(self, output: dict, extraction: dict, pages_to_process: list[dict], missing_warnings: list[dict]) -> dict:
