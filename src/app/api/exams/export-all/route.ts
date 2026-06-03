@@ -6,7 +6,7 @@ import { getJobs } from '@/lib/storage';
 
 export async function GET() {
   const jobs = await getJobs();
-  const completedJobs = jobs.filter(j => j.status === 'completed');
+  const completedJobs = jobs.filter(j => j.status === 'completed' || j.status === 'completed_with_warnings');
 
   if (completedJobs.length === 0) {
     return NextResponse.json({ error: 'No completed exams found' }, { status: 404 });
@@ -124,6 +124,12 @@ function collectUsedAssets(examData: Record<string, unknown>): string[] {
       for (const key of ['best', 'full', 'document', 'visual']) {
         const crop = crops[key] as Record<string, unknown> | undefined;
         if (crop?.relativePath) addVisualPath(crop.relativePath);
+      }
+    }
+    const childCrops = src.childCrops as Record<string, Record<string, unknown>> | undefined;
+    if (childCrops) {
+      for (const crop of Object.values(childCrops)) {
+        addVisualCrop(crop);
       }
     }
   }

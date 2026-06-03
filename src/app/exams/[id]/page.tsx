@@ -27,7 +27,7 @@ export default function ExamDetailPage() {
       <Link href="/exams" className="text-blue-600 hover:underline text-sm">&larr; Voltar</Link>
       <h1 className="text-2xl font-bold mt-4 mb-6">Exame: {id}</h1>
       <ProcessingStatus examId={id} />
-      {status === 'completed' && (
+      {(status === 'completed' || status === 'completed_with_warnings') && (
         <div className="mt-6 flex gap-3">
           <a
             href={`/api/exams/${id}/export`}

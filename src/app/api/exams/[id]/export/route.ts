@@ -143,6 +143,12 @@ function collectUsedAssets(examData: Record<string, unknown>): string[] {
         if (crop?.relativePath) addVisualPath(crop.relativePath);
       }
     }
+    const childCrops = src.childCrops as Record<string, Record<string, unknown>> | undefined;
+    if (childCrops) {
+      for (const crop of Object.values(childCrops)) {
+        addVisualCrop(crop);
+      }
+    }
   }
 
   return [...paths];

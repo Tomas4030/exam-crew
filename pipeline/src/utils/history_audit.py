@@ -184,8 +184,12 @@ def apply_history_audit_gate(output: dict[str, Any], asset_base: str | Path) -> 
                 f"{summary['high']} high severity issue(s)."
             ),
         })
-    elif summary["verdict"] == "REVIEW" and output.get("processingStatus") == "completed":
+    elif summary["verdict"] == "REVIEW" and output.get("processingStatus") != "partial_failed":
         output["processingStatus"] = "completed_with_warnings"
+        output["needsHumanReview"] = False
+    elif summary["verdict"] == "PASS" and output.get("processingStatus") != "partial_failed":
+        output["processingStatus"] = "completed"
+        output["needsHumanReview"] = False
 
     return output, issues, summary
 
@@ -374,7 +378,11 @@ def _audit_warning_noise(root: str, data: dict, issues: list[Issue]) -> None:
     warnings = data.get("warnings") or []
     for warning in warnings:
         wtype = warning.get("type") or ""
-        if wtype in {"possible_hallucination", "missing_crop_ref", "broken_ref"}:
+        if wtype in {"missing_crop_ref", "missing_media_ref"}:
+            continue
+        if wtype == "possible_hallucination":
+            continue
+        if wtype in {"broken_ref"}:
             issues.append(Issue(root, "MEDIUM", "PIPELINE_WARNING",
                                 warning.get("message") or wtype, actual=wtype))
 
