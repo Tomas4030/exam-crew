@@ -228,6 +228,28 @@ function collectAllAssets(
       state,
     );
   }
+
+  for (const source of examData.sources || []) {
+    collectDeclaredSourceAssets(source, examDir, assetsDir, state);
+  }
+}
+
+function collectDeclaredSourceAssets(
+  source: AnyObj,
+  examDir: string,
+  assetsDir: string,
+  state: AssetState,
+) {
+  addAsset(getBestSourcePath(source), examDir, assetsDir, state);
+
+  for (const crop of Object.values(source.childCrops || {}) as AnyObj[]) {
+    addAsset(crop?.relativePath || crop?.url, examDir, assetsDir, state);
+  }
+
+  const children = source.crops?.children || {};
+  for (const crop of Object.values(children) as AnyObj[]) {
+    addAsset(crop?.relativePath || crop?.url, examDir, assetsDir, state);
+  }
 }
 
 function collectAssetsFromQuestion(
