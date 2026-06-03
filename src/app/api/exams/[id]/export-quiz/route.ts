@@ -802,6 +802,21 @@ textarea{
   line-height:1.6;
 }
 textarea:focus,select:focus{outline:3px solid rgba(36,87,214,.16);border-color:#7ca2f4}
+.matching-wrap,.ordering-wrap{margin-top:18px}
+.matching-columns{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.matching-col{border:1px solid var(--line);background:#f8fafc;border-radius:18px;padding:16px}
+.matching-col h3{margin:0 0 12px;font-size:1rem}
+.matching-row{display:grid;grid-template-columns:34px minmax(0,1fr) 82px;gap:10px;align-items:center;border:1px solid var(--line);background:#fff;border-radius:14px;padding:10px;margin-bottom:10px}
+.matching-left-key{font-weight:950;color:var(--brand)}
+.matching-left-text{line-height:1.45}
+.matching-ref{border:1px solid var(--line);background:#fff;border-radius:14px;padding:10px 12px;margin-bottom:10px;line-height:1.45}
+.matching-ref strong{color:var(--brand);margin-right:8px}
+.ordering-items{display:grid;gap:10px;margin:12px 0}
+.ordering-item{display:grid;grid-template-columns:38px minmax(0,1fr);gap:10px;align-items:start;border:1px solid var(--line);background:#fff;border-radius:14px;padding:12px}
+.ordering-item strong{color:var(--brand)}
+.ordering-input{width:100%;border:1px solid var(--line-strong);border-radius:16px;padding:14px 16px;background:#fbfdff;color:var(--text)}
+.option-img{display:block;max-width:100%;max-height:220px;object-fit:contain;margin-top:10px;border:1px solid var(--line);border-radius:12px;background:#fff}
+.muted{color:var(--muted);font-size:.94rem;margin:0 0 12px}
 .blank-table-wrap{overflow-x:auto;margin:20px 0;border-radius:18px;border:1px solid var(--line);background:#fff}
 .blank-table{width:100%;border-collapse:collapse;font-size:.95rem}
 .blank-table th,.blank-table td{border:1px solid var(--line);padding:12px;vertical-align:top}
@@ -841,6 +856,9 @@ textarea:focus,select:focus{outline:3px solid rgba(36,87,214,.16);border-color:#
   .bottom-nav{flex-direction:column-reverse;padding:14px 0 0}
   .q-type{margin-left:0;width:100%;justify-content:center}
   .option{grid-template-columns:20px 32px minmax(0,1fr);padding:12px}
+  .matching-columns{grid-template-columns:1fr}
+  .matching-row{grid-template-columns:30px minmax(0,1fr)}
+  .matching-row select{grid-column:1 / -1}
 }
 @media print{
   body{background:#fff;overflow:visible}
@@ -981,10 +999,18 @@ function setAnswer(key, value) {
 function updateOptionSelection(questionId, value) {
   var selector = '[data-question-id="' + cssEscape(questionId) + '"] .option';
   var labels = document.querySelectorAll(selector);
+  var selected = String(value || '')
+    .split(',')
+    .map(function(letter) { return letter.trim(); })
+    .filter(Boolean);
 
   labels.forEach(function(label) {
     var input = label.querySelector('input');
-    label.classList.toggle('selected', input && input.value === value);
+    if (!input) return;
+    var isSelected = input.type === 'checkbox'
+      ? selected.indexOf(input.value) >= 0
+      : input.value === value;
+    label.classList.toggle('selected', isSelected);
   });
 }
 
@@ -1029,6 +1055,24 @@ function render() {
 }
 
 function bindQuestionEvents(root) {
+  root.querySelectorAll('[data-matching-key]').forEach(function(el) {
+    var questionId = el.getAttribute('data-matching-key');
+    var itemKey = el.getAttribute('data-matching-item');
+    if (!questionId || !itemKey) return;
+
+    el.addEventListener('change', function(event) {
+      var current = state.answers[questionId] || {};
+      if (typeof current === 'string') {
+        try { current = JSON.parse(current); } catch (_) { current = {}; }
+      }
+
+      current[itemKey] = event.target.value;
+      state.answers[questionId] = current;
+      saveAnswers();
+      renderNav();
+    });
+  });
+
   root.querySelectorAll('[data-multi-select-key]').forEach(function(el) {
     var key = el.getAttribute('data-multi-select-key');
     if (!key) return;
@@ -1044,7 +1088,7 @@ function bindQuestionEvents(root) {
     var key = el.getAttribute('data-answer-key');
     if (!key) return;
 
-    var eventName = el.tagName === 'TEXTAREA' ? 'input' : 'change';
+    var eventName = el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' ? 'input' : 'change';
 
     el.addEventListener(eventName, function(event) {
       setAnswer(key, event.target.value);
@@ -1123,6 +1167,26 @@ function hasAnswer(q) {
     return q.blanks.some(function(blank) {
       return state.answers[q.questionId + '_' + blank.number];
     });
+  }
+
+  if (q.type === 'matching' && q.matchColumns && q.matchColumns.left) {
+    var answer = state.answers[q.questionId] || {};
+    if (typeof answer === 'string') {
+      try { answer = JSON.parse(answer); } catch (_) { answer = {}; }
+    }
+
+    return q.matchColumns.left.some(function(item) {
+      var key = item.key || item.letter || item.number;
+      return Boolean(answer[key]);
+    });
+  }
+
+  if (q.type === 'multi_select') {
+    return String(state.answers[q.questionId] || '')
+      .split(',')
+      .map(function(letter) { return letter.trim(); })
+      .filter(Boolean)
+      .length > 0;
   }
 
   return Boolean(state.answers[q.questionId]);
@@ -1319,6 +1383,14 @@ function renderAnswer(q) {
     return renderBlanks(q);
   }
 
+  if (q.type === 'matching' && q.matchColumns) {
+    return renderMatching(q);
+  }
+
+  if (q.type === 'ordering') {
+    return renderOrdering(q);
+  }
+
   var value = state.answers[q.questionId] || '';
 
   return '<textarea placeholder="Escreva a sua resposta..." data-answer-key="' +
@@ -1339,7 +1411,7 @@ function renderOptions(q) {
         (isSelected ? 'checked' : '') +
         ' data-answer-key="' + esc(q.questionId) + '">' +
         '<span class="option-letter">(' + esc(option.letter) + ')</span>' +
-        '<span class="option-text">' + formatInlineText(text) + '</span>' +
+        '<span class="option-text">' + formatInlineText(text) + renderOptionImage(option) + '</span>' +
       '</label>';
     }).join('') +
   '</div>';
@@ -1351,7 +1423,11 @@ function renderMultiSelect(q) {
     .map(function(letter) { return letter.trim(); })
     .filter(Boolean);
 
-  return '<div class="options" data-question-id="' + esc(q.questionId) + '">' +
+  var help = q.maxSelections
+    ? '<p class="muted">Seleciona ' + esc(q.maxSelections) + ' opção(ões).</p>'
+    : '<p class="muted">Seleciona todas as opções corretas.</p>';
+
+  return help + '<div class="options" data-question-id="' + esc(q.questionId) + '">' +
     q.options.map(function(option) {
       var isSelected = selected.indexOf(option.letter) >= 0;
       var text = cleanOptionText(option.latex || option.text || '');
@@ -1361,9 +1437,106 @@ function renderMultiSelect(q) {
         (isSelected ? 'checked' : '') +
         ' data-multi-select-key="' + esc(q.questionId) + '">' +
         '<span class="option-letter">(' + esc(option.letter) + ')</span>' +
-        '<span class="option-text">' + formatInlineText(text) + '</span>' +
+        '<span class="option-text">' + formatInlineText(text) + renderOptionImage(option) + '</span>' +
       '</label>';
     }).join('') +
+  '</div>';
+}
+
+function renderOptionImage(option) {
+  var url = option.imageUrl || option.url || '';
+
+  if (!url && option.imageAssetId) {
+    url = getAssetPath(findAsset(option.imageAssetId));
+  }
+
+  if (!url) return '';
+
+  return '<img class="option-img" src="' + esc(cleanPath(url)) + '" alt="Imagem da opção">';
+}
+
+function renderMatching(q) {
+  var left = (q.matchColumns && q.matchColumns.left) || [];
+  var right = (q.matchColumns && q.matchColumns.right) || [];
+
+  if (!left.length || !right.length) {
+    return '<textarea placeholder="Escreva a sua resposta..." data-answer-key="' +
+      esc(q.questionId) +
+      '">' +
+      esc(state.answers[q.questionId] || '') +
+    '</textarea>';
+  }
+
+  var answer = state.answers[q.questionId] || {};
+  if (typeof answer === 'string') {
+    try { answer = JSON.parse(answer); } catch (_) { answer = {}; }
+  }
+
+  return '<div class="matching-wrap">' +
+    '<div class="matching-columns">' +
+      '<div class="matching-col">' +
+        '<h3>Coluna A</h3>' +
+        left.map(function(item) {
+          var key = item.key || item.letter || item.number;
+          var current = answer[key] || '';
+
+          return '<label class="matching-row">' +
+            '<span class="matching-left-key">' + esc(key) + '</span>' +
+            '<span class="matching-left-text">' + formatInlineText(item.text || '') + '</span>' +
+            '<select data-matching-key="' + esc(q.questionId) + '" data-matching-item="' + esc(key) + '">' +
+              '<option value="">-</option>' +
+              right.map(function(opt) {
+                var optKey = opt.key || opt.letter || opt.number;
+                return '<option value="' + esc(optKey) + '"' +
+                  (current === optKey ? ' selected' : '') +
+                  '>' + esc(optKey) + '</option>';
+              }).join('') +
+            '</select>' +
+          '</label>';
+        }).join('') +
+      '</div>' +
+      '<div class="matching-col">' +
+        '<h3>Coluna B</h3>' +
+        right.map(function(item) {
+          var key = item.key || item.letter || item.number;
+          return '<div class="matching-ref">' +
+            '<strong>' + esc(key) + '</strong> ' +
+            '<span>' + formatInlineText(item.text || '') + '</span>' +
+          '</div>';
+        }).join('') +
+      '</div>' +
+    '</div>' +
+  '</div>';
+}
+
+function renderOrdering(q) {
+  var items = q.items || q.orderingItems || q.options || [];
+  var answer = state.answers[q.questionId] || '';
+
+  if (!items.length) {
+    return '<input class="ordering-input" placeholder="Ex.: A, C, B, D" data-answer-key="' +
+      esc(q.questionId) +
+      '" value="' +
+      esc(answer) +
+      '">';
+  }
+
+  return '<div class="ordering-wrap">' +
+    '<p class="muted">Escreve a sequência correta.</p>' +
+    '<div class="ordering-items">' +
+      items.map(function(item) {
+        var key = item.key || item.letter || item.number;
+        return '<div class="ordering-item">' +
+          '<strong>' + esc(key) + '</strong>' +
+          '<span>' + formatInlineText(item.text || '') + '</span>' +
+        '</div>';
+      }).join('') +
+    '</div>' +
+    '<input class="ordering-input" placeholder="Ex.: A, C, B, D" data-answer-key="' +
+      esc(q.questionId) +
+      '" value="' +
+      esc(answer) +
+      '">' +
   '</div>';
 }
 
@@ -1445,6 +1618,8 @@ function labelType(type) {
     multiple_choice: 'Escolha múltipla',
     multi_select: 'Seleção múltipla',
     multi_blank_choice: 'Associação / espaços',
+    matching: 'Correspondência',
+    ordering: 'Ordenação',
     open_answer: 'Resposta aberta',
     group: 'Grupo'
   };
