@@ -5,6 +5,7 @@ import csv
 import hashlib
 import json
 import re
+import struct
 import sys
 import zipfile
 from dataclasses import dataclass
@@ -73,7 +74,7 @@ class ExamBundle:
 
         if self.path.is_file():
             self.data = json.loads(self.path.read_text(encoding="utf-8"))
-            base = self.path.parent / self.path.stem
+            base = self.path.parent if self.path.name == "exam.json" else self.path.parent / self.path.stem
         else:
             json_path = self.path / "exam.json"
             if not json_path.exists():
@@ -130,11 +131,13 @@ def audit_bundle(bundle: ExamBundle) -> list[Issue]:
     metadata = data.get("metadata") or {}
 
     _audit_counts(root, questions, metadata, issues)
+    _audit_points(root, questions, issues)
+    _audit_metadata(root, metadata, issues)
     _audit_text_quality(root, questions, issues)
     _audit_question_types(root, questions, issues)
     _audit_sources_and_media(root, questions, sources, bundle, issues)
     _audit_document_expectations(root, questions, sources, issues)
-    _audit_crops(root, sources, bundle, issues)
+    _audit_crops(root, sources, bundle, issues, metadata)
     _audit_warning_noise(root, data, issues)
 
     issues.sort(key=lambda i: (SEVERITY_ORDER.get(i.severity, 99), i.root, i.question_id, i.code))
@@ -194,6 +197,10 @@ def apply_history_audit_gate(output: dict[str, Any], asset_base: str | Path) -> 
 
 def _is_probably_history_output(output: dict[str, Any]) -> bool:
     metadata = output.get("metadata") or {}
+    subject = str(metadata.get("subject") or output.get("subject") or "").lower()
+    if subject and "hist" not in subject:
+        return False
+
     marker = f"{metadata.get('subject') or ''} {metadata.get('title') or ''} {output.get('exam_id') or ''}".lower()
     if "hist" in marker:
         return True
@@ -244,6 +251,72 @@ def _audit_counts(root: str, questions: list[dict], metadata: dict, issues: list
                 group=group, expected=",".join(map(str, range(unique[0], unique[-1] + 1))),
                 actual=",".join(map(str, unique)),
             ))
+
+
+def _audit_points(root: str, questions: list[dict], issues: list[Issue]) -> None:
+    null_points: list[str] = []
+    zero_points: list[str] = []
+    total = 0
+
+    for q in questions:
+        qid = _question_id(q)
+        points = q.get("points")
+        if points is None:
+            null_points.append(qid)
+            continue
+        try:
+            numeric = int(points)
+        except (TypeError, ValueError):
+            null_points.append(qid)
+            continue
+        if numeric <= 0:
+            zero_points.append(qid)
+            continue
+        total += numeric
+
+    if null_points:
+        issues.append(Issue(
+            root, "BLOCKER", "POINTS_NULL",
+            f"{len(null_points)} question(s) have null/non-numeric points: {', '.join(null_points[:10])}",
+            expected="integer > 0",
+            actual=f"{len(null_points)} invalid",
+        ))
+    if zero_points:
+        issues.append(Issue(
+            root, "BLOCKER", "POINTS_ZERO",
+            f"{len(zero_points)} question(s) have zero/negative points: {', '.join(zero_points[:10])}",
+            expected="integer > 0",
+            actual=f"{len(zero_points)} zero",
+        ))
+
+    # Recent Historia A exams include optional items in the exported quiz, so
+    # totals above 200 can be valid. Totals below 200 are still structurally bad.
+    if questions and not null_points and not zero_points and total < 200:
+        issues.append(Issue(
+            root, "HIGH", "TOTAL_POINTS_TOO_LOW",
+            f"total points = {total}, expected at least 200",
+            expected=">=200",
+            actual=str(total),
+        ))
+
+
+def _audit_metadata(root: str, metadata: dict, issues: list[Issue]) -> None:
+    year = metadata.get("year")
+    phase = metadata.get("phase")
+    if not year:
+        issues.append(Issue(
+            root, "HIGH", "MISSING_YEAR",
+            "metadata.year is missing, so the exam cannot be catalogued reliably",
+            expected="year",
+            actual=str(year),
+        ))
+    if not phase:
+        issues.append(Issue(
+            root, "HIGH", "MISSING_PHASE",
+            "metadata.phase is missing, so the exam cannot be catalogued reliably",
+            expected="phase",
+            actual=str(phase),
+        ))
 
 
 def _audit_text_quality(root: str, questions: list[dict], issues: list[Issue]) -> None:
@@ -298,6 +371,15 @@ def _audit_question_types(root: str, questions: list[dict], issues: list[Issue])
         if re.search(r"\([A-D]\)", _question_text(q)) and qtype == "open_answer":
             issues.append(Issue(root, "MEDIUM", "CHOICE_LIKE_OPEN_ANSWER",
                                 "open_answer statement contains A-D option markers", qid, _group_id(q), str(q.get("number") or "")))
+
+        if qtype == "open_answer" and _looks_like_selection_prompt(text):
+            issues.append(Issue(
+                root, "HIGH", "OPEN_ANSWER_SHOULD_BE_SELECTION",
+                "open_answer statement asks the student to select/identify options",
+                qid, _group_id(q), str(q.get("number") or ""),
+                expected="multiple_choice or multi_select",
+                actual="open_answer",
+            ))
 
 
 def _audit_sources_and_media(
@@ -372,11 +454,25 @@ def _audit_document_expectations(root: str, questions: list[dict], sources: list
             ))
 
 
-def _audit_crops(root: str, sources: list[dict], bundle: ExamBundle, issues: list[Issue]) -> None:
+def _audit_crops(root: str, sources: list[dict], bundle: ExamBundle, issues: list[Issue], metadata: dict | None = None) -> None:
     hashes_by_group: dict[tuple[str, str], list[str]] = {}
+    suspect_crops: list[Issue] = []
+    total_pages = int((metadata or {}).get("total_pages") or 0)
     for source in sources:
         crop = ((source.get("crops") or {}).get("best") or (source.get("crops") or {}).get("full") or {})
         rel = _url_to_rel(crop.get("url") or crop.get("relativePath") or "")
+        method = str(crop.get("method") or "")
+        if (
+            total_pages
+            and source.get("groupId") == "grupo_i"
+            and int(source.get("pageStart") or 0) >= total_pages
+            and method == "history_unlabelled_doc_crop"
+        ):
+            issues.append(Issue(
+                root, "BLOCKER", "SCORING_PAGE_AS_SOURCE",
+                "implicit Grupo I document crop points to the final scoring page",
+                group="grupo_i", actual=str(source.get("sourceId") or ""),
+            ))
         if not rel:
             issues.append(Issue(root, "HIGH", "SOURCE_WITHOUT_CROP",
                                 f"source has no best/full crop: {source.get('sourceId')}", actual=str(source.get("sourceId"))))
@@ -386,9 +482,31 @@ def _audit_crops(root: str, sources: list[dict], bundle: ExamBundle, issues: lis
             issues.append(Issue(root, "BLOCKER", "MISSING_SOURCE_CROP_FILE",
                                 f"source crop file missing: {rel}", actual=rel))
             continue
+        width, height = _png_dimensions(data)
+        if height and height < 80:
+            suspect_crops.append(Issue(
+                root, "HIGH", "SUSPECT_CROP_TOO_SMALL",
+                f"source crop is only {width}x{height}px; likely a footer/citation, not a document",
+                question_id=str(source.get("sourceId") or ""),
+                group=str(source.get("groupId") or ""),
+                actual=f"{rel} ({width}x{height})",
+            ))
+        elif width and height and width / height > 8:
+            suspect_crops.append(Issue(
+                root, "HIGH", "SUSPECT_CROP_TOO_SMALL",
+                f"source crop has extreme aspect ratio {width}x{height}px; likely a footer/citation",
+                question_id=str(source.get("sourceId") or ""),
+                group=str(source.get("groupId") or ""),
+                actual=f"{rel} ({width}x{height})",
+            ))
         digest = hashlib.sha256(data).hexdigest()
         key = (source.get("groupId") or "", digest)
         hashes_by_group.setdefault(key, []).append(source.get("sourceId") or "")
+
+    crop_severity = "HIGH" if len(suspect_crops) >= 3 else "MEDIUM"
+    for issue in suspect_crops:
+        issue.severity = crop_severity
+        issues.append(issue)
 
     for (group, _digest), source_ids in hashes_by_group.items():
         if len(source_ids) > 1:
@@ -437,8 +555,34 @@ def _mentions_document_or_image(text: str) -> bool:
     return bool(re.search(r"\b(documento|imagem)\s+[A-Z0-9]", text or "", re.IGNORECASE))
 
 
+def _looks_like_selection_prompt(text: str) -> bool:
+    if not text:
+        return False
+    patterns = (
+        r"\bselec(?:ione|cione|cione)\s+as?\s+duas\b",
+        r"\bsele(?:ccione|cione)\s+as?\s+duas\b",
+        r"\bidentifique\s+as?\s+duas\b",
+        r"\bduas\s+afirma(?:ções|coes)\b",
+        r"\bduas\s+op(?:ções|coes)\s+selecionadas\b",
+        r"\bop(?:ção|cao)\s+adequada\b",
+        r"\bassinale\b",
+        r"\bindique\s+a\s+op(?:ção|cao)\b",
+        r"\btranscreva\s+a\s+op(?:ção|cao)\b",
+    )
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
+
+
 def _is_asset_name(name: str) -> bool:
     return bool(re.search(r"\.(png|jpg|jpeg|webp|gif)$", name, re.IGNORECASE))
+
+
+def _png_dimensions(data: bytes) -> tuple[int, int]:
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
+        return 0, 0
+    try:
+        return struct.unpack(">II", data[16:24])
+    except struct.error:
+        return 0, 0
 
 
 def _norm_asset_path(path: str) -> str:

@@ -822,10 +822,19 @@ def _attach_implicit_group_i_document(output: dict, extraction: dict | None) -> 
 
 def _find_group_i_document_page(output: dict, extraction: dict, group_i_qs: list[dict]) -> int | None:
     """Find the real page of the Grupo I document (not the cover page)."""
-    # 1. Questions with sourcePage > 3 that mention "documento"
+    pages_by_num = {
+        int(p.get("page")): p
+        for p in extraction.get("pages", [])
+        if p.get("page") is not None
+    }
+
+    # 1. Prefer the page where the question was found. Older História A exams
+    # put the Grupo I document on page 2; skipping early pages can select the
+    # final scoring page because it also contains "GRUPO I".
     candidates = [
         int(q["sourcePage"]) for q in group_i_qs
-        if (q.get("sourcePage") or 0) > 3
+        if (q.get("sourcePage") or 0) > 1
+        and not _is_scoring_page(pages_by_num.get(int(q.get("sourcePage") or 0), {}))
     ]
     if candidates:
         return min(candidates)
@@ -834,21 +843,33 @@ def _find_group_i_document_page(output: dict, extraction: dict, group_i_qs: list
     table_kws = ("norte", "centro", "sul", "total", "senhorio", "distribuição", "localização", "titulares")
     for p in sorted(extraction.get("pages", []), key=lambda x: x.get("page", 0)):
         pnum = p.get("page", 0)
-        if pnum <= 3:
+        if pnum <= 1 or _is_scoring_page(p):
             continue
         text = (p.get("text") or "").lower()
         if "grupo i" in text and any(kw in text for kw in table_kws):
             return int(pnum)
 
-    # 3. Fallback: first page > 3 that has "grupo i"
+    # 3. Fallback: first non-scoring page after cover that has "grupo i"
     for p in sorted(extraction.get("pages", []), key=lambda x: x.get("page", 0)):
         pnum = p.get("page", 0)
-        if pnum <= 3:
+        if pnum <= 1 or _is_scoring_page(p):
             continue
         if "grupo i" in (p.get("text") or "").lower():
             return int(pnum)
 
     return None
+
+
+def _is_scoring_page(page: dict | None) -> bool:
+    text = ((page or {}).get("text") or "").lower()
+    if not text:
+        return False
+    return (
+        "cotações" in text
+        or "cotacoes" in text
+        or "cotação" in text
+        or "cotacao" in text
+    )
 
 
 def _create_unlabelled_doc_crop(output: dict, extraction: dict, page_info: dict) -> dict | None:

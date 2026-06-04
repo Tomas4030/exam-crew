@@ -15,6 +15,7 @@ from .utils.source_grouping import apply_source_grouping
 from .utils.page_diagnostics import write_page_diagnostics
 from .utils.asset_integrity import enforce_asset_integrity
 from .utils.question_cleanup import cleanup_history_questions
+from .utils.token_usage import get_token_usage
 
 
 def _find_question_anchor_y(blocks: list[dict], q_number: str) -> float | None:
@@ -77,6 +78,10 @@ class ExamProcessingCrew:
         self.base_dir = Path(base_dir) if base_dir else Path(__file__).resolve().parent.parent.parent
         self.output_dir = self.base_dir / "data" / "output"
         self.extracted_dir = self.base_dir / "data" / "extracted" / exam_id
+
+    def _attach_run_metrics(self, output: dict) -> dict:
+        output.setdefault("metadata", {})["tokenUsage"] = get_token_usage()
+        return output
 
     def run(self) -> dict:
         self.extracted_dir.mkdir(parents=True, exist_ok=True)
@@ -442,6 +447,7 @@ Text:
 
         if history_audit_summary.get("verdict") == "FAIL":
             out_file = self.output_dir / f"{self.exam_id}.json"
+            output = self._attach_run_metrics(output)
             out_file.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
             top = history_audit_issues[0].code if history_audit_issues else "UNKNOWN"
             message = (
@@ -465,6 +471,7 @@ Text:
             output["needsHumanReview"] = True
 
             out_file = self.output_dir / f"{self.exam_id}.json"
+            output = self._attach_run_metrics(output)
             out_file.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
 
             report_progress(
@@ -476,6 +483,7 @@ Text:
 
         # Step 5: Save
         out_file = self.output_dir / f"{self.exam_id}.json"
+        output = self._attach_run_metrics(output)
         out_file.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
         report_progress("done", f"Saved to {out_file}")
         return output
@@ -488,6 +496,7 @@ Text:
             "MULTIBLANK_WITHOUT_OPTIONS",
             "MULTIBLANK_MISCLASSIFIED",
             "CHOICE_LIKE_OPEN_ANSWER",
+            "OPEN_ANSWER_SHOULD_BE_SELECTION",
             "BROKEN_SOURCE_REF",
             "BROKEN_CHILD_REF",
             "CROSS_GROUP_SOURCE_REF",
@@ -498,6 +507,7 @@ Text:
             "MISSING_SOURCE_CROP_FILE",
             "MISSING_CHILD_CROP_FILE",
             "DUPLICATE_SOURCE_CROPS",
+            "SUSPECT_CROP_TOO_SMALL",
         }
         return [issue for issue in issues if getattr(issue, "code", "") in retryable_codes]
 
@@ -550,6 +560,7 @@ Text:
             "MULTIBLANK_WITHOUT_OPTIONS",
             "MULTIBLANK_MISCLASSIFIED",
             "CHOICE_LIKE_OPEN_ANSWER",
+            "OPEN_ANSWER_SHOULD_BE_SELECTION",
             "BROKEN_SOURCE_REF",
             "BROKEN_CHILD_REF",
             "CROSS_GROUP_SOURCE_REF",
@@ -560,6 +571,7 @@ Text:
             "MISSING_SOURCE_CROP_FILE",
             "MISSING_CHILD_CROP_FILE",
             "DUPLICATE_SOURCE_CROPS",
+            "SUSPECT_CROP_TOO_SMALL",
             "GROUP_NUMBER_GAP",
         })
         if needs_structure_pass:

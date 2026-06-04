@@ -7,6 +7,7 @@ import re
 import httpx
 
 from ..config import OPENROUTER_BASE_URL, OPENROUTER_API_KEY, OPENROUTER_MODEL
+from ..utils.token_usage import record_usage
 
 
 def _call_vision(image_path: str, prompt: str, max_tokens: int = 2048) -> str | None:
@@ -39,6 +40,7 @@ def _call_vision(image_path: str, prompt: str, max_tokens: int = 2048) -> str | 
     if response.status_code != 200:
         return None
     data = response.json()
+    record_usage(data, OPENROUTER_MODEL)
     return data["choices"][0]["message"]["content"] or None
 
 
@@ -62,6 +64,7 @@ def _call_text(prompt: str, max_tokens: int = 2048) -> str | None:
     if response.status_code != 200:
         return None
     data = response.json()
+    record_usage(data, OPENROUTER_MODEL)
     return data["choices"][0]["message"]["content"] or None
 
 

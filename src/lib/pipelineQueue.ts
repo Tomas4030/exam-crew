@@ -21,11 +21,24 @@ async function runNext() {
   try {
     while (queue.length > 0) {
       const item = queue.shift()!;
-      await updateJob(item.examId, { status: "processing" });
+      const startedAt = new Date().toISOString();
+      await updateJob(item.examId, { status: "processing", startedAt });
       const result = await runPipeline(item.pdfPath, item.examId);
+      const completedAt = new Date().toISOString();
+      const durationMs = Math.max(0, new Date(completedAt).getTime() - new Date(startedAt).getTime());
       await updateJob(item.examId, result.success
-        ? { status: result.status || "completed" }
-        : { status: "error", error: result.error || "Pipeline failed" }
+        ? {
+            status: result.status || "completed",
+            completedAt,
+            durationMs,
+            tokenUsage: result.tokenUsage,
+          }
+        : {
+            status: "error",
+            error: result.error || "Pipeline failed",
+            completedAt,
+            durationMs,
+          }
       );
     }
   } finally {

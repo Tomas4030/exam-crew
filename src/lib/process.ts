@@ -2,7 +2,7 @@ import { spawn } from 'child_process';
 import path from 'path';
 import os from 'os';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
-import { ExamStatus, ProcessResult } from './types';
+import { ExamStatus, ProcessResult, TokenUsage } from './types';
 
 const PROGRESS_DIR = path.join(process.cwd(), 'data');
 
@@ -50,6 +50,19 @@ function readFinalStatus(examId: string): ExamStatus {
   } catch {}
 
   return 'completed';
+}
+
+function readFinalTokenUsage(examId: string): TokenUsage | undefined {
+  const file = path.join(process.cwd(), 'data', 'output', `${examId}.json`);
+  if (!existsSync(file)) return undefined;
+
+  try {
+    const data = JSON.parse(readFileSync(file, 'utf8'));
+    const usage = data.metadata?.tokenUsage;
+    if (usage && typeof usage === 'object') return usage;
+  } catch {}
+
+  return undefined;
 }
 
 export function runPipeline(pdfPath: string, examId: string): Promise<ProcessResult> {
@@ -119,6 +132,7 @@ export function runPipeline(pdfPath: string, examId: string): Promise<ProcessRes
 
       if (code === 0) {
         const finalStatus = readFinalStatus(examId);
+        const tokenUsage = readFinalTokenUsage(examId);
         writeProgress(examId, {
           step: 'done',
           label: 'Concluído',
@@ -126,7 +140,7 @@ export function runPipeline(pdfPath: string, examId: string): Promise<ProcessRes
           message: finalStatus === 'completed' ? '' : `Estado final: ${finalStatus}`,
         });
 
-        resolve({ success: true, examId, status: finalStatus });
+        resolve({ success: true, examId, status: finalStatus, tokenUsage });
       } else {
         const errorMessage =
           lastProgressError ||

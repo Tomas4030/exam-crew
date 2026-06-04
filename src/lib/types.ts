@@ -14,16 +14,30 @@ export interface ExamJob {
   status: ExamStatus;
   createdAt: string;
   updatedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
+  tokenUsage?: TokenUsage;
   error?: string;
   sourceUrl?: string;
   batchId?: string;
   batchIndex?: number;
 }
 
+export interface TokenUsage {
+  calls?: number;
+  models?: string[];
+  promptTokens?: number;
+  completionTokens?: number;
+  reasoningTokens?: number;
+  totalTokens?: number;
+}
+
 export interface ProcessResult {
   success: boolean;
   examId: string;
   status?: ExamStatus;
+  tokenUsage?: TokenUsage;
   error?: string;
 }
 
