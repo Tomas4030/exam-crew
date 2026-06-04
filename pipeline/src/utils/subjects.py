@@ -97,6 +97,17 @@ SUBJECT_PROFILES = {
 def detect_subject(cover_text: str) -> tuple[str, dict]:
     """Detect subject from cover page text. Returns (subject_key, profile)."""
     text_lower = cover_text.lower()
+    history_filename_hints = (
+        "historia-a.pdf",
+        "história-a.pdf",
+        "/historia-a",
+        "\\historia-a",
+        "/historia.pdf",
+        "\\historia.pdf",
+    )
+    if any(hint in text_lower for hint in history_filename_hints):
+        return "historia_a", SUBJECT_PROFILES["historia_a"]
+
     for key, profile in SUBJECT_PROFILES.items():
         if key == "unknown":
             continue

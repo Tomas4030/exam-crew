@@ -1,6 +1,7 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import type { Dispatch, SetStateAction } from 'react';
 import Link from 'next/link';
 
 interface TokenUsage {
@@ -38,9 +39,13 @@ const statusColors: Record<string, string> = {
 };
 
 const terminalStatuses = new Set(['completed', 'completed_with_warnings', 'needs_review', 'partial_failed', 'error']);
+const exportableStatuses = new Set(['completed', 'completed_with_warnings']);
 
 export default function ExamList() {
   const [exams, setExams] = useState<Exam[]>([]);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [downloading, setDownloading] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     const fetchExams = () => fetch('/api/exams').then(r => r.json()).then(setExams).catch(() => {});
@@ -48,6 +53,16 @@ export default function ExamList() {
     const interval = setInterval(fetchExams, 5000);
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    setSelectedIds(previous => {
+      const valid = new Set(exams.map(exam => exam.id));
+      const next = new Set([...previous].filter(id => valid.has(id)));
+      return next.size === previous.size ? previous : next;
+    });
+  }, [exams]);
+
+  const exportableExams = useMemo(() => exams.filter(isExportable), [exams]);
 
   if (exams.length === 0) {
     return (
@@ -65,6 +80,59 @@ export default function ExamList() {
     .filter(total => total > 0);
   const grouped = groupByDay(exams);
 
+  const selectedCount = selectedIds.size;
+  const selectedExportableCount = exportableExams.filter(exam => selectedIds.has(exam.id)).length;
+  const allSelected = exams.length > 0 && selectedCount === exams.length;
+
+  const toggleAll = () => {
+    setSelectedIds(allSelected ? new Set() : new Set(exams.map(exam => exam.id)));
+  };
+
+  const downloadSelected = async () => {
+    if (!selectedExportableCount || downloading) return;
+    setDownloading(true);
+    try {
+      const response = await fetch('/api/exams/export-selected', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: [...selectedIds] }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = filenameFromDisposition(response.headers.get('content-disposition')) || `SelectedExams_${selectedExportableCount}.zip`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  const deleteSelected = async () => {
+    if (!selectedCount || deleting) return;
+    const confirmed = window.confirm(`Apagar ${selectedCount} exame${selectedCount === 1 ? '' : 's'} selecionado${selectedCount === 1 ? '' : 's'}?`);
+    if (!confirmed) return;
+
+    setDeleting(true);
+    try {
+      const response = await fetch('/api/exams/delete-selected', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: [...selectedIds] }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      setExams(previous => previous.filter(exam => !selectedIds.has(exam.id)));
+      setSelectedIds(new Set());
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <section className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -74,52 +142,116 @@ export default function ExamList() {
         <Metric label="Tokens medios" value={tokenTotals.length ? formatNumber(Math.round(avg(tokenTotals))) : 'Sem dados'} detail={`${tokenTotals.length} com usage real`} />
       </section>
 
-      <section className="space-y-5">
-        {grouped.map(group => (
-          <div key={group.key} className="overflow-hidden rounded-md border border-slate-800 bg-slate-900 shadow-[0_18px_60px_rgba(0,0,0,0.28)]">
-            <div className="flex flex-col gap-2 border-b border-slate-800 bg-slate-900/80 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <h2 className="font-semibold text-white">{group.label}</h2>
-                <p className="text-xs text-slate-400">
-                  {group.exams.length} exame{group.exams.length === 1 ? '' : 's'} - media {group.averageDuration ? formatDuration(group.averageDuration) : 'sem duracao'}
-                </p>
-              </div>
-              <div className="text-xs text-slate-400">
-                Tokens: {group.totalTokens ? formatNumber(group.totalTokens) : 'sem dados'}
-              </div>
-            </div>
-            <ul className="divide-y divide-slate-800">
-              {group.exams.map(exam => (
-                <li key={exam.id}>
-                  <Link href={`/exams/${exam.id}`} className="block px-4 py-4 transition-colors hover:bg-slate-800/55">
-                    <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
-                      <div className="min-w-0">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="truncate font-medium text-slate-100">{displayName(exam)}</span>
-                          <span className={`rounded-full border px-2 py-0.5 text-xs font-medium ${statusColors[exam.status] || 'border-slate-700 bg-slate-800 text-slate-300'}`}>
-                            {exam.status}
-                          </span>
-                        </div>
-                        <p className="mt-1 truncate text-xs text-slate-500">{exam.sourceUrl || exam.id}</p>
-                      </div>
+      <section className="flex flex-col gap-3 rounded-md border border-slate-800 bg-slate-900 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="inline-flex items-center gap-2 text-sm font-medium text-slate-200">
+            <input
+              type="checkbox"
+              checked={allSelected}
+              onChange={toggleAll}
+              className="h-4 w-4 rounded border-slate-600 bg-slate-950 text-blue-500 focus:ring-blue-500"
+            />
+            Selecionar todos
+          </label>
+          <span className="text-xs text-slate-500">
+            {selectedCount} selecionado{selectedCount === 1 ? '' : 's'} - {selectedExportableCount} exportavel{selectedExportableCount === 1 ? '' : 'eis'}
+          </span>
+        </div>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <button
+            type="button"
+            disabled={!selectedExportableCount || downloading}
+            onClick={downloadSelected}
+            className="inline-flex items-center justify-center rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-500"
+          >
+            {downloading ? 'A preparar...' : 'Download selecionados'}
+          </button>
+          <button
+            type="button"
+            disabled={!selectedCount || deleting}
+            onClick={deleteSelected}
+            className="inline-flex items-center justify-center rounded-md border border-red-400/30 bg-red-500/10 px-4 py-2 text-sm font-medium text-red-100 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:border-slate-800 disabled:bg-slate-800 disabled:text-slate-500"
+          >
+            {deleting ? 'A apagar...' : 'Apagar selecionados'}
+          </button>
+        </div>
+      </section>
 
-                      <div className="grid grid-cols-2 gap-3 text-xs text-slate-300 sm:grid-cols-4 lg:min-w-[520px]">
-                        <Info label="Criado" value={formatTime(exam.createdAt)} />
-                        <Info label="Inicio" value={formatTime(exam.startedAt)} />
-                        <Info label="Fim" value={formatTime(exam.completedAt || (terminalStatuses.has(exam.status) ? exam.updatedAt : undefined))} />
-                        <Info label="Duracao" value={formatDuration(getDurationMs(exam))} />
-                        <Info label="Calls" value={exam.tokenUsage?.calls ? String(exam.tokenUsage.calls) : '-'} />
-                        <Info label="Tokens" value={exam.tokenUsage?.totalTokens ? formatNumber(exam.tokenUsage.totalTokens) : '-'} />
-                        <Info label="Prompt" value={exam.tokenUsage?.promptTokens ? formatNumber(exam.tokenUsage.promptTokens) : '-'} />
-                        <Info label="Resposta" value={exam.tokenUsage?.completionTokens ? formatNumber(exam.tokenUsage.completionTokens) : '-'} />
-                      </div>
-                    </div>
-                  </Link>
-                </li>
-              ))}
-            </ul>
-          </div>
-        ))}
+      <section className="space-y-5">
+        {grouped.map(group => {
+          const groupExportable = group.exams.filter(isExportable);
+          const groupSelected = group.exams.filter(exam => selectedIds.has(exam.id)).length;
+          const groupSelectedExportable = groupExportable.filter(exam => selectedIds.has(exam.id)).length;
+          const groupAllSelected = group.exams.length > 0 && groupSelected === group.exams.length;
+
+          return (
+            <div key={group.key} className="overflow-hidden rounded-md border border-slate-800 bg-slate-900 shadow-[0_18px_60px_rgba(0,0,0,0.28)]">
+              <div className="flex flex-col gap-3 border-b border-slate-800 bg-slate-900/80 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <h2 className="font-semibold text-white">{group.label}</h2>
+                  <p className="text-xs text-slate-400">
+                    {group.exams.length} exame{group.exams.length === 1 ? '' : 's'} - media {group.averageDuration ? formatDuration(group.averageDuration) : 'sem duracao'}
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
+                  <label className="inline-flex items-center gap-2 text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={groupAllSelected}
+                      onChange={() => toggleGroup(group.exams, groupAllSelected, setSelectedIds)}
+                      className="h-4 w-4 rounded border-slate-600 bg-slate-950 text-blue-500 focus:ring-blue-500"
+                    />
+                    Dia
+                  </label>
+                  <span>{groupSelected}/{group.exams.length} selecionados</span>
+                  <span>{groupSelectedExportable}/{groupExportable.length} exportaveis</span>
+                  <span>Tokens: {group.totalTokens ? formatNumber(group.totalTokens) : 'sem dados'}</span>
+                </div>
+              </div>
+              <ul className="divide-y divide-slate-800">
+                {group.exams.map(exam => {
+                  const checked = selectedIds.has(exam.id);
+
+                  return (
+                    <li key={exam.id} className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-3 px-4 py-4 transition-colors hover:bg-slate-800/55">
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => toggleExam(exam.id, setSelectedIds)}
+                        className="mt-1 h-4 w-4 rounded border-slate-600 bg-slate-950 text-blue-500 focus:ring-blue-500"
+                        aria-label={`Selecionar ${displayName(exam)}`}
+                      />
+                      <Link href={`/exams/${exam.id}`} className="min-w-0">
+                        <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="truncate font-medium text-slate-100">{displayName(exam)}</span>
+                              <span className={`rounded-full border px-2 py-0.5 text-xs font-medium ${statusColors[exam.status] || 'border-slate-700 bg-slate-800 text-slate-300'}`}>
+                                {exam.status}
+                              </span>
+                            </div>
+                            <p className="mt-1 truncate text-xs text-slate-500">{exam.sourceUrl || exam.id}</p>
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-3 text-xs text-slate-300 sm:grid-cols-4 lg:min-w-[520px]">
+                            <Info label="Criado" value={formatTime(exam.createdAt)} />
+                            <Info label="Inicio" value={formatTime(exam.startedAt)} />
+                            <Info label="Fim" value={formatTime(exam.completedAt || (terminalStatuses.has(exam.status) ? exam.updatedAt : undefined))} />
+                            <Info label="Duracao" value={formatDuration(getDurationMs(exam))} />
+                            <Info label="Calls" value={exam.tokenUsage?.calls ? String(exam.tokenUsage.calls) : '-'} />
+                            <Info label="Tokens" value={exam.tokenUsage?.totalTokens ? formatNumber(exam.tokenUsage.totalTokens) : '-'} />
+                            <Info label="Prompt" value={exam.tokenUsage?.promptTokens ? formatNumber(exam.tokenUsage.promptTokens) : '-'} />
+                            <Info label="Resposta" value={exam.tokenUsage?.completionTokens ? formatNumber(exam.tokenUsage.completionTokens) : '-'} />
+                          </div>
+                        </div>
+                      </Link>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          );
+        })}
       </section>
     </div>
   );
@@ -142,6 +274,34 @@ function Info({ label, value }: { label: string; value: string }) {
       <div className="mt-0.5 font-medium text-slate-200">{value}</div>
     </div>
   );
+}
+
+function isExportable(exam: Exam) {
+  return exportableStatuses.has(exam.status);
+}
+
+function toggleExam(id: string, setSelectedIds: Dispatch<SetStateAction<Set<string>>>) {
+  setSelectedIds(previous => {
+    const next = new Set(previous);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    return next;
+  });
+}
+
+function toggleGroup(
+  exams: Exam[],
+  allSelected: boolean,
+  setSelectedIds: Dispatch<SetStateAction<Set<string>>>,
+) {
+  setSelectedIds(previous => {
+    const next = new Set(previous);
+    for (const exam of exams) {
+      if (allSelected) next.delete(exam.id);
+      else next.add(exam.id);
+    }
+    return next;
+  });
 }
 
 function groupByDay(exams: Exam[]) {
@@ -223,4 +383,10 @@ function avg(values: number[]) {
 
 function formatNumber(value: number) {
   return new Intl.NumberFormat('pt-PT').format(value);
+}
+
+function filenameFromDisposition(disposition: string | null) {
+  if (!disposition) return '';
+  const match = disposition.match(/filename="([^"]+)"/);
+  return match?.[1] || '';
 }

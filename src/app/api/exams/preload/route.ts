@@ -43,7 +43,7 @@ export async function POST(request: Request) {
         batchIndex: i + 1,
       };
       await createJob(job);
-      enqueuePipeline({ examId, pdfPath: filePath });
+      enqueuePipeline({ examId, pdfPath: filePath, sourceUrl: url });
       created.push({ exam_id: examId, url, status: "queued" });
     }
 

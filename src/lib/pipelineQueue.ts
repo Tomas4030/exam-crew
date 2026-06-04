@@ -1,7 +1,7 @@
 import { runPipeline } from "@/lib/process";
 import { updateJob } from "@/lib/storage";
 
-type QueueItem = { examId: string; pdfPath: string };
+type QueueItem = { examId: string; pdfPath: string; sourceUrl?: string };
 
 const queue: QueueItem[] = [];
 let running = false;
@@ -23,7 +23,7 @@ async function runNext() {
       const item = queue.shift()!;
       const startedAt = new Date().toISOString();
       await updateJob(item.examId, { status: "processing", startedAt });
-      const result = await runPipeline(item.pdfPath, item.examId);
+      const result = await runPipeline(item.pdfPath, item.examId, item.sourceUrl);
       const completedAt = new Date().toISOString();
       const durationMs = Math.max(0, new Date(completedAt).getTime() - new Date(startedAt).getTime());
       await updateJob(item.examId, result.success

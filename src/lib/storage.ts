@@ -39,3 +39,19 @@ export async function createJob(job: ExamJob): Promise<void> {
   await ensureDataDir();
   await writeFile(JOBS_FILE, JSON.stringify(jobs, null, 2));
 }
+
+export async function deleteJobs(ids: string[]): Promise<number> {
+  const idSet = new Set(ids);
+  if (!idSet.size) return 0;
+
+  const jobs = await getJobs();
+  const nextJobs = jobs.filter(job => !idSet.has(job.id));
+  const deleted = jobs.length - nextJobs.length;
+
+  if (deleted > 0) {
+    await ensureDataDir();
+    await writeFile(JOBS_FILE, JSON.stringify(nextJobs, null, 2));
+  }
+
+  return deleted;
+}

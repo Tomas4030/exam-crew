@@ -65,6 +65,8 @@ def normalize_humanities(output: dict, extraction: dict | None = None) -> dict:
     _attach_implicit_group_i_document(output, extraction)
     _repair_multi_blank_questions(output, extraction)
     _repair_multi_select_questions(output)
+    _repair_history_interaction_types(output)
+    _remove_history_line_number_artifacts(output)
     _repair_history_text_typos(output)
     _normalize_source_labels(output)
     _repair_known_history_points(output)
@@ -153,6 +155,105 @@ def _repair_multi_select_questions(output: dict) -> None:
         output.setdefault("warnings", []).append({
             "type": "history_multi_select_repaired",
             "message": f"Repaired {repaired} História choose-two question(s).",
+        })
+
+
+def _repair_history_interaction_types(output: dict) -> None:
+    """Convert old Historia association/ordering prompts away from open textareas."""
+    repaired = 0
+    for q in output.get("questions", []):
+        if q.get("type") != "open_answer":
+            continue
+        text = _combined_question_text(q)
+        low = text.lower()
+
+        if re.search(r"\bassocie\b", low) and re.search(r"\bcoluna\s+[abi12i]+\b", low):
+            q["type"] = "matching"
+            columns = _extract_matching_columns(text)
+            if columns:
+                q["matchColumns"] = columns
+            q.setdefault("disciplineData", {})["interactionMode"] = "matching"
+            repaired += 1
+            continue
+
+        if re.search(r"\bordene\s+cronologicamente\b", low):
+            q["type"] = "ordering"
+            items = _extract_ordering_items(text)
+            if items:
+                q["orderingItems"] = items
+            q.setdefault("disciplineData", {})["interactionMode"] = "ordering"
+            repaired += 1
+
+    if repaired:
+        output.setdefault("warnings", []).append({
+            "type": "history_interaction_type_repaired",
+            "message": f"Repaired {repaired} Historia matching/ordering question(s).",
+        })
+
+
+def _extract_matching_columns(text: str) -> dict | None:
+    left = _extract_column_items(text, letters=True)
+    right = _extract_column_items(text, letters=False)
+    if not left or not right:
+        return None
+    return {"left": left, "right": right}
+
+
+def _extract_column_items(text: str, letters: bool) -> list[dict]:
+    marker = r"[a-e]" if letters else r"\d{1,2}"
+    matches = list(re.finditer(
+        rf"(?ms)\(({marker})\)\s*(.*?)(?=\n\s*\((?:[a-e]|\d{{1,2}})\)\s*|\Z)",
+        text,
+        re.IGNORECASE,
+    ))
+    items = []
+    seen = set()
+    for match in matches:
+        key = match.group(1).strip()
+        is_letter = bool(re.match(r"^[a-e]$", key, re.IGNORECASE))
+        if is_letter != letters or key in seen:
+            continue
+        value = _clean_option_text(match.group(2))
+        if value:
+            items.append({"key": key.lower() if letters else key, "text": value})
+            seen.add(key)
+    return items
+
+
+def _extract_ordering_items(text: str) -> list[dict]:
+    if re.search(r"\bimagens?\s+A,\s*B,\s*C\s+e\s+D\b", text, re.IGNORECASE):
+        return [{"key": letter, "text": f"Imagem {letter}"} for letter in ("A", "B", "C", "D")]
+
+    image_letters = sorted(set(letter.upper() for letter in re.findall(r"\bimagens?\s+([A-D])\b", text, re.IGNORECASE)))
+    if len(image_letters) >= 2:
+        return [{"key": letter, "text": f"Imagem {letter}"} for letter in image_letters]
+
+    options = _extract_letter_options(text)
+    if options:
+        return [{"key": opt["letter"], "text": opt["text"]} for opt in options]
+    return []
+
+
+def _remove_history_line_number_artifacts(output: dict) -> None:
+    """Remove line-number artifacts such as q95 extracted from document text."""
+    questions = output.get("questions", [])
+    clean = []
+    removed = 0
+    for q in questions:
+        number = str(q.get("number") or "").strip()
+        if number.isdigit() and int(number) > 30 and q.get("groupId"):
+            removed += 1
+            continue
+        clean.append(q)
+    if removed:
+        output["questions"] = clean
+        stats = output.setdefault("metadata", {}).setdefault("stats", {})
+        if isinstance(stats, dict):
+            stats["answerableItems"] = len(clean)
+            stats["mainQuestions"] = len(clean)
+        output.setdefault("warnings", []).append({
+            "type": "history_line_number_artifact_removed",
+            "message": f"Removed {removed} line-number artifact question(s).",
         })
 
 

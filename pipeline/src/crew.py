@@ -1,5 +1,6 @@
 """ExamCrew Pipeline v3: PDF → subject detection → pre-scan → per-question extraction → JSON."""
 import json
+import os
 import re
 from pathlib import Path
 
@@ -71,6 +72,22 @@ def _attach_question_regions(questions: list[dict], extraction: dict):
             }
 
 
+def _has_scoring_text(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in (
+        "cotação",
+        "cotações",
+        "cotacao",
+        "cotacoes",
+        "cotaÃ§",
+        "classificação final",
+        "classificacao final",
+        "pontuação",
+        "pontuacao",
+        "pontu",
+    ))
+
+
 class ExamProcessingCrew:
     def __init__(self, pdf_path: str, exam_id: str, base_dir: str = None):
         self.pdf_path = pdf_path
@@ -105,7 +122,10 @@ class ExamProcessingCrew:
 
         # Step 1.5: Detect subject and filter formula pages
         cover_text = extraction["pages"][0]["text"] if extraction["pages"] else ""
-        subject_key, subject_profile = detect_subject(cover_text)
+        source_url = os.environ.get("EXAM_SOURCE_URL") or ""
+        original_filename = os.environ.get("EXAM_ORIGINAL_FILENAME") or Path(self.pdf_path).name
+        subject_hint = "\n".join([cover_text, source_url, original_filename])
+        subject_key, subject_profile = detect_subject(subject_hint)
         report_progress("subject", f"Detected subject: {subject_key}")
 
         # Filter out formula/cover pages
@@ -201,6 +221,41 @@ class ExamProcessingCrew:
             if pr.get("scoring"):
                 scoring_collected.extend(pr["scoring"])
 
+        # Prefer processed pages over the raw PDF tail. Older exams can end with
+        # technical/accessibility pages that are not part of the statement.
+        if not scoring_collected:
+            scoring_pages = list(reversed(pages_to_process[-3:] or extraction["pages"][-3:]))
+            for scoring_page in scoring_pages:
+                scoring = _extract_scoring(scoring_page["page_image_path"], scoring_page["page"])
+                if scoring:
+                    scoring_collected = scoring
+                    break
+
+            if not scoring_collected:
+                for scoring_page in scoring_pages:
+                    scoring_text = scoring_page.get("text", "")
+                    if not _has_scoring_text(scoring_text):
+                        continue
+                    text_prompt = f"""Extract scoring from this text. Each line has a question number and points.
+Respond ONLY with JSON array: [{{"question": "1", "points": 12}}]
+
+Text:
+{scoring_text[:3000]}"""
+                    content = _call_text(text_prompt, 512)
+                    if content:
+                        import re as _re
+                        try:
+                            scoring_collected = json.loads(content)
+                        except json.JSONDecodeError:
+                            match = _re.search(r'\[[\s\S]*\]', content)
+                            if match:
+                                try:
+                                    scoring_collected = json.loads(match.group())
+                                except json.JSONDecodeError:
+                                    pass
+                    if scoring_collected:
+                        break
+
         # If pre-scan didn't find scoring, do dedicated extraction on last page
         if not scoring_collected:
             last_page = extraction["pages"][-1]
@@ -239,8 +294,15 @@ Text:
         # Step 3: Assemble
         report_progress("assemble", "Building structured output")
         self._last_page_results = page_results  # Store for retry scoring re-application
+        extraction["_processed_pages"] = pages_to_process
         output = self._assemble_output(extraction, page_results, subject_profile)
         output["metadata"]["subject"] = subject_key.replace("_", " ").title() if subject_key != "unknown" else None
+        output["metadata"]["sourceUrl"] = source_url or None
+        output["metadata"]["originalFilename"] = original_filename or None
+        url_match = re.search(r"/(20\d{2})-([12])fase/", source_url, re.IGNORECASE)
+        if url_match:
+            output["metadata"]["year"] = output["metadata"].get("year") or url_match.group(1)
+            output["metadata"]["phase"] = output["metadata"].get("phase") or f"{url_match.group(2)}ª Fase"
         output["metadata"]["formula_pages"] = formula_pages
         output["metadata"]["preflight"] = preflight.to_dict()
 
@@ -269,6 +331,16 @@ Text:
             repaired_text = repair_corrupt_questions_from_text(output, extraction)
             if repaired_text:
                 report_progress("normalize", f"Repaired {repaired_text} corrupted question text(s) from native PDF text")
+
+            reapplied_points = self._reapply_page_result_scoring(output, page_results)
+            if subject_profile and subject_profile.get("has_source_grouping"):
+                reapplied_points += self._apply_scoring_entries_to_output(
+                    output,
+                    self._parse_history_scoring(extraction),
+                    overwrite=True,
+                )
+            if reapplied_points:
+                report_progress("scoring", f"Applied scoring to {reapplied_points} text-fallback question(s)")
         else:
             from .utils.text_question_fallback import extract_questions_from_text_pages, repair_corrupt_questions_from_text
 
@@ -302,6 +374,16 @@ Text:
             repaired_text = repair_corrupt_questions_from_text(output, extraction)
             if repaired_text:
                 report_progress("normalize", f"Repaired {repaired_text} corrupted question text(s) from native PDF text")
+
+            reapplied_points = self._reapply_page_result_scoring(output, page_results)
+            if subject_profile and subject_profile.get("has_source_grouping"):
+                reapplied_points += self._apply_scoring_entries_to_output(
+                    output,
+                    self._parse_history_scoring(extraction),
+                    overwrite=True,
+                )
+            if reapplied_points:
+                report_progress("scoring", f"Applied scoring to {reapplied_points} text-fallback question(s)")
 
         # Step 3.2: Extract table data for tables without rows
         from .tools.vision_tool import _extract_table_data
@@ -772,6 +854,51 @@ Text:
 
         return output
 
+    def _reapply_page_result_scoring(self, output: dict, page_results: list[dict]) -> int:
+        """Apply scoring collected before later text-fallback questions were added."""
+        scoring_entries = []
+        for pr in page_results or []:
+            for score in pr.get("scoring", []) or []:
+                q_num = str(score.get("question") or score.get("number") or "").strip().rstrip(".")
+                pts = score.get("points") or score.get("cotacao") or score.get("score")
+                group = str(score.get("group") or score.get("groupId") or "").strip()
+                if not q_num or pts is None:
+                    continue
+                try:
+                    pts = int(float(str(pts)))
+                except (ValueError, TypeError):
+                    continue
+                if pts > 0:
+                    scoring_entries.append({"question": q_num, "points": pts, "group": group})
+
+        return self._apply_scoring_entries_to_output(output, scoring_entries, overwrite=False)
+
+    def _apply_scoring_entries_to_output(self, output: dict, scoring_entries: list[dict], overwrite: bool = False) -> int:
+        """Apply group-aware scoring entries to output questions."""
+        applied = 0
+        questions = output.get("questions", []) or []
+        for entry in scoring_entries:
+            q_num = entry["question"]
+            pts = entry["points"]
+            group = entry.get("group", "")
+            candidates = [
+                q for q in questions
+                if str(q.get("number", "")).strip() == q_num and (overwrite or q.get("points") is None)
+            ]
+            if group:
+                grouped = [
+                    q for q in candidates
+                    if group.lower() in str(q.get("groupId") or q.get("group") or "").lower()
+                ]
+                candidates = grouped or candidates
+            if candidates:
+                for q in candidates[:1]:
+                    if q.get("points") != pts:
+                        q["points"] = pts
+                        applied += 1
+
+        return applied
+
     def _extract_question_from_text(self, page_text: str, q_number: int) -> dict | None:
         """Extract a question from raw page text using regex. Last-resort fallback."""
         # Find the question block: starts with "N." and ends before next question or end
@@ -815,18 +942,25 @@ Text:
         Handles vertical table format where each cell is on its own line:
         I\nII\nII\n...\n1.\n1.\n2.\n...\n13\n14\n20\n...
         """
-        pages = extraction.get("pages", [])
+        pages = extraction.get("_processed_pages") or extraction.get("pages", [])
         if not pages:
             return []
 
         scoring_text = ""
-        for p in pages[-2:]:
+        for p in reversed(pages[-4:]):
             text = p.get("text", "")
+            if _has_scoring_text(text):
+                scoring_text = text
+                break
             if "cotaç" in text.lower():
                 scoring_text = text
                 break
         if not scoring_text:
             return []
+
+        structured_results = self._parse_history_scoring_lines(scoring_text)
+        if structured_results:
+            return structured_results
 
         results = []
         roman_map = {"I": "grupo_i", "II": "grupo_ii", "III": "grupo_iii", "IV": "grupo_iv"}
@@ -911,6 +1045,122 @@ Text:
                     results.append({"question": item_m.group(1), "points": optional_points, "group": optional_group})
 
         return results
+
+    def _parse_history_scoring_lines(self, scoring_text: str) -> list[dict]:
+        """Parse modern and optional-item Historia scoring tables from native PDF text."""
+        roman_map = {"I": "grupo_i", "II": "grupo_ii", "III": "grupo_iii", "IV": "grupo_iv"}
+        lines = [re.sub(r"\s+", " ", line).strip() for line in (scoring_text or "").splitlines()]
+        lines = [line for line in lines if line]
+
+        def roman_token(value: str) -> str:
+            value = re.sub(r"^Grupo\s+", "", value, flags=re.IGNORECASE)
+            value = re.sub(r"[^ivIV]", "", value).upper()
+            return value if value in roman_map else ""
+
+        def item_token(value: str) -> str:
+            match = re.match(r"^(\d{1,2})\.$", value)
+            return match.group(1) if match else ""
+
+        def point_token(value: str) -> int | None:
+            if not re.match(r"^\d{1,3}$", value):
+                return None
+            val = int(value)
+            return val if 1 <= val <= 100 else None
+
+        results: list[dict] = []
+
+        # Standard vertical layout:
+        # Grupo / Item / Cotação -> I -> 1. 2. 3. -> 10 10 10 subtotal -> II ...
+        i = 0
+        while i < len(lines):
+            group = roman_token(lines[i])
+            if not group:
+                i += 1
+                continue
+            gid = roman_map[group]
+            j = i + 1
+            items: list[str] = []
+            while j < len(lines):
+                item = item_token(lines[j])
+                if not item:
+                    break
+                items.append(item)
+                j += 1
+            if not items:
+                i += 1
+                continue
+            points: list[int] = []
+            while j < len(lines):
+                point = point_token(lines[j])
+                if point is None:
+                    break
+                points.append(point)
+                j += 1
+            if len(points) >= len(items):
+                for item, point in zip(items, points[:len(items)]):
+                    results.append({"question": item, "points": point, "group": gid})
+                i = j
+                continue
+            i += 1
+
+        if len(results) >= 8:
+            return results
+
+        # Older optional layout:
+        # mandatory columns followed by "Destes N itens ... 7 x 18 pontos".
+        old_results: list[dict] = []
+        start = next((idx for idx, line in enumerate(lines) if line.lower() == "grupo"), -1)
+        if start >= 0:
+            idx = start + 1
+            while idx < len(lines) and not roman_token(lines[idx]):
+                idx += 1
+            groups: list[str] = []
+            while idx < len(lines):
+                token = roman_token(lines[idx])
+                if not token:
+                    break
+                groups.append(token)
+                idx += 1
+            items: list[str] = []
+            while idx < len(lines):
+                item = item_token(lines[idx])
+                if not item:
+                    break
+                items.append(item)
+                idx += 1
+            while idx < len(lines) and point_token(lines[idx]) is None:
+                idx += 1
+            points: list[int] = []
+            while idx < len(lines):
+                point = point_token(lines[idx])
+                if point is None:
+                    break
+                points.append(point)
+                idx += 1
+
+            for group, item, point in zip(groups, items, points[:len(items)]):
+                old_results.append({"question": item, "points": point, "group": roman_map[group]})
+
+        optional_match = re.search(r"(\d+)\s*[x×]\s*(\d+)\s*pontos", scoring_text, re.IGNORECASE)
+        optional_points = int(optional_match.group(2)) if optional_match else None
+        if optional_points:
+            current_group = ""
+            in_optional_section = False
+            for line in lines:
+                if "contribuem para a classificação" in line.lower() or "contribuem para a classificacao" in line.lower():
+                    in_optional_section = True
+                    continue
+                if not in_optional_section:
+                    continue
+                group = roman_token(line)
+                if group:
+                    current_group = roman_map[group]
+                    continue
+                item = item_token(line)
+                if item and current_group:
+                    old_results.append({"question": item, "points": optional_points, "group": current_group})
+
+        return old_results
 
     def _extract_metadata(self, page_results: list[dict], extraction: dict) -> dict:
         """Extract metadata deterministically from raw PDF text (pages 1-2)."""
@@ -1391,12 +1641,21 @@ Text:
                     q["points"] = pts
                     break
 
+        scoring_candidate_text = ""
+        scoring_candidate_pages = extraction.get("_processed_pages") or extraction.get("pages", [])
+        for scoring_page in reversed(scoring_candidate_pages[-4:]):
+            candidate_text = scoring_page.get("text", "")
+            if _has_scoring_text(candidate_text):
+                scoring_candidate_text = candidate_text
+                break
+        if not scoring_candidate_text and scoring_candidate_pages:
+            scoring_candidate_text = scoring_candidate_pages[-1].get("text", "")
+
         # If most questions still have no points, try text-based scoring from last page
         real_qs_no_points = [q for q in all_questions if q["number"].isdigit() and not q.get("parentQuestion") and not q.get("isGroup") and q.get("points") is None]
         if len(real_qs_no_points) > len(all_questions) // 3:
             # Scoring merge mostly failed — try text-based fallback
-            last_page = extraction["pages"][-1]
-            last_text = last_page.get("text", "")
+            last_text = scoring_candidate_text
             if last_text:
                 # Try to parse scoring from raw text using regex
                 import re as _re
@@ -1417,8 +1676,7 @@ Text:
 
         # Detect optional questions from scoring page: "N × P pontos" pattern
         # and list of optional question numbers
-        last_page = extraction["pages"][-1]
-        last_text = last_page.get("text", "")
+        last_text = scoring_candidate_text
         import re as _re2
         opt_match = _re2.search(r'(\d+)\s*[×x]\s*(\d+)\s*pontos', last_text)
         opt_points = int(opt_match.group(2)) if opt_match else None

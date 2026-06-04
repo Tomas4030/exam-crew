@@ -65,7 +65,7 @@ function readFinalTokenUsage(examId: string): TokenUsage | undefined {
   return undefined;
 }
 
-export function runPipeline(pdfPath: string, examId: string): Promise<ProcessResult> {
+export function runPipeline(pdfPath: string, examId: string, sourceUrl?: string): Promise<ProcessResult> {
   return new Promise((resolve) => {
     const pipelineDir = path.join(process.cwd(), 'pipeline');
     const uvPath = process.env.UV_PATH || 'uv';
@@ -78,6 +78,11 @@ export function runPipeline(pdfPath: string, examId: string): Promise<ProcessRes
 
     const child = spawn(uvPath, ['run', 'python', '-m', 'src.main', pdfPath, examId], {
       cwd: pipelineDir,
+      env: {
+        ...process.env,
+        EXAM_SOURCE_URL: sourceUrl || '',
+        EXAM_ORIGINAL_FILENAME: path.basename(sourceUrl ? new URL(sourceUrl).pathname : pdfPath),
+      },
     });
 
     let stdout = '';

@@ -456,7 +456,6 @@ def _audit_document_expectations(root: str, questions: list[dict], sources: list
 
 def _audit_crops(root: str, sources: list[dict], bundle: ExamBundle, issues: list[Issue], metadata: dict | None = None) -> None:
     hashes_by_group: dict[tuple[str, str], list[str]] = {}
-    suspect_crops: list[Issue] = []
     total_pages = int((metadata or {}).get("total_pages") or 0)
     for source in sources:
         crop = ((source.get("crops") or {}).get("best") or (source.get("crops") or {}).get("full") or {})
@@ -484,7 +483,7 @@ def _audit_crops(root: str, sources: list[dict], bundle: ExamBundle, issues: lis
             continue
         width, height = _png_dimensions(data)
         if height and height < 80:
-            suspect_crops.append(Issue(
+            issues.append(Issue(
                 root, "HIGH", "SUSPECT_CROP_TOO_SMALL",
                 f"source crop is only {width}x{height}px; likely a footer/citation, not a document",
                 question_id=str(source.get("sourceId") or ""),
@@ -492,8 +491,8 @@ def _audit_crops(root: str, sources: list[dict], bundle: ExamBundle, issues: lis
                 actual=f"{rel} ({width}x{height})",
             ))
         elif width and height and width / height > 8:
-            suspect_crops.append(Issue(
-                root, "HIGH", "SUSPECT_CROP_TOO_SMALL",
+            issues.append(Issue(
+                root, "MEDIUM", "SUSPECT_CROP_TOO_SMALL",
                 f"source crop has extreme aspect ratio {width}x{height}px; likely a footer/citation",
                 question_id=str(source.get("sourceId") or ""),
                 group=str(source.get("groupId") or ""),
@@ -502,11 +501,6 @@ def _audit_crops(root: str, sources: list[dict], bundle: ExamBundle, issues: lis
         digest = hashlib.sha256(data).hexdigest()
         key = (source.get("groupId") or "", digest)
         hashes_by_group.setdefault(key, []).append(source.get("sourceId") or "")
-
-    crop_severity = "HIGH" if len(suspect_crops) >= 3 else "MEDIUM"
-    for issue in suspect_crops:
-        issue.severity = crop_severity
-        issues.append(issue)
 
     for (group, _digest), source_ids in hashes_by_group.items():
         if len(source_ids) > 1:
@@ -557,6 +551,8 @@ def _mentions_document_or_image(text: str) -> bool:
 
 def _looks_like_selection_prompt(text: str) -> bool:
     if not text:
+        return False
+    if re.search(r"\btranscreva\s+duas\s+afirma", text, re.IGNORECASE):
         return False
     patterns = (
         r"\bselec(?:ione|cione|cione)\s+as?\s+duas\b",
