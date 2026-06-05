@@ -7,10 +7,16 @@ import { buildExamExportName, normalizeExamForExport } from '@/lib/examExport';
 
 export async function GET() {
   const jobs = await getJobs();
-  const completedJobs = jobs.filter(j => j.status === 'completed' || j.status === 'completed_with_warnings');
+  const exportableJobs = jobs.filter(j =>
+    j.status === 'completed' ||
+    j.status === 'completed_with_warnings' ||
+    j.status === 'needs_review' ||
+    j.status === 'partial_failed' ||
+    j.status === 'error'
+  );
 
-  if (completedJobs.length === 0) {
-    return NextResponse.json({ error: 'No completed exams found' }, { status: 404 });
+  if (exportableJobs.length === 0) {
+    return NextResponse.json({ error: 'No exportable exams found' }, { status: 404 });
   }
 
   const outputDir = path.join(process.cwd(), 'data', 'output');
@@ -22,22 +28,29 @@ export async function GET() {
     archive.on('end', resolve);
     archive.on('error', reject);
 
-    for (const job of completedJobs) {
+    for (const job of exportableJobs) {
       const id = job.id;
       const jsonPath = path.join(outputDir, `${id}.json`);
-      if (!fs.existsSync(jsonPath)) continue;
+      const hasExamJson = fs.existsSync(jsonPath);
+      const examData = hasExamJson
+        ? normalizeExamForExport(JSON.parse(fs.readFileSync(jsonPath, 'utf-8')))
+        : null;
+      const folder = examData ? buildExamExportName(examData, id) : buildFallbackExportName(job, id);
 
-      const examData = normalizeExamForExport(JSON.parse(fs.readFileSync(jsonPath, 'utf-8')));
-      const usedFiles = collectUsedAssets(examData);
-      const folder = buildExamExportName(examData, id);
+      if (examData) {
+        const usedFiles = collectUsedAssets(examData);
+        archive.append(JSON.stringify(examData, null, 2), { name: `${folder}/exam.json` });
 
-      archive.append(JSON.stringify(examData, null, 2), { name: `${folder}/exam.json` });
-
-      for (const relPath of usedFiles) {
-        const absPath = path.join(outputDir, id, relPath);
-        if (fs.existsSync(absPath)) {
-          archive.file(absPath, { name: `${folder}/${relPath}` });
+        for (const relPath of usedFiles) {
+          const absPath = path.join(outputDir, id, relPath);
+          if (fs.existsSync(absPath)) {
+            archive.file(absPath, { name: `${folder}/${relPath}` });
+          }
         }
+      }
+
+      if (job.status === 'error' || job.error) {
+        archive.append(JSON.stringify(buildErrorReport(job, examData), null, 2), { name: `${folder}/error.json` });
       }
     }
 
@@ -54,6 +67,38 @@ export async function GET() {
       'Content-Disposition': `attachment; filename="${zipFilename}"`,
     },
   });
+}
+
+function buildFallbackExportName(job: { filename?: string; sourceUrl?: string }, id: string) {
+  const source = `${job.sourceUrl || ''}/${job.filename || 'Exame'}`;
+  const year = source.match(/\/(20\d{2})-/)?.[1] || '';
+  const phase = source.match(/-(\d)fase\//i)?.[1] || '';
+  const subject = String(job.filename || 'Exame')
+    .replace(/\.pdf$/i, '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9]/g, '') || 'Exame';
+  const shortId = id.split('_').pop() || id.slice(-8);
+  return `${subject}${year}${phase ? `Fase${phase}` : ''}_${shortId}`;
+}
+
+function buildErrorReport(job: Record<string, any>, examData: Record<string, any> | null) {
+  const metadata = examData?.metadata || {};
+  const audit = metadata.portugueseAudit || metadata.historyAudit || null;
+  return {
+    id: job.id,
+    filename: job.filename,
+    status: job.status,
+    error: job.error || null,
+    sourceUrl: job.sourceUrl || metadata.sourceUrl || null,
+    createdAt: job.createdAt || null,
+    startedAt: job.startedAt || null,
+    completedAt: job.completedAt || null,
+    updatedAt: job.updatedAt || null,
+    processingStatus: examData?.processingStatus || metadata.processingStatus || null,
+    needsHumanReview: examData?.needsHumanReview ?? metadata.needsHumanReview ?? null,
+    audit,
+  };
 }
 
 function collectUsedAssets(examData: Record<string, unknown>): string[] {
