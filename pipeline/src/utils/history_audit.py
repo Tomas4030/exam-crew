@@ -131,7 +131,7 @@ def audit_bundle(bundle: ExamBundle) -> list[Issue]:
     metadata = data.get("metadata") or {}
 
     _audit_counts(root, questions, metadata, issues)
-    _audit_points(root, questions, issues)
+    _audit_points(root, questions, issues, metadata)
     _audit_metadata(root, metadata, issues)
     _audit_text_quality(root, questions, issues)
     _audit_question_types(root, questions, issues)
@@ -253,7 +253,7 @@ def _audit_counts(root: str, questions: list[dict], metadata: dict, issues: list
             ))
 
 
-def _audit_points(root: str, questions: list[dict], issues: list[Issue]) -> None:
+def _audit_points(root: str, questions: list[dict], issues: list[Issue], metadata: dict | None = None) -> None:
     null_points: list[str] = []
     zero_points: list[str] = []
     total = 0
@@ -363,6 +363,18 @@ def _audit_question_types(root: str, questions: list[dict], issues: list[Issue])
             if invalid:
                 issues.append(Issue(root, "HIGH", "MULTIBLANK_WITHOUT_OPTIONS",
                                     "multi_blank_choice item has missing blanks/options", qid, _group_id(q), str(q.get("number") or "")))
+
+        if qtype == "matching":
+            columns = q.get("matchColumns") or {}
+            left = columns.get("left") or columns.get("columnA") or []
+            right = columns.get("right") or columns.get("columnB") or []
+            if len(left) < 2 or len(right) < 2:
+                issues.append(Issue(root, "HIGH", "MATCHING_WITHOUT_COLUMNS",
+                                    "matching item has missing/insufficient matchColumns", qid, _group_id(q), str(q.get("number") or "")))
+
+        if qtype == "ordering" and len(q.get("orderingItems") or []) < 2:
+            issues.append(Issue(root, "HIGH", "ORDERING_WITHOUT_ITEMS",
+                                "ordering item has fewer than 2 orderingItems", qid, _group_id(q), str(q.get("number") or "")))
 
         if "complete o texto" in text and qtype != "multi_blank_choice":
             issues.append(Issue(root, "HIGH", "MULTIBLANK_MISCLASSIFIED",
@@ -492,8 +504,8 @@ def _audit_crops(root: str, sources: list[dict], bundle: ExamBundle, issues: lis
             ))
         elif width and height and width / height > 8:
             issues.append(Issue(
-                root, "MEDIUM", "SUSPECT_CROP_TOO_SMALL",
-                f"source crop has extreme aspect ratio {width}x{height}px; likely a footer/citation",
+                root, "INFO", "SUSPECT_CROP_TOO_SMALL",
+                f"source crop has extreme aspect ratio {width}x{height}px; visually inspect if this document matters",
                 question_id=str(source.get("sourceId") or ""),
                 group=str(source.get("groupId") or ""),
                 actual=f"{rel} ({width}x{height})",

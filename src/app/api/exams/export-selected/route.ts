@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import archiver from 'archiver';
 import { getJobs } from '@/lib/storage';
+import { buildExamExportName, normalizeExamForExport } from '@/lib/examExport';
 
 type ExportSelectedRequest = {
   ids?: string[];
@@ -43,11 +44,11 @@ export async function POST(request: Request) {
       const jsonPath = path.join(outputDir, `${id}.json`);
       if (!fs.existsSync(jsonPath)) continue;
 
-      const examData = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
+      const examData = normalizeExamForExport(JSON.parse(fs.readFileSync(jsonPath, 'utf-8')));
       const usedFiles = collectUsedAssets(examData);
-      const folder = buildFolderName(examData, id);
+      const folder = buildExamExportName(examData, id);
 
-      archive.file(jsonPath, { name: `${folder}/exam.json` });
+      archive.append(JSON.stringify(examData, null, 2), { name: `${folder}/exam.json` });
 
       for (const relPath of usedFiles) {
         const absPath = path.join(outputDir, id, relPath);
@@ -74,17 +75,6 @@ export async function POST(request: Request) {
       'Content-Disposition': `attachment; filename="${zipFilename}"`,
     },
   });
-}
-
-function buildFolderName(examData: Record<string, unknown>, id: string) {
-  const metadata = examData.metadata as Record<string, unknown> | undefined;
-  const subject = String(metadata?.subject || 'Exame')
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-zA-Z0-9]/g, '');
-  const year = metadata?.year || '';
-  const phase = String(metadata?.phase || '').replace(/[^0-9]/g, '');
-  const shortId = id.split('_').pop() || id.slice(-8);
-  return `${subject}${year}${phase ? `Fase${phase}` : ''}_${shortId}`;
 }
 
 function collectUsedAssets(examData: Record<string, unknown>): string[] {

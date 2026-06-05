@@ -301,8 +301,8 @@ Text:
         output["metadata"]["originalFilename"] = original_filename or None
         url_match = re.search(r"/(20\d{2})-([12])fase/", source_url, re.IGNORECASE)
         if url_match:
-            output["metadata"]["year"] = output["metadata"].get("year") or url_match.group(1)
-            output["metadata"]["phase"] = output["metadata"].get("phase") or f"{url_match.group(2)}ª Fase"
+            output["metadata"]["year"] = url_match.group(1)
+            output["metadata"]["phase"] = f"{url_match.group(2)}ª Fase"
         output["metadata"]["formula_pages"] = formula_pages
         output["metadata"]["preflight"] = preflight.to_dict()
 
@@ -540,6 +540,30 @@ Text:
             report_progress("error", message)
             raise RuntimeError(message)
 
+        portuguese_audit_issues = []
+        portuguese_audit_summary = {"verdict": "SKIPPED"}
+        if subject_profile and "portugues" in subject_profile.get("normalizers", []):
+            from .utils.portuguese_audit import apply_portuguese_audit_gate
+
+            report_progress("audit", "Running Portuguese quality audit")
+            output, portuguese_audit_issues, portuguese_audit_summary = apply_portuguese_audit_gate(
+                output,
+                self.output_dir / self.exam_id,
+            )
+
+        if portuguese_audit_summary.get("verdict") == "FAIL":
+            out_file = self.output_dir / f"{self.exam_id}.json"
+            output = self._attach_run_metrics(output)
+            out_file.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+            top = portuguese_audit_issues[0].code if portuguese_audit_issues else "UNKNOWN"
+            message = (
+                "Portuguese audit failed before completion: "
+                f"{portuguese_audit_summary.get('blocker', 0)} blocker(s), "
+                f"{portuguese_audit_summary.get('high', 0)} high issue(s). Top issue: {top}."
+            )
+            report_progress("error", message)
+            raise RuntimeError(message)
+
         # Step 4.95: Final quality gate
         question_count = len(output.get("questions") or [])
 
@@ -575,6 +599,8 @@ Text:
             "GROUP_NUMBER_GAP",
             "CORRUPT_TEXT",
             "MULTIPLE_CHOICE_WITHOUT_OPTIONS",
+            "MATCHING_WITHOUT_COLUMNS",
+            "ORDERING_WITHOUT_ITEMS",
             "MULTIBLANK_WITHOUT_OPTIONS",
             "MULTIBLANK_MISCLASSIFIED",
             "CHOICE_LIKE_OPEN_ANSWER",
@@ -639,6 +665,8 @@ Text:
 
         needs_structure_pass = bool(codes & {
             "MULTIPLE_CHOICE_WITHOUT_OPTIONS",
+            "MATCHING_WITHOUT_COLUMNS",
+            "ORDERING_WITHOUT_ITEMS",
             "MULTIBLANK_WITHOUT_OPTIONS",
             "MULTIBLANK_MISCLASSIFIED",
             "CHOICE_LIKE_OPEN_ANSWER",

@@ -1,0 +1,677 @@
+"""Portuguese exam normalizer.
+
+Keep this module subject-specific. Do not put Historia rules here.
+"""
+from __future__ import annotations
+
+import re
+from typing import Any
+
+
+def normalize_portugues(output: dict, extraction: dict | None = None) -> dict:
+    """Apply deterministic repairs for Portuguese national exams."""
+    _split_embedded_grupo_iii(output)
+    _repair_grupo_iii_composition(output, extraction)
+    _normalize_group_metadata(output)
+    _remove_legacy_duplicate_questions(output)
+    _collapse_multiple_grupo_iii_questions(output)
+    _repair_composition_question(output)
+    _repair_missing_choice_options(output)
+    _repair_points_from_scoring_text(output, extraction)
+    _sort_questions(output)
+    _refresh_stats(output)
+    return output
+
+
+def _split_embedded_grupo_iii(output: dict) -> None:
+    questions = output.get("questions") or []
+    if any(q.get("groupId") == "grupo_iii" for q in questions):
+        return
+
+    for q in list(questions):
+        text = _question_all_text(q)
+        match = re.search(r"\bGRUPO\s+III\b", text, re.IGNORECASE)
+        if not match:
+            continue
+
+        composition = _extract_grupo_iii_statement(text[match.start():])
+        if not composition:
+            continue
+
+        for key in _TEXT_KEYS:
+            value = q.get(key)
+            if isinstance(value, str):
+                q[key] = _strip_after_grupo_iii(value)
+
+        q.setdefault("warnings", []).append({
+            "type": "portuguese_embedded_group_iii_split",
+            "message": "Removed embedded Grupo III text from this question.",
+        })
+
+        new_question = {
+            "questionId": "grupo_iii_q1",
+            "number": "1",
+            "type": "open_answer",
+            "sourcePage": q.get("sourcePage"),
+            "statement": composition,
+            "sourceTextRaw": composition,
+            "rawText": composition,
+            "blanks": None,
+            "options": [],
+            "maxSelections": None,
+            "imageRefs": [],
+            "tableRefs": [],
+            "assetRefs": [],
+            "visualDependency": False,
+            "confidence": 0.9,
+            "needsHumanReview": False,
+            "warnings": [],
+            "parentQuestion": None,
+            "subQuestions": [],
+            "mathHeavy": False,
+            "hasGraph": False,
+            "hasDiagram": False,
+            "hasTable": False,
+            "calculatorAllowed": None,
+            "points": None,
+            "isMandatory": True,
+            "region": q.get("region"),
+            "groupId": "grupo_iii",
+            "group": "Grupo III",
+            "displayNumber": "Grupo III, item 1",
+            "sourceRefs": [],
+            "media": [],
+            "statementPlain": composition,
+            "statementLatex": composition,
+            "statementRaw": composition,
+            "statementFormatted": composition,
+            "statementPlainFormatted": composition,
+            "statementLatexFormatted": composition,
+        }
+        questions.append(new_question)
+        output.setdefault("warnings", []).append({
+            "type": "portuguese_group_iii_recovered",
+            "message": "Recovered Grupo III composition prompt from embedded text.",
+        })
+        return
+
+
+def _repair_grupo_iii_composition(output: dict, extraction: dict | None) -> None:
+    questions = output.get("questions") or []
+    extracted = _extract_grupo_iii_from_pages(extraction)
+
+    composition_questions = [q for q in questions if _is_composition_prompt(_question_all_text(q))]
+    observation_questions = [q for q in questions if q.get("groupId") == "grupo_iii" and _is_observation_artifact(q)]
+
+    if extracted:
+        target = next((q for q in questions if q.get("groupId") == "grupo_iii" and not _is_observation_artifact(q)), None)
+        if target is None:
+            target = next((q for q in composition_questions if q not in observation_questions), None)
+        if target is None:
+            target = _new_grupo_iii_question(extracted, source_page=_find_grupo_iii_page(extraction))
+            questions.append(target)
+
+        _set_question_text(target, extracted)
+        target["questionId"] = "grupo_iii_q1"
+        target["number"] = "1"
+        target["type"] = "open_answer"
+        target["groupId"] = "grupo_iii"
+        target["group"] = "Grupo III"
+        target["displayNumber"] = "Grupo III, item 1"
+        target["options"] = []
+        target["blanks"] = None
+        target["maxSelections"] = None
+        target["sourceRefs"] = []
+        target["media"] = []
+        target["points"] = target.get("points") or None
+
+        removed = 0
+        clean = []
+        for q in questions:
+            if q is target:
+                clean.append(q)
+                continue
+            if q in observation_questions or _is_composition_prompt(_question_all_text(q)):
+                removed += 1
+                continue
+            clean.append(q)
+        output["questions"] = clean
+        if removed:
+            output.setdefault("warnings", []).append({
+                "type": "portuguese_group_iii_duplicates_removed",
+                "message": f"Removed {removed} duplicate/observation Grupo III candidate(s).",
+            })
+        return
+
+    if observation_questions:
+        output["questions"] = [q for q in questions if q not in observation_questions]
+        output.setdefault("warnings", []).append({
+            "type": "portuguese_group_iii_observations_removed",
+            "message": f"Removed {len(observation_questions)} Grupo III observation artifact(s).",
+        })
+
+
+def _new_grupo_iii_question(statement: str, source_page: int | None = None) -> dict:
+    return {
+        "questionId": "grupo_iii_q1",
+        "number": "1",
+        "type": "open_answer",
+        "sourcePage": source_page,
+        "statement": statement,
+        "sourceTextRaw": statement,
+        "rawText": statement,
+        "blanks": None,
+        "options": [],
+        "maxSelections": None,
+        "imageRefs": [],
+        "tableRefs": [],
+        "assetRefs": [],
+        "visualDependency": False,
+        "confidence": 0.9,
+        "needsHumanReview": False,
+        "warnings": [],
+        "parentQuestion": None,
+        "subQuestions": [],
+        "mathHeavy": False,
+        "hasGraph": False,
+        "hasDiagram": False,
+        "hasTable": False,
+        "calculatorAllowed": None,
+        "points": None,
+        "isMandatory": True,
+        "groupId": "grupo_iii",
+        "group": "Grupo III",
+        "displayNumber": "Grupo III, item 1",
+        "sourceRefs": [],
+        "media": [],
+        "statementPlain": statement,
+        "statementLatex": statement,
+        "statementRaw": statement,
+        "statementFormatted": statement,
+        "statementPlainFormatted": statement,
+        "statementLatexFormatted": statement,
+    }
+
+
+def _normalize_group_metadata(output: dict) -> None:
+    for q in output.get("questions") or []:
+        qid = str(q.get("questionId") or "")
+        if qid.startswith("grupo_i_"):
+            q["groupId"] = "grupo_i"
+            q["group"] = "Grupo I"
+        elif qid.startswith("grupo_ii_"):
+            q["groupId"] = "grupo_ii"
+            q["group"] = "Grupo II"
+        elif qid.startswith("grupo_iii_"):
+            q["groupId"] = "grupo_iii"
+            q["group"] = "Grupo III"
+        elif re.match(r"^q[12]_\d+$", qid):
+            q["groupId"] = "grupo_ii"
+            q["group"] = "Grupo II"
+
+        if q.get("groupId") and q.get("number"):
+            roman = {"grupo_i": "I", "grupo_ii": "II", "grupo_iii": "III"}.get(q["groupId"], "")
+            if roman:
+                q["displayNumber"] = f"Grupo {roman}, item {q['number']}"
+
+
+def _remove_legacy_duplicate_questions(output: dict) -> None:
+    questions = output.get("questions") or []
+    clean = []
+    seen = set()
+    removed = 0
+    for q in questions:
+        qid = str(q.get("questionId") or "")
+        text = _normalized_text(_question_prompt_text(q))
+        if q.get("groupId") == "grupo_ii" and re.search(r"\bresponda\s+(?:aos?|de forma)", text):
+            removed += 1
+            continue
+        key = (q.get("groupId"), q.get("number"), text[:180])
+        if text and key in seen:
+            removed += 1
+            continue
+        seen.add(key)
+        clean.append(q)
+    if removed:
+        output["questions"] = clean
+        output.setdefault("warnings", []).append({
+            "type": "portuguese_legacy_duplicates_removed",
+            "message": f"Removed {removed} duplicate/container question(s).",
+        })
+
+
+def _collapse_multiple_grupo_iii_questions(output: dict) -> None:
+    questions = output.get("questions") or []
+    grupo_iii = [q for q in questions if q.get("groupId") == "grupo_iii"]
+    if len(grupo_iii) <= 1:
+        return
+
+    def score(q: dict) -> tuple[int, int]:
+        text = _question_prompt_text(q)
+        return (
+            2 if _is_composition_prompt(text) else 0,
+            len(text),
+        )
+
+    keeper = max(grupo_iii, key=score)
+    removed = 0
+    clean = []
+    for q in questions:
+        if q.get("groupId") == "grupo_iii" and q is not keeper:
+            removed += 1
+            continue
+        clean.append(q)
+
+    keeper["questionId"] = "grupo_iii_q1"
+    keeper["number"] = "1"
+    keeper["groupId"] = "grupo_iii"
+    keeper["group"] = "Grupo III"
+    keeper["displayNumber"] = "Grupo III, item 1"
+    output["questions"] = clean
+    if removed:
+        output.setdefault("warnings", []).append({
+            "type": "portuguese_multiple_compositions_collapsed",
+            "message": f"Kept the best Grupo III composition and removed {removed} duplicate candidate(s).",
+        })
+
+
+def _repair_composition_question(output: dict) -> None:
+    for q in output.get("questions") or []:
+        text = _question_all_text(q).lower()
+        if q.get("groupId") == "grupo_iii" or "texto de opinião" in text or "texto de opiniao" in text:
+            q["type"] = "open_answer"
+            q["options"] = []
+            q["blanks"] = None
+            q["maxSelections"] = None
+            q.setdefault("disciplineData", {})["answerMode"] = "composition"
+            q.setdefault("disciplineData", {})["minWords"] = _extract_min_words(text)
+
+
+def _repair_missing_choice_options(output: dict) -> None:
+    repaired = 0
+    for q in output.get("questions") or []:
+        if q.get("type") not in {"multiple_choice", "multi_select"}:
+            continue
+        if q.get("options"):
+            continue
+        text = _question_prompt_text(q)
+        options = _extract_letter_options(text)
+        if len(options) >= 3:
+            q["options"] = options
+            repaired += 1
+    if repaired:
+        output.setdefault("warnings", []).append({
+            "type": "portuguese_choice_options_repaired",
+            "message": f"Extracted options for {repaired} choice question(s).",
+        })
+
+
+def _repair_points_from_scoring_text(output: dict, extraction: dict | None) -> None:
+    entries = _parse_portuguese_scoring(extraction)
+    if not entries:
+        return
+
+    by_key = {(entry["group"], str(entry["number"])): entry["points"] for entry in entries}
+    applied = 0
+    for q in output.get("questions") or []:
+        key = (q.get("groupId") or "", str(q.get("number") or ""))
+        points = by_key.get(key)
+        if points is None:
+            continue
+        if q.get("points") != points:
+            q["points"] = points
+            applied += 1
+
+    if applied:
+        output.setdefault("warnings", []).append({
+            "type": "portuguese_points_repaired",
+            "message": f"Applied Portuguese scoring table to {applied} question(s).",
+        })
+
+
+def _parse_portuguese_scoring(extraction: dict | None) -> list[dict[str, Any]]:
+    if not extraction:
+        return []
+    pages = extraction.get("_processed_pages") or extraction.get("pages") or []
+    scoring_pages = [
+        str(page.get("text") or "")
+        for page in pages
+        if isinstance(page, dict)
+        and re.search(r"\bCOTAÇÕES\b", str(page.get("text") or ""))
+        and re.search(r"\bTOTAL\b", str(page.get("text") or ""))
+    ]
+    scoring_text = scoring_pages[0] if scoring_pages else ""
+    if not scoring_text:
+        scoring_text = "\n".join(
+            str(page.get("text") or "")
+            for page in pages[-4:]
+            if isinstance(page, dict) and _looks_like_scoring_text(str(page.get("text") or ""))
+        )
+    if not scoring_text:
+        scoring_text = "\n".join(str(page.get("text") or "") for page in pages[-2:] if isinstance(page, dict))
+
+    text = re.sub(r"[ \t]+", " ", scoring_text.replace("\x07", " "))
+    if not _looks_like_scoring_text(text):
+        return []
+
+    modern = _parse_modern_portuguese_scoring(text)
+    if modern:
+        return modern
+
+    entries: list[dict[str, Any]] = []
+    group_aliases = (
+        ("grupo_i", r"Grupo\s+I"),
+        ("grupo_ii", r"Grupo\s+II"),
+        ("grupo_iii", r"Grupo\s+III"),
+    )
+    for idx, (gid, pattern) in enumerate(group_aliases):
+        start = re.search(pattern, text, re.IGNORECASE)
+        if not start:
+            continue
+        next_start = None
+        for _, next_pattern in group_aliases[idx + 1:]:
+            m = re.search(next_pattern, text[start.end():], re.IGNORECASE)
+            if m:
+                next_start = start.end() + m.start()
+                break
+        block = text[start.end():next_start]
+        entries.extend(_parse_group_scoring_block(gid, block))
+    return entries
+
+
+def _parse_modern_portuguese_scoring(text: str) -> list[dict[str, Any]]:
+    low = text.lower()
+    if "contribuem" not in low or "classificação final" not in low:
+        return []
+
+    scoring_text = text
+    scoring_matches = list(re.finditer(r"\bCOTAÇÕES\b", text))
+    if scoring_matches:
+        scoring_text = text[scoring_matches[-1].start():]
+
+    split = re.split(r"(?im)^\s*Destes\b", scoring_text, maxsplit=1)
+    before_optional = split[0]
+    optional_block = split[1] if len(split) > 1 else ""
+    entries = _parse_modern_mandatory_scoring(before_optional)
+    entries.extend(_parse_modern_optional_scoring(optional_block))
+    return _dedupe_entries(entries)
+
+
+def _parse_modern_mandatory_scoring(block: str) -> list[dict[str, Any]]:
+    lines = _scoring_lines(block)
+    group_tokens = [line.lower() for line in lines if line in {"I", "II", "III"}]
+    if not group_tokens:
+        return []
+
+    item_numbers = [int(m.group(1)) for line in lines if (m := re.match(r"^(\d{1,2})\.$", line))]
+    points = [int(line) for line in lines if re.match(r"^\d{1,3}$", line)]
+    points = _drop_subtotal(points)
+
+    if not item_numbers or not points:
+        return []
+
+    runs = _split_item_runs(item_numbers)
+    entries: list[dict[str, Any]] = []
+    group_ids = [_roman_to_group(token) for token in group_tokens]
+
+    point_index = 0
+    for gid, run in zip(group_ids, runs):
+        for item in run:
+            if point_index >= len(points):
+                break
+            entries.append({"group": gid, "number": str(item), "points": points[point_index]})
+            point_index += 1
+
+    # Modern Portuguese tables often omit item "1." under Grupo III because it is
+    # the single composition item; the remaining point value belongs to it.
+    if "grupo_iii" in group_ids and not any(e["group"] == "grupo_iii" for e in entries):
+        if point_index < len(points):
+            entries.append({"group": "grupo_iii", "number": "1", "points": points[point_index]})
+
+    return entries
+
+
+def _parse_modern_optional_scoring(block: str) -> list[dict[str, Any]]:
+    if not block:
+        return []
+    match = re.search(r"(\d+)\s*[x×]\s*(\d+)\s*pontos", block, re.IGNORECASE)
+    if not match:
+        return []
+    points_each = int(match.group(2))
+    lines = _scoring_lines(block)
+    group_tokens = [line.lower() for line in lines if line in {"I", "II", "III"}]
+    item_numbers = [int(m.group(1)) for line in lines if (m := re.match(r"^(\d{1,2})\.$", line))]
+    runs = _split_item_runs(item_numbers)
+    entries: list[dict[str, Any]] = []
+    for gid, run in zip([_roman_to_group(token) for token in group_tokens], runs):
+        for item in run:
+            entries.append({"group": gid, "number": str(item), "points": points_each})
+    return entries
+
+
+def _scoring_lines(text: str) -> list[str]:
+    return [
+        re.sub(r"\s+", " ", line).strip().rstrip()
+        for line in (text or "").splitlines()
+        if re.sub(r"\s+", " ", line).strip()
+    ]
+
+
+def _split_item_runs(items: list[int]) -> list[list[int]]:
+    runs: list[list[int]] = []
+    current: list[int] = []
+    previous = 0
+    for item in items:
+        if current and item <= previous:
+            runs.append(current)
+            current = []
+        current.append(item)
+        previous = item
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _drop_subtotal(points: list[int]) -> list[int]:
+    clean = list(points)
+    while len(clean) > 1 and clean[-1] == sum(clean[:-1]):
+        clean.pop()
+    return clean
+
+
+def _roman_to_group(token: str) -> str:
+    return {"i": "grupo_i", "ii": "grupo_ii", "iii": "grupo_iii"}.get(token.lower(), "")
+
+
+def _parse_group_scoring_block(group_id: str, block: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+
+    # Common line format: "1. 13 pontos" / "1 13" / "Item 1 13 pontos".
+    for match in re.finditer(
+        r"(?im)(?:^|\n)\s*(?:item\s*)?(\d{1,2})[.\s]+(?:[^\n]*?\s)?(\d{1,3})\s*pontos?\b",
+        block,
+    ):
+        item = match.group(1)
+        points = int(match.group(2))
+        if 0 < points <= 100:
+            entries.append({"group": group_id, "number": item, "points": points})
+
+    if entries:
+        return _dedupe_entries(entries)
+
+    # Fallback for compact tables where item numbers and points appear as columns.
+    numbers = [int(n) for n in re.findall(r"\b(?:item\s*)?(\d{1,2})\b", block, re.IGNORECASE)]
+    points = [int(p) for p in re.findall(r"\b(\d{1,3})\s*pontos?\b", block, re.IGNORECASE)]
+    if group_id == "grupo_iii" and not points:
+        points = [int(p) for p in re.findall(r"\b(\d{2,3})\b", block)]
+
+    if group_id == "grupo_iii" and points:
+        return [{"group": group_id, "number": "1", "points": points[-1]}]
+
+    usable_items = [n for n in numbers if 1 <= n <= 20]
+    for item, point in zip(usable_items, points):
+        if 0 < point <= 100:
+            entries.append({"group": group_id, "number": str(item), "points": point})
+    return _dedupe_entries(entries)
+
+
+def _dedupe_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen = set()
+    clean = []
+    for entry in entries:
+        key = (entry["group"], entry["number"])
+        if key in seen:
+            continue
+        seen.add(key)
+        clean.append(entry)
+    return clean
+
+
+def _sort_questions(output: dict) -> None:
+    order = {"grupo_i": 1, "grupo_ii": 2, "grupo_iii": 3}
+    output["questions"] = sorted(
+        output.get("questions") or [],
+        key=lambda q: (
+            order.get(q.get("groupId") or "", 99),
+            int(str(q.get("number") or "999").split(".", 1)[0]) if str(q.get("number") or "").split(".", 1)[0].isdigit() else 999,
+            q.get("sourcePage") or 999,
+        ),
+    )
+
+
+def _refresh_stats(output: dict) -> None:
+    questions = output.get("questions") or []
+    stats = output.setdefault("metadata", {}).setdefault("stats", {})
+    if isinstance(stats, dict):
+        stats["mainQuestions"] = len(questions)
+        stats["answerableItems"] = len(questions)
+        stats["jsonNodes"] = len(questions)
+
+
+def _extract_grupo_iii_statement(text: str) -> str:
+    text = re.sub(r"(?is)^.*?\bGRUPO\s+III\b", "", text, count=1).strip()
+    text = re.sub(r"(?is)\bFIM\b.*$", "", text).strip()
+    text = re.sub(r"(?is)\bCOTAÇÕES\b.*$", "", text).strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _extract_grupo_iii_from_pages(extraction: dict | None) -> str:
+    if not extraction:
+        return ""
+    pages = extraction.get("_processed_pages") or extraction.get("pages") or []
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        text = str(page.get("text") or "")
+        if re.search(r"\bGRUPO\s+III\b", text, re.IGNORECASE):
+            statement = _extract_grupo_iii_statement(text)
+            statement = re.sub(r"(?is)\bObserva[cç][oõ]es\s*:.*$", "", statement).strip()
+            if _is_composition_prompt(statement):
+                return statement
+    return ""
+
+
+def _find_grupo_iii_page(extraction: dict | None) -> int | None:
+    if not extraction:
+        return None
+    pages = extraction.get("_processed_pages") or extraction.get("pages") or []
+    for page in pages:
+        if isinstance(page, dict) and re.search(r"\bGRUPO\s+III\b", str(page.get("text") or ""), re.IGNORECASE):
+            try:
+                return int(page.get("page") or 0) or None
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _strip_after_grupo_iii(text: str) -> str:
+    return re.sub(r"(?is)\bGRUPO\s+III\b.*$", "", text).strip()
+
+
+def _question_all_text(q: dict) -> str:
+    return "\n".join(str(q.get(key) or "") for key in _TEXT_KEYS).replace("\x07", " ")
+
+
+def _question_prompt_text(q: dict) -> str:
+    keys = (
+        "statement",
+        "statementPlain",
+        "statementLatex",
+        "statementRaw",
+        "statementFormatted",
+        "statementPlainFormatted",
+        "statementLatexFormatted",
+        "rawText",
+    )
+    return "\n".join(str(q.get(key) or "") for key in keys).replace("\x07", " ")
+
+
+def _set_question_text(q: dict, text: str) -> None:
+    for key in (
+        "statement",
+        "statementPlain",
+        "statementLatex",
+        "statementRaw",
+        "statementFormatted",
+        "statementPlainFormatted",
+        "statementLatexFormatted",
+        "rawText",
+    ):
+        q[key] = text
+    q["sourceTextRaw"] = text
+
+
+def _is_composition_prompt(text: str) -> bool:
+    low = (text or "").lower()
+    return (
+        "num texto" in low
+        and ("duzent" in low or "200" in low)
+        and (
+            "defenda uma perspetiva" in low
+            or "defenda uma perspectiva" in low
+            or "apreciação crítica" in low
+            or "apreciacao critica" in low
+            or "texto de opinião" in low
+            or "texto de opiniao" in low
+        )
+    )
+
+
+def _is_observation_artifact(q: dict) -> bool:
+    text = _question_prompt_text(q).lower().strip()
+    return (
+        text.startswith("1. para efeitos de contagem")
+        or text.startswith("2. relativamente ao desvio")
+        or ("extensão inferior a oitenta palavras" in text and "num texto" not in text)
+        or ("extensao inferior a oitenta palavras" in text and "num texto" not in text)
+    )
+
+
+def _looks_like_scoring_text(text: str) -> bool:
+    low = (text or "").lower()
+    return ("cotação" in low or "cotacoes" in low or "cotações" in low or "pontos" in low) and "grupo" in low
+
+
+def _extract_min_words(text: str) -> int | None:
+    match = re.search(r"mínimo\s+de\s+(\w+|\d+)", text, re.IGNORECASE)
+    if not match:
+        return None
+    raw = match.group(1)
+    if raw.isdigit():
+        return int(raw)
+    words = {"cem": 100, "cento": 100, "duzentas": 200, "duzentos": 200, "trezentas": 300, "trezentos": 300}
+    return words.get(raw.lower())
+
+
+_TEXT_KEYS = (
+    "statement",
+    "statementPlain",
+    "statementLatex",
+    "statementRaw",
+    "statementFormatted",
+    "statementPlainFormatted",
+    "statementLatexFormatted",
+    "rawText",
+    "sourceTextRaw",
+)

@@ -20,4 +20,8 @@ def normalize_by_profile(output: dict, extraction: dict | None, profile: dict) -
         from .humanities import normalize_humanities
         output = normalize_humanities(output, extraction)
 
+    if "portugues" in normalizers:
+        from .portugues import normalize_portugues
+        output = normalize_portugues(output, extraction)
+
     return output

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import path from 'path';
 import fs from 'fs';
 import archiver from 'archiver';
+import { buildExamExportName, normalizeExamForExport } from '@/lib/examExport';
 
 export async function GET(
   request: NextRequest,
@@ -12,22 +13,14 @@ export async function GET(
 
   const outputDir = path.join(process.cwd(), 'data', 'output');
   const jsonPath = path.join(outputDir, `${id}.json`);
-  const assetsDir = path.join(outputDir, id, 'assets');
-
   if (!fs.existsSync(jsonPath)) {
     return NextResponse.json({ error: 'Exam not found' }, { status: 404 });
   }
 
-  const examData = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
+  const examData = normalizeExamForExport(JSON.parse(fs.readFileSync(jsonPath, 'utf-8')));
 
   // Build filename: HistoriaA2025Fase1_ID.zip
-  const subject = (examData.metadata?.subject || 'Exame')
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-zA-Z0-9]/g, '');
-  const year = examData.metadata?.year || '';
-  const phase = (examData.metadata?.phase || '').replace(/[^0-9]/g, '');
-  const shortId = id.split('_').pop() || id.slice(-8);
-  const zipFilename = `${subject}${year}${phase ? `Fase${phase}` : ''}_${shortId}.zip`;
+  const zipFilename = `${buildExamExportName(examData, id)}.zip`;
 
   // Collect only used asset paths from the JSON
   const usedFiles = collectUsedAssets(examData);
@@ -40,7 +33,7 @@ export async function GET(
     archive.on('end', resolve);
     archive.on('error', reject);
 
-    archive.file(jsonPath, { name: 'exam.json' });
+    archive.append(JSON.stringify(examData, null, 2), { name: 'exam.json' });
 
     // Add only used assets
     for (const relPath of usedFiles) {

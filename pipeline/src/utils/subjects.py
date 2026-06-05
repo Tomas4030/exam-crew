@@ -32,7 +32,7 @@ SUBJECT_PROFILES = {
         "has_excerpts": True,
         "has_source_grouping": True,
         "question_types": ["multiple_choice", "open_answer", "essay", "short_answer"],
-        "normalizers": ["common", "humanities"],
+        "normalizers": ["common", "humanities", "portugues"],
         "crop_profile": "auto",
         "preview_profile": "humanities",
     },

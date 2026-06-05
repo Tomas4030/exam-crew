@@ -65,11 +65,13 @@ def normalize_humanities(output: dict, extraction: dict | None = None) -> dict:
     _attach_implicit_group_i_document(output, extraction)
     _repair_multi_blank_questions(output, extraction)
     _repair_multi_select_questions(output)
+    _repair_false_history_interaction_types(output)
     _repair_history_interaction_types(output)
     _remove_history_line_number_artifacts(output)
     _repair_history_text_typos(output)
     _normalize_source_labels(output)
     _repair_known_history_points(output)
+    _repair_history_points_from_scoring_text(output, extraction)
     _repair_document_refs(output)
     _strip_cross_group_refs(output)
     _rebuild_all_media(output)
@@ -162,32 +164,66 @@ def _repair_history_interaction_types(output: dict) -> None:
     """Convert old Historia association/ordering prompts away from open textareas."""
     repaired = 0
     for q in output.get("questions", []):
-        if q.get("type") != "open_answer":
+        qtype = q.get("type")
+        if qtype not in {"open_answer", "multiple_choice", "matching", "ordering"}:
             continue
+        prompt = _question_prompt_text(q)
         text = _combined_question_text(q)
-        low = text.lower()
+        low = prompt.lower()
 
         if re.search(r"\bassocie\b", low) and re.search(r"\bcoluna\s+[abi12i]+\b", low):
-            q["type"] = "matching"
             columns = _extract_matching_columns(text)
-            if columns:
-                q["matchColumns"] = columns
-            q.setdefault("disciplineData", {})["interactionMode"] = "matching"
-            repaired += 1
+            if qtype != "matching" or columns and not q.get("matchColumns"):
+                q["type"] = "matching"
+                if columns:
+                    q["matchColumns"] = columns
+                q["options"] = []
+                q.setdefault("disciplineData", {})["interactionMode"] = "matching"
+                repaired += 1
             continue
 
         if re.search(r"\bordene\s+cronologicamente\b", low):
-            q["type"] = "ordering"
             items = _extract_ordering_items(text)
-            if items:
-                q["orderingItems"] = items
-            q.setdefault("disciplineData", {})["interactionMode"] = "ordering"
-            repaired += 1
+            if qtype != "ordering" or items and not q.get("orderingItems"):
+                q["type"] = "ordering"
+                if items:
+                    q["orderingItems"] = items
+                q["options"] = []
+                q.setdefault("disciplineData", {})["interactionMode"] = "ordering"
+                repaired += 1
 
     if repaired:
         output.setdefault("warnings", []).append({
             "type": "history_interaction_type_repaired",
             "message": f"Repaired {repaired} Historia matching/ordering question(s).",
+        })
+
+
+def _repair_false_history_interaction_types(output: dict) -> None:
+    """Undo matching/ordering when source text, not the prompt, caused the detection."""
+    repaired = 0
+    for q in output.get("questions", []):
+        qtype = q.get("type")
+        if qtype not in {"matching", "ordering"}:
+            continue
+        prompt = _question_prompt_text(q)
+        low = prompt.lower()
+        if qtype == "matching":
+            valid = re.search(r"\bassocie\b", low) and re.search(r"\bcoluna\s+[abi12i]+\b", low)
+        else:
+            valid = re.search(r"\bordene\s+cronologicamente\b", low)
+        if valid:
+            continue
+        q["type"] = "open_answer"
+        q.pop("matchColumns", None)
+        q.pop("orderingItems", None)
+        q.setdefault("disciplineData", {})["interactionMode"] = "open_answer"
+        repaired += 1
+
+    if repaired:
+        output.setdefault("warnings", []).append({
+            "type": "history_false_interaction_type_repaired",
+            "message": f"Repaired {repaired} false matching/ordering question(s).",
         })
 
 
@@ -202,7 +238,7 @@ def _extract_matching_columns(text: str) -> dict | None:
 def _extract_column_items(text: str, letters: bool) -> list[dict]:
     marker = r"[a-e]" if letters else r"\d{1,2}"
     matches = list(re.finditer(
-        rf"(?ms)\(({marker})\)\s*(.*?)(?=\n\s*\((?:[a-e]|\d{{1,2}})\)\s*|\Z)",
+        rf"(?ms)\(({marker})\)\s*(.*?)(?=\n\s*(?:\((?:[a-e]|\d{{1,2}})\)|\d+\.|FIM\b|Identifica[cç][aã]o das fontes)\s*|\Z)",
         text,
         re.IGNORECASE,
     ))
@@ -314,16 +350,17 @@ def _extract_roman_options(text: str) -> list[dict]:
 
 def _extract_letter_options(text: str) -> list[dict]:
     matches = list(re.finditer(
-        r"(?ms)(?:^|\n)\s*([a-e])\)\s*(.*?)(?=\n\s*[a-e]\)\s*|\Z)",
+        r"(?ms)(?:^|\n)\s*(?:\(([a-e])\)|([a-e])\))\s*(.*?)(?=\n\s*(?:\([a-e]\)|[a-e]\)|\d+\.|FIM\b|Identifica[cç][aã]o das fontes)\s*|\Z)",
         text,
+        re.IGNORECASE,
     ))
     options = []
     seen = set()
     for match in matches:
-        letter = match.group(1).strip()
+        letter = (match.group(1) or match.group(2) or "").strip().upper()
         if letter in seen:
             continue
-        option_text = _clean_option_text(match.group(2))
+        option_text = _clean_option_text(match.group(3))
         if option_text:
             options.append({"letter": letter, "text": option_text})
             seen.add(letter)
@@ -401,6 +438,119 @@ def _repair_known_history_points(output: dict) -> None:
             "type": "history_points_repaired",
             "message": f"Repaired {repaired} História point value(s) from canonical scoring.",
         })
+
+
+def _repair_history_points_from_scoring_text(output: dict, extraction: dict | None) -> None:
+    """Apply Historia scoring table values from native PDF text by group/item."""
+    if not extraction or not extraction.get("pages"):
+        return
+
+    scoring_text = ""
+    for page in reversed(extraction.get("pages", [])[-5:]):
+        text = page.get("text") or ""
+        low = text.lower()
+        if ("cota" in low or "pontua" in low) and "grupo" in low and "item" in low:
+            scoring_text = text
+            break
+    if not scoring_text:
+        return
+
+    scores = _parse_history_scoring_table(scoring_text)
+    if not scores:
+        return
+
+    repaired = 0
+    for q in output.get("questions", []):
+        gid = str(q.get("groupId") or q.get("group") or "").strip().lower()
+        num = str(q.get("number") or "").strip().rstrip(".")
+        key = (gid, num)
+        if key not in scores:
+            continue
+        if q.get("points") != scores[key]:
+            q["points"] = scores[key]
+            repaired += 1
+
+    if repaired:
+        output.setdefault("warnings", []).append({
+            "type": "history_points_repaired_from_scoring_text",
+            "message": f"Applied {repaired} point value(s) from the native scoring table.",
+        })
+
+
+def _parse_history_scoring_table(scoring_text: str) -> dict[tuple[str, str], int]:
+    roman_map = {"I": "grupo_i", "II": "grupo_ii", "III": "grupo_iii", "IV": "grupo_iv"}
+    lines = [re.sub(r"\s+", " ", line).strip() for line in (scoring_text or "").splitlines()]
+    lines = [line for line in lines if line]
+
+    def roman_token(value: str) -> str:
+        value = re.sub(r"^Grupo\s+", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"[^ivIV]", "", value).upper()
+        return value if value in roman_map else ""
+
+    def item_token(value: str) -> str:
+        match = re.match(r"^(\d{1,2})\.$", value)
+        return match.group(1) if match else ""
+
+    def point_token(value: str) -> int | None:
+        if not re.match(r"^\d{1,3}$", value):
+            return None
+        val = int(value)
+        return val if 1 <= val <= 100 else None
+
+    scores: dict[tuple[str, str], int] = {}
+    i = 0
+    while i < len(lines):
+        group = roman_token(lines[i])
+        if not group:
+            i += 1
+            continue
+        gid = roman_map[group]
+        j = i + 1
+        items: list[str] = []
+        while j < len(lines):
+            item = item_token(lines[j])
+            if not item:
+                break
+            items.append(item)
+            j += 1
+        if not items:
+            i += 1
+            continue
+        points: list[int] = []
+        while j < len(lines):
+            point = point_token(lines[j])
+            if point is None:
+                break
+            points.append(point)
+            j += 1
+        if len(points) >= len(items):
+            for item, point in zip(items, points[:len(items)]):
+                scores[(gid, item)] = point
+            i = j
+            continue
+        i += 1
+
+    optional_match = re.search(r"(\d+)\s*[x×]\s*(\d+)\s*pontos", scoring_text, re.IGNORECASE)
+    if optional_match:
+        optional_points = int(optional_match.group(2))
+        current_gid = ""
+        in_optional = False
+        for line in lines:
+            low = line.lower()
+            if "contribuem para a classificação" in low or "contribuem para a classificacao" in low:
+                in_optional = True
+                continue
+            if not in_optional:
+                continue
+            group = roman_token(line)
+            if group:
+                current_gid = roman_map[group]
+                continue
+            item = item_token(line)
+            if item and current_gid:
+                scores[(current_gid, item)] = optional_points
+
+    return scores
 
 
 def _normalize_table_rows(table: object) -> list[list]:
