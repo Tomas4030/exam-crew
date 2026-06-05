@@ -17,7 +17,10 @@ def normalize_portugues(output: dict, extraction: dict | None = None) -> dict:
     _remove_legacy_duplicate_questions(output)
     _collapse_multiple_grupo_iii_questions(output)
     _repair_composition_question(output)
+    _strip_inline_options_from_selection_statements(output)
+    _repair_multi_blank_structure(output, extraction)
     _repair_missing_choice_options(output, extraction)
+    _attach_visual_assets_to_composition(output)
     _recover_missing_questions_from_scoring(output, extraction)
     _repair_points_from_scoring_text(output, extraction)
     _sort_questions(output)
@@ -252,6 +255,9 @@ def _remove_legacy_duplicate_questions(output: dict) -> None:
         if _is_scoring_artifact_text(text):
             removed += 1
             continue
+        if _is_observation_artifact(q):
+            removed += 1
+            continue
         if q.get("groupId") == "grupo_ii" and re.search(r"\bresponda\s+(?:aos?|de forma)", text):
             removed += 1
             continue
@@ -316,6 +322,70 @@ def _repair_composition_question(output: dict) -> None:
             q.setdefault("disciplineData", {})["minWords"] = _extract_min_words(text)
 
 
+def _strip_inline_options_from_selection_statements(output: dict) -> None:
+    repaired = 0
+    for q in output.get("questions") or []:
+        qtype = q.get("type")
+        if qtype not in {"multiple_choice", "multi_select"}:
+            continue
+        options = q.get("options") or []
+        if not options:
+            continue
+        text = _question_prompt_text(q)
+        stripped = _strip_letter_option_lines(text)
+        if stripped and stripped != text:
+            _set_question_text(q, stripped)
+            repaired += 1
+
+        if qtype == "multi_select":
+            wanted = _infer_max_selections(stripped)
+            if wanted:
+                q["maxSelections"] = wanted
+    if repaired:
+        output.setdefault("warnings", []).append({
+            "type": "portuguese_inline_options_stripped",
+            "message": f"Removed duplicated inline options from {repaired} selection question(s).",
+        })
+
+
+def _attach_visual_assets_to_composition(output: dict) -> None:
+    assets = output.get("assets") or []
+    visual_assets = [asset for asset in assets if _asset_visual_path(asset)]
+    if not visual_assets:
+        return
+
+    attached = 0
+    for q in output.get("questions") or []:
+        if q.get("groupId") != "grupo_iii":
+            continue
+        text = _normalized_text(_question_prompt_text(q))
+        if not re.search(r"\b(cartoon|imagem|figura|ilustra[cç][aã]o|refloresta)", text):
+            continue
+        asset = _best_visual_asset_for_question(q, visual_assets)
+        rel = _asset_visual_path(asset)
+        if not rel:
+            continue
+        url = _asset_visual_url(asset) or f"/api/exams/{output.get('exam_id')}/assets/{rel.removeprefix('assets/')}"
+        q.setdefault("assetRefs", [])
+        if asset.get("id") not in q["assetRefs"]:
+            q["assetRefs"].append(asset.get("id"))
+        q["visualDependency"] = True
+        q["media"] = [{
+            "type": "image",
+            "url": url,
+            "relativePath": rel,
+            "assetId": asset.get("id"),
+            "label": asset.get("label") or "Imagem",
+        }]
+        attached += 1
+
+    if attached:
+        output.setdefault("warnings", []).append({
+            "type": "portuguese_composition_visual_attached",
+            "message": f"Attached visual asset to {attached} Portuguese composition question(s).",
+        })
+
+
 def _repair_missing_choice_options(output: dict, extraction: dict | None = None) -> None:
     repaired = 0
     for q in output.get("questions") or []:
@@ -337,6 +407,44 @@ def _repair_missing_choice_options(output: dict, extraction: dict | None = None)
         output.setdefault("warnings", []).append({
             "type": "portuguese_choice_options_repaired",
             "message": f"Extracted options for {repaired} choice question(s).",
+        })
+
+
+def _repair_multi_blank_structure(output: dict, extraction: dict | None = None) -> None:
+    repaired = 0
+    for q in output.get("questions") or []:
+        if q.get("type") != "multi_blank_choice":
+            continue
+
+        blanks = q.get("blanks") if isinstance(q.get("blanks"), list) else []
+        if _valid_multi_blank_blanks(blanks):
+            q["blanks"] = _normalize_multi_blank_blanks(blanks)
+            q["options"] = []
+            q["maxSelections"] = len(q["blanks"])
+            continue
+
+        text = _question_prompt_text(q)
+        parsed = _parse_multi_blank_options(text)
+        if not _valid_multi_blank_blanks(parsed):
+            block = _extract_question_block_from_pages(q.get("number"), extraction, require_options=False)
+            parsed = _parse_multi_blank_options(block)
+            if _valid_multi_blank_blanks(parsed):
+                _set_question_text(q, _strip_multi_blank_option_table(block))
+
+        if _valid_multi_blank_blanks(parsed):
+            q["blanks"] = _normalize_multi_blank_blanks(parsed)
+            q["options"] = []
+            q["maxSelections"] = len(q["blanks"])
+            if text:
+                stripped = _strip_multi_blank_option_table(text)
+                if stripped and stripped != text:
+                    _set_question_text(q, stripped)
+            repaired += 1
+
+    if repaired:
+        output.setdefault("warnings", []).append({
+            "type": "portuguese_multiblank_repaired",
+            "message": f"Rebuilt blanks/options for {repaired} multi_blank_choice question(s).",
         })
 
 
@@ -416,22 +524,98 @@ def _repair_points_from_scoring_text(output: dict, extraction: dict | None) -> N
     if not entries:
         return
 
+    _store_portuguese_scoring_policy(output, entries)
     by_key = {(entry["group"], str(entry["number"])): entry["points"] for entry in entries}
     applied = 0
     for q in output.get("questions") or []:
         key = (q.get("groupId") or "", str(q.get("number") or ""))
+        entry = next((item for item in entries if (item["group"], str(item["number"])) == key), None)
         points = by_key.get(key)
         if points is None:
             continue
         if q.get("points") != points:
             q["points"] = points
             applied += 1
+        if entry:
+            q["isMandatory"] = bool(entry.get("isMandatory", True))
+            if entry.get("optionalPoolId"):
+                q.setdefault("disciplineData", {})["optionalPoolId"] = entry["optionalPoolId"]
 
     if applied:
         output.setdefault("warnings", []).append({
             "type": "portuguese_points_repaired",
             "message": f"Applied Portuguese scoring table to {applied} question(s).",
         })
+
+
+def _store_portuguese_scoring_policy(output: dict, entries: list[dict[str, Any]]) -> None:
+    if not entries:
+        return
+
+    items = []
+    for entry in entries:
+        group = str(entry.get("group") or "")
+        number = str(entry.get("number") or "")
+        points = entry.get("points")
+        if not group or not number or points is None:
+            continue
+        item = {
+            "groupId": group,
+            "number": number,
+            "points": points,
+            "isMandatory": bool(entry.get("isMandatory", True)),
+        }
+        if entry.get("optionalPoolId"):
+            item["optionalPoolId"] = entry["optionalPoolId"]
+        items.append(item)
+
+    if not items:
+        return
+
+    mandatory_points = sum(int(item["points"]) for item in items if item.get("isMandatory"))
+    optional_items = [item for item in items if not item.get("isMandatory")]
+    optional_points = sum(int(item["points"]) for item in optional_items)
+    optional_each = _common_point_value(optional_items)
+    choose = _infer_optional_choose(optional_items, mandatory_points)
+    output.setdefault("metadata", {})["scoringPolicy"] = {
+        "source": "cotacoes",
+        "totalPoints": 200,
+        "rawSubtotal": mandatory_points + optional_points,
+        "mandatorySubtotal": mandatory_points,
+        "optionalPoolSubtotal": optional_points,
+        "optionalPool": {
+            "choose": choose,
+            "from": len(optional_items),
+            "pointsEach": optional_each,
+        } if optional_items else None,
+        "items": items,
+    }
+
+
+def _common_point_value(items: list[dict[str, Any]]) -> int | None:
+    values = []
+    for item in items:
+        try:
+            values.append(int(item.get("points")))
+        except (TypeError, ValueError):
+            return None
+    if not values:
+        return None
+    first = values[0]
+    return first if all(value == first for value in values) else None
+
+
+def _infer_optional_choose(optional_items: list[dict[str, Any]], mandatory_points: int) -> int | None:
+    points_each = _common_point_value(optional_items)
+    if not optional_items or not points_each:
+        return None
+    remaining = 200 - mandatory_points
+    if remaining <= 0 or remaining % points_each:
+        return None
+    choose = remaining // points_each
+    if 0 < choose <= len(optional_items):
+        return choose
+    return None
 
 
 def _parse_portuguese_scoring(extraction: dict | None) -> list[dict[str, Any]]:
@@ -503,9 +687,9 @@ def _parse_modern_portuguese_scoring(text: str) -> list[dict[str, Any]]:
         return []
 
     scoring_text = text
-    scoring_matches = list(re.finditer(r"\bCOTA\w*", text, re.IGNORECASE))
-    if scoring_matches:
-        scoring_text = text[scoring_matches[-1].start():]
+    heading_index = _find_scoring_heading_index(text)
+    if heading_index >= 0:
+        scoring_text = text[heading_index:]
 
     split = re.split(r"(?im)^\s*Destes\b", scoring_text, maxsplit=1)
     before_optional = split[0]
@@ -542,7 +726,7 @@ def _parse_grid_portuguese_scoring(text: str) -> list[dict[str, Any]]:
             points_each = int(range_match.group(4))
             if 0 < points_each <= 100 and start <= end:
                 for number in range(start, end + 1):
-                    entries.append({"group": gid, "number": str(number), "points": points_each})
+                    entries.append({"group": gid, "number": str(number), "points": points_each, "isMandatory": True})
                 continue
 
         item_numbers: list[str] = []
@@ -560,7 +744,7 @@ def _parse_grid_portuguese_scoring(text: str) -> list[dict[str, Any]]:
 
         if item_numbers and point_values:
             for number, point in zip(item_numbers, point_values[:len(item_numbers)]):
-                entries.append({"group": gid, "number": number, "points": point})
+                entries.append({"group": gid, "number": number, "points": point, "isMandatory": True})
 
     return _dedupe_entries(entries)
 
@@ -579,22 +763,22 @@ def _parse_legacy_portuguese_scoring(text: str) -> list[dict[str, Any]]:
     for match in re.finditer(r"(?im)^\s*(\d{1,2})\.\s*.*?\n\s*(\d{1,3})\s+pontos?\b", group_blocks["grupo_i"]):
         point = int(match.group(2))
         if 0 < point <= 100:
-            entries.append({"group": "grupo_i", "number": match.group(1), "points": point})
+            entries.append({"group": "grupo_i", "number": match.group(1), "points": point, "isMandatory": True})
 
     b_match = re.search(r"(?im)^\s*B\s*[\.\s]+.*?\n\s*(\d{1,3})\s+pontos?\b", group_blocks["grupo_i"])
     if b_match:
         point = int(b_match.group(1))
         if 0 < point <= 100:
-            entries.append({"group": "grupo_i", "number": "5", "points": point})
+            entries.append({"group": "grupo_i", "number": "5", "points": point, "isMandatory": True})
 
     for match in re.finditer(r"(?im)^\s*(\d)\.(\d)\.\s*.*?\n\s*(\d{1,3})\s+pontos?\b", group_blocks["grupo_ii"]):
         point = int(match.group(3))
         if 0 < point <= 100:
-            entries.append({"group": "grupo_ii", "number": f"{match.group(1)}.{match.group(2)}", "points": point})
+            entries.append({"group": "grupo_ii", "number": f"{match.group(1)}.{match.group(2)}", "points": point, "isMandatory": True})
 
     point = _last_points_before_total(_scoring_lines(group_blocks["grupo_iii"]))
     if point:
-        entries.append({"group": "grupo_iii", "number": "1", "points": point})
+        entries.append({"group": "grupo_iii", "number": "1", "points": point, "isMandatory": True})
 
     return _dedupe_entries(entries)
 
@@ -621,14 +805,14 @@ def _parse_modern_mandatory_scoring(block: str) -> list[dict[str, Any]]:
         for item in run:
             if point_index >= len(points):
                 break
-            entries.append({"group": gid, "number": str(item), "points": points[point_index]})
+            entries.append({"group": gid, "number": str(item), "points": points[point_index], "isMandatory": True})
             point_index += 1
 
     # Modern Portuguese tables often omit item "1." under Grupo III because it is
     # the single composition item; the remaining point value belongs to it.
     if "grupo_iii" in group_ids and not any(e["group"] == "grupo_iii" for e in entries):
         if point_index < len(points):
-            entries.append({"group": "grupo_iii", "number": "1", "points": points[point_index]})
+            entries.append({"group": "grupo_iii", "number": "1", "points": points[point_index], "isMandatory": True})
 
     return entries
 
@@ -647,7 +831,13 @@ def _parse_modern_optional_scoring(block: str) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for gid, run in zip([_roman_to_group(token) for token in group_tokens], runs):
         for item in run:
-            entries.append({"group": gid, "number": str(item), "points": points_each})
+            entries.append({
+                "group": gid,
+                "number": str(item),
+                "points": points_each,
+                "isMandatory": False,
+                "optionalPoolId": "portuguese_optional_pool_1",
+            })
     return entries
 
 
@@ -655,8 +845,8 @@ def _parse_textual_modern_portuguese_scoring(text: str) -> list[dict[str, Any]]:
     if not re.search(r"Grupo\s+I", text, re.IGNORECASE) or "Item" not in text:
         return []
 
-    scoring_matches = list(re.finditer(r"\bCOTA\w*", text, re.IGNORECASE))
-    scoring_text = text[scoring_matches[-1].start():] if scoring_matches else text
+    heading_index = _find_scoring_heading_index(text)
+    scoring_text = text[heading_index:] if heading_index >= 0 else text
     split = re.split(r"(?is)\bDos\s+restantes\b", scoring_text, maxsplit=1)
     mandatory = split[0]
     optional = split[1] if len(split) > 1 else ""
@@ -667,14 +857,14 @@ def _parse_textual_modern_portuguese_scoring(text: str) -> list[dict[str, Any]]:
         for match in re.finditer(r"(?is)Item\s+(\d{1,2})\.?.*?(\d{1,3})\s+pontos?\b", block):
             point = int(match.group(2))
             if 0 < point <= 100:
-                entries.append({"group": gid, "number": match.group(1), "points": point})
+                entries.append({"group": gid, "number": match.group(1), "points": point, "isMandatory": True})
 
     group_iii = _extract_scoring_group_block(mandatory, "III")
     item_unique = re.search(r"(?is)Item\s+(?:único|unico).*?(\d{1,3})\s+pontos?\b", group_iii)
     if item_unique:
         point = int(item_unique.group(1))
         if 0 < point <= 100:
-            entries.append({"group": "grupo_iii", "number": "1", "points": point})
+            entries.append({"group": "grupo_iii", "number": "1", "points": point, "isMandatory": True})
 
     opt_match = re.search(r"(\d+)\s*[x×]\s*(\d+)\s*pontos", optional, re.IGNORECASE)
     if opt_match:
@@ -684,7 +874,13 @@ def _parse_textual_modern_portuguese_scoring(text: str) -> list[dict[str, Any]]:
             if not block_match:
                 continue
             for raw in re.findall(r"\b(\d{1,2})\.", block_match.group(1)):
-                entries.append({"group": gid, "number": raw, "points": points_each})
+                entries.append({
+                    "group": gid,
+                    "number": raw,
+                    "points": points_each,
+                    "isMandatory": False,
+                    "optionalPoolId": "portuguese_optional_pool_1",
+                })
 
     return _dedupe_entries(entries)
 
@@ -757,7 +953,7 @@ def _parse_group_scoring_block(group_id: str, block: str) -> list[dict[str, Any]
         if item_unique:
             point = int(item_unique.group(1))
             if 0 < point <= 100:
-                return [{"group": group_id, "number": "1", "points": point}]
+                return [{"group": group_id, "number": "1", "points": point, "isMandatory": True}]
 
     # Common line format: "1. 13 pontos" / "1 13" / "Item 1 13 pontos".
     for match in re.finditer(
@@ -767,7 +963,7 @@ def _parse_group_scoring_block(group_id: str, block: str) -> list[dict[str, Any]
         item = match.group(1)
         points = int(match.group(2))
         if 0 < points <= 100:
-            entries.append({"group": group_id, "number": item, "points": points})
+            entries.append({"group": group_id, "number": item, "points": points, "isMandatory": True})
 
     if entries:
         return _dedupe_entries(entries)
@@ -782,12 +978,12 @@ def _parse_group_scoring_block(group_id: str, block: str) -> list[dict[str, Any]
     if group_id == "grupo_iii" and points:
         usable = [point for point in points if 0 < point <= 100]
         if usable:
-            return [{"group": group_id, "number": "1", "points": usable[-1]}]
+            return [{"group": group_id, "number": "1", "points": usable[-1], "isMandatory": True}]
 
     usable_items = [n for n in numbers if 1 <= n <= 20]
     for item, point in zip(usable_items, points):
         if 0 < point <= 100:
-            entries.append({"group": group_id, "number": str(item), "points": point})
+            entries.append({"group": group_id, "number": str(item), "points": point, "isMandatory": True})
     return _dedupe_entries(entries)
 
 
@@ -904,6 +1100,258 @@ def _extract_letter_options(text: str) -> list[dict[str, str]]:
     return options
 
 
+def _strip_letter_option_lines(text: str) -> str:
+    if not text:
+        return ""
+    pattern = re.compile(r"(?s)(?:^|\s)(?:[A-Ea-e]\.|\([A-Ea-e]\))\s+")
+    matches = list(pattern.finditer(text))
+    if len(matches) < 2:
+        return text
+
+    first = matches[0]
+    last = matches[-1]
+    tail_start = len(text)
+    tail_patterns = (
+        r"\bIdentifique\b",
+        r"\bSelecione\b",
+        r"\bEscreva\b",
+        r"\bIndique\b",
+    )
+    for marker in tail_patterns:
+        marker_match = re.search(marker, text[last.end():], re.IGNORECASE)
+        if marker_match:
+            tail_start = last.end() + marker_match.start()
+            break
+
+    prefix = text[:first.start()].strip()
+    suffix = text[tail_start:].strip() if tail_start < len(text) else ""
+    cleaned = "\n".join(part for part in (prefix, suffix) if part)
+    return re.sub(r"[ \t]+\n", "\n", cleaned).strip()
+
+
+def _parse_multi_blank_options(text: str) -> list[dict[str, Any]]:
+    if not text:
+        return []
+
+    clean = text.replace("\x07", " ")
+    blanks = _blank_ids_from_text(clean)
+    if len(blanks) < 2:
+        return []
+
+    column_options = _parse_multi_blank_columns(clean, blanks)
+    if _valid_multi_blank_blanks(column_options):
+        return column_options
+
+    section_options = _parse_multi_blank_sections(clean, blanks)
+    if _valid_multi_blank_blanks(section_options):
+        return section_options
+
+    return []
+
+
+def _blank_ids_from_text(text: str) -> list[str]:
+    found: list[str] = []
+    for match in re.finditer(r"(?<!\w)([a-z])\)", text or "", re.IGNORECASE):
+        blank = match.group(1).lower()
+        if blank not in found:
+            found.append(blank)
+    return found[:4]
+
+
+def _parse_multi_blank_columns(text: str, blanks: list[str]) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict[str, str]]] = {blank: [] for blank in blanks[:3]}
+    lines = [line.rstrip() for line in (text or "").splitlines()]
+
+    for line in lines:
+        matches = list(re.finditer(r"(?<!\d)([1-5])[.)]\s+(.+?)(?=(?:\s{2,}|\t+)[1-5][.)]\s+|$)", line))
+        if len(matches) < 2:
+            continue
+        for index, match in enumerate(matches[:len(groups)]):
+            blank = blanks[index]
+            value = _clean_multi_blank_option_text(match.group(2))
+            if value:
+                groups[blank].append({"letter": match.group(1), "text": value})
+
+    return [
+        {"number": f"{blank})", "options": _dedupe_options(options)}
+        for blank, options in groups.items()
+    ]
+
+
+def _parse_multi_blank_sections(text: str, blanks: list[str]) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict[str, str]]] = {blank: [] for blank in blanks}
+    header_matches = list(re.finditer(r"(?im)^\s*([a-z])\)\s*$", text or ""))
+    if len(header_matches) < 2:
+        return []
+
+    for index, match in enumerate(header_matches):
+        blank = match.group(1).lower()
+        if blank not in groups:
+            continue
+        start = match.end()
+        end = header_matches[index + 1].start() if index + 1 < len(header_matches) else len(text)
+        section = text[start:end]
+        for option_match in re.finditer(r"(?im)^\s*([1-5])[.)]\s+(.+?)\s*$", section):
+            value = _clean_multi_blank_option_text(option_match.group(2))
+            if value:
+                groups[blank].append({"letter": option_match.group(1), "text": value})
+
+    return [
+        {"number": f"{blank})", "options": _dedupe_options(options)}
+        for blank, options in groups.items()
+    ]
+
+
+def _strip_multi_blank_option_table(text: str) -> str:
+    if not text:
+        return ""
+    lines = text.replace("\x07", " ").splitlines()
+    cut_index = None
+    for index, line in enumerate(lines):
+        header_count = len(re.findall(r"(?<!\w)[a-z]\)", line, re.IGNORECASE))
+        numbered_count = len(re.findall(r"(?<!\d)[1-5][.)]\s+", line))
+        if numbered_count >= 2:
+            cut_index = index
+            break
+        if header_count >= 2:
+            rest = "\n".join(lines[index + 1:index + 6])
+            if (
+                re.fullmatch(r"\s*(?:[a-z]\)\s*){2,}", line, re.IGNORECASE)
+                or len(re.findall(r"(?m)^\s*[1-5][.)]\s+", rest)) >= 2
+                or len(re.findall(r"(?<!\d)[1-5][.)]\s+", rest)) >= 2
+            ):
+                cut_index = index
+                break
+        if re.match(r"^\s*[a-z]\)\s*$", line, re.IGNORECASE):
+            rest = "\n".join(lines[index + 1:index + 5])
+            if len(re.findall(r"(?m)^\s*[1-5][.)]\s+", rest)) >= 2:
+                cut_index = index
+                break
+    if cut_index is None:
+        return text.strip()
+    return "\n".join(lines[:cut_index]).strip()
+
+
+def _clean_multi_blank_option_text(text: str) -> str:
+    value = re.sub(r"\s+", " ", text or "").strip()
+    value = re.sub(r"\s*(?:GRUPO\s+[IVX]+|COTA\w+|FIM)\b.*$", "", value, flags=re.IGNORECASE).strip()
+    return value.rstrip(" .")
+
+
+def _valid_multi_blank_blanks(blanks: Any) -> bool:
+    if not isinstance(blanks, list) or len(blanks) < 2:
+        return False
+    for blank in blanks:
+        if not isinstance(blank, dict):
+            return False
+        options = blank.get("options")
+        if not isinstance(options, list) or len(options) < 2:
+            return False
+    return True
+
+
+def _normalize_multi_blank_blanks(blanks: list[dict]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for index, blank in enumerate(blanks):
+        raw_number = str(blank.get("number") or blank.get("id") or blank.get("label") or "").strip()
+        if not raw_number:
+            raw_number = f"{chr(ord('a') + index)})"
+        raw_number = raw_number.rstrip(".")
+        if re.fullmatch(r"[a-zA-Z]", raw_number):
+            raw_number = f"{raw_number.lower()})"
+        options = []
+        for option in blank.get("options") or []:
+            if not isinstance(option, dict):
+                continue
+            letter = str(option.get("letter") or option.get("value") or "").strip()
+            text = _clean_multi_blank_option_text(str(option.get("text") or option.get("label") or ""))
+            if letter and text:
+                options.append({"letter": letter, "text": text})
+        normalized.append({"number": raw_number, "options": _dedupe_options(options)})
+    return normalized
+
+
+def _dedupe_options(options: list[dict[str, str]]) -> list[dict[str, str]]:
+    clean: list[dict[str, str]] = []
+    seen = set()
+    for option in options:
+        key = (str(option.get("letter") or ""), _normalized_text(str(option.get("text") or "")))
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        clean.append({"letter": key[0], "text": str(option.get("text") or "").strip()})
+    return clean
+
+
+def _infer_max_selections(text: str) -> int | None:
+    low = (text or "").lower()
+    words = {
+        "duas": 2,
+        "dois": 2,
+        "três": 3,
+        "tres": 3,
+        "quatro": 4,
+    }
+    for word, value in words.items():
+        if re.search(rf"\b{word}\b", low):
+            return value
+    match = re.search(r"\b([2-4])\s+(?:afirmações|opções|letras)", low)
+    return int(match.group(1)) if match else None
+
+
+def _asset_visual_path(asset: dict) -> str:
+    if asset.get("type") == "embedded_image":
+        rel = asset.get("relativePath")
+        if isinstance(rel, str) and rel.startswith("assets/"):
+            return rel
+    crops = asset.get("crops") or {}
+    for key in ("best", "visual", "context"):
+        crop = crops.get(key) or {}
+        rel = crop.get("relativePath")
+        if isinstance(rel, str) and rel.startswith("assets/"):
+            return rel
+    crop = asset.get("crop") or {}
+    rel = crop.get("relativePath") if isinstance(crop, dict) else None
+    if isinstance(rel, str) and rel.startswith("assets/"):
+        return rel
+    rel = asset.get("relativePath")
+    return rel if isinstance(rel, str) and rel.startswith("assets/") else ""
+
+
+def _asset_visual_url(asset: dict) -> str:
+    if asset.get("type") == "embedded_image":
+        url = asset.get("url")
+        if isinstance(url, str):
+            return url
+    crops = asset.get("crops") or {}
+    for key in ("best", "visual", "context"):
+        crop = crops.get(key) or {}
+        url = crop.get("url")
+        if isinstance(url, str):
+            return url
+    crop = asset.get("crop") or {}
+    url = crop.get("url") if isinstance(crop, dict) else None
+    if isinstance(url, str):
+        return url
+    url = asset.get("url")
+    return url if isinstance(url, str) else ""
+
+
+def _best_visual_asset_for_question(q: dict, assets: list[dict]) -> dict:
+    page = q.get("sourcePage")
+    same_page = [asset for asset in assets if asset.get("page") == page]
+    candidates = same_page or assets
+    text = _normalized_text(_question_prompt_text(q))
+    if "cartoon" in text:
+        embedded = [asset for asset in candidates if asset.get("type") == "embedded_image"]
+        if embedded:
+            return embedded[0]
+        cartoon = [asset for asset in candidates if "cartoon" in _normalized_text(str(asset.get("description") or asset.get("label") or ""))]
+        if cartoon:
+            return cartoon[0]
+    return candidates[0]
+
+
 def _extract_question_block_from_pages(number: Any, extraction: dict | None, require_options: bool = False) -> str:
     if number is None or not extraction:
         return ""
@@ -1010,6 +1458,16 @@ def _looks_like_scoring_text(text: str) -> bool:
 
 def _has_scoring_heading(text: str) -> bool:
     return any(line.strip().upper().startswith("COTA") for line in (text or "").splitlines())
+
+
+def _find_scoring_heading_index(text: str) -> int:
+    offset = 0
+    for line in (text or "").splitlines(keepends=True):
+        clean = line.strip().upper()
+        if clean.startswith("COTA") and "PONTOS" not in clean and len(clean) <= 20:
+            return offset + line.index(line.lstrip())
+        offset += len(line)
+    return -1
 
 
 def _is_scoring_artifact_text(text: str) -> bool:

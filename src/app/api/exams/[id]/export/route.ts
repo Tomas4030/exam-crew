@@ -88,6 +88,11 @@ function collectUsedAssets(examData: Record<string, unknown>): string[] {
 
   const addAssetVisual = (asset?: Record<string, unknown>) => {
     if (!asset) return;
+    addVisualPath(asset.relativePath);
+    if (typeof asset.url === 'string') {
+      const match = asset.url.match(/\/assets\/(.+)$/);
+      if (match) addVisualPath(`assets/${match[1]}`);
+    }
     const crops = asset.crops as Record<string, unknown> | undefined;
     if (crops?.visual) addVisualCrop(crops.visual as Record<string, unknown>);
     addVisualCrop(asset.crop as Record<string, unknown>);

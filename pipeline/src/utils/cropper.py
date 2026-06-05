@@ -35,6 +35,49 @@ def _region_to_rect(region: dict | None) -> fitz.Rect | None:
         return None
 
 
+def _materialize_embedded_image(asset: dict, output_dir: Path, legacy_dir: Path, page_image_path: str | None) -> Path | None:
+    import shutil
+
+    candidates: list[Path] = []
+    raw_path = asset.get("path")
+    if isinstance(raw_path, str):
+        candidates.append(Path(raw_path))
+    rel = asset.get("relativePath")
+    if isinstance(rel, str) and rel.startswith("assets/"):
+        candidates.append(output_dir / rel)
+    url = asset.get("url")
+    if isinstance(url, str) and not url.startswith("/api/"):
+        candidates.append(Path(url))
+
+    for src_path in candidates:
+        if not src_path.exists():
+            continue
+        dst_path = legacy_dir / src_path.name
+        if not dst_path.exists():
+            shutil.copy2(str(src_path), str(dst_path))
+        return dst_path
+
+    bbox = asset.get("bbox") or {}
+    if not page_image_path or not Path(page_image_path).exists() or not isinstance(bbox, dict):
+        return None
+    try:
+        x0 = max(0, int(float(bbox.get("x", 0)) * SCALE))
+        y0 = max(0, int(float(bbox.get("y", 0)) * SCALE))
+        x1 = max(x0 + 1, int((float(bbox.get("x", 0)) + float(bbox.get("width", 0))) * SCALE))
+        y1 = max(y0 + 1, int((float(bbox.get("y", 0)) + float(bbox.get("height", 0))) * SCALE))
+        with Image.open(page_image_path) as img:
+            x1 = min(img.width, x1)
+            y1 = min(img.height, y1)
+            if x1 <= x0 or y1 <= y0:
+                return None
+            filename = f"{asset.get('id') or 'embedded_image'}.png"
+            dst_path = legacy_dir / filename
+            img.crop((x0, y0, x1, y1)).save(dst_path)
+            return dst_path
+    except Exception:
+        return None
+
+
 # ── Label Finding ────────────────────────────────────────────────
 
 def _find_label_position(pdf_path: str, page_num: int, label: str) -> fitz.Rect | None:
@@ -821,23 +864,21 @@ def crop_assets(output: dict, extraction: dict, output_dir: Path) -> dict:
             asset["crop"] = {"status": "failed", "reason": "page_image_missing"}
             continue
 
-        if asset.get("type") == "embedded_image" and asset.get("url"):
-            src_path = Path(asset["url"])
-            fname = src_path.name
-            # Copy to output assets dir so the API can serve it
-            dst_path = legacy_dir / fname
-            if src_path.exists() and not dst_path.exists():
-                import shutil
-                shutil.copy2(str(src_path), str(dst_path))
-            crop_info = {
-                "status": "success",
-                "method": "embedded",
-                "relativePath": f"assets/{fname}",
-                "url": f"/api/exams/{exam_id}/assets/{fname}",
-            }
-            asset["crops"] = {"context": crop_info, "visual": crop_info}
-            asset["crop"] = crop_info
-            continue
+        if asset.get("type") == "embedded_image":
+            embedded_path = _materialize_embedded_image(asset, output_dir, legacy_dir, page_images.get(page_num))
+            if embedded_path:
+                fname = embedded_path.name
+                crop_info = {
+                    "status": "success",
+                    "method": "embedded",
+                    "relativePath": f"assets/{fname}",
+                    "url": f"/api/exams/{exam_id}/assets/{fname}",
+                }
+                asset["relativePath"] = crop_info["relativePath"]
+                asset["url"] = crop_info["url"]
+                asset["crops"] = {"context": crop_info, "visual": crop_info}
+                asset["crop"] = crop_info
+                continue
 
         label = asset.get("label", "")
         aid = asset.get("id", "")
