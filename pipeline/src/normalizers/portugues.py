@@ -5,7 +5,10 @@ Keep this module subject-specific. Do not put Historia rules here.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
+
+from PIL import Image
 
 
 def normalize_portugues(output: dict, extraction: dict | None = None) -> dict:
@@ -21,6 +24,7 @@ def normalize_portugues(output: dict, extraction: dict | None = None) -> dict:
     _repair_multi_blank_structure(output, extraction)
     _repair_missing_choice_options(output, extraction)
     _attach_visual_assets_to_composition(output)
+    _repair_portuguese_text_sources(output, extraction)
     _recover_missing_questions_from_scoring(output, extraction)
     _repair_points_from_scoring_text(output, extraction)
     _sort_questions(output)
@@ -446,6 +450,417 @@ def _repair_multi_blank_structure(output: dict, extraction: dict | None = None) 
             "type": "portuguese_multiblank_repaired",
             "message": f"Rebuilt blanks/options for {repaired} multi_blank_choice question(s).",
         })
+
+
+def _repair_portuguese_text_sources(output: dict, extraction: dict | None = None) -> None:
+    """Create page-level text-source crops for Portuguese when source grouping missed them."""
+    if not extraction or not output.get("exam_id"):
+        return
+
+    pages = {
+        int(page.get("page")): page
+        for page in (extraction.get("_processed_pages") or extraction.get("pages") or [])
+        if isinstance(page, dict) and page.get("page")
+    }
+    if not pages:
+        return
+
+    group_questions = [
+        q for q in output.get("questions") or []
+        if q.get("groupId") in {"grupo_i", "grupo_ii"} and q.get("sourcePage")
+    ]
+    if not group_questions:
+        return
+
+    questions_needing_refs = [q for q in group_questions if not q.get("sourceRefs")]
+    referenced_source_ids = {
+        ref.get("sourceId")
+        for q in group_questions
+        for ref in (q.get("sourceRefs") or [])
+        if isinstance(ref, dict) and ref.get("sourceId")
+    }
+    sources_needing_crops = [
+        s for s in (output.get("sources") or [])
+        if isinstance(s, dict)
+        and s.get("sourceId") in referenced_source_ids
+        and not _source_has_usable_crop(s)
+    ]
+    if not questions_needing_refs and not sources_needing_crops:
+        return
+
+    sources = output.setdefault("sources", [])
+    existing = {s.get("sourceId") for s in sources if isinstance(s, dict)}
+    output_base = Path("data") / "output" / str(output.get("exam_id"))
+    sources_dir = output_base / "assets" / "sources"
+    sources_dir.mkdir(parents=True, exist_ok=True)
+
+    created = 0
+    candidates = _detect_portuguese_text_source_candidates(output, pages, group_questions)
+    by_source_id: dict[str, dict] = {}
+    for candidate in candidates:
+        group_id = candidate["groupId"]
+        page_num = candidate["page"]
+        source_id = candidate["sourceId"]
+        source = next((s for s in sources if s.get("sourceId") == source_id), None)
+        if source is None or not _source_has_usable_crop(source):
+            crop = _create_portuguese_text_source_crop(
+                output, pages.get(page_num), source_id, sources_dir,
+                top_pdf=candidate.get("topPdf"),
+                bottom_pdf=candidate.get("bottomPdf"),
+            )
+            if not crop:
+                continue
+            if source is not None:
+                source.setdefault("crops", {})["full"] = crop
+                source.setdefault("crops", {})["best"] = crop
+                by_source_id[source_id] = source
+                continue
+            roman = {"grupo_i": "I", "grupo_ii": "II"}.get(group_id, "")
+            source = {
+                "sourceId": source_id,
+                "groupId": group_id,
+                "label": f"Texto de apoio - Grupo {roman}, pagina {page_num}",
+                "kind": "text_source",
+                "pageStart": page_num,
+                "pageEnd": page_num,
+                "assetRefs": [],
+                "children": [],
+                "childCrops": {},
+                "crops": {"full": crop, "best": crop},
+            }
+            if source_id not in existing:
+                sources.append(source)
+                existing.add(source_id)
+                created += 1
+        by_source_id[source_id] = source
+
+    linked = 0
+    for q in group_questions:
+        candidate = _best_portuguese_source_for_question(q, candidates)
+        source = None
+        if candidate:
+            source = by_source_id.get(candidate["sourceId"])
+        if source is None:
+            refs = [r for r in (q.get("sourceRefs") or []) if isinstance(r, dict)]
+            for ref in refs:
+                ref_source = by_source_id.get(ref.get("sourceId"))
+                if ref_source:
+                    source = ref_source
+                    break
+        if not source:
+            continue
+        ref = {"sourceId": source["sourceId"], "childId": None, "mode": "full_group"}
+        refs = q.setdefault("sourceRefs", [])
+        if not any(r.get("sourceId") == ref["sourceId"] for r in refs if isinstance(r, dict)):
+            refs.append(ref)
+            linked += 1
+        crop = (source.get("crops") or {}).get("best") or (source.get("crops") or {}).get("full")
+        if isinstance(crop, dict) and crop.get("url"):
+            media = q.setdefault("media", [])
+            if not any(m.get("url") == crop["url"] for m in media if isinstance(m, dict)):
+                media.append({
+                    "type": "source",
+                    "url": crop["url"],
+                    "relativePath": crop.get("relativePath"),
+                    "sourceId": source["sourceId"],
+                    "label": source.get("label") or "Texto de apoio",
+                })
+
+    if created or linked:
+        output.setdefault("warnings", []).append({
+            "type": "portuguese_text_sources_repaired",
+            "message": f"Created {created} Portuguese text source crop(s) and linked {linked} question(s).",
+        })
+
+
+def _detect_portuguese_text_source_candidates(output: dict, pages: dict[int, dict], questions: list[dict]) -> list[dict[str, Any]]:
+    pdf_blocks = _load_pdf_text_blocks(output)
+    first_q_by_page = _first_question_y_by_page(questions)
+    candidates: list[dict[str, Any]] = []
+
+    for page_num, page_info in sorted(pages.items()):
+        if _page_is_mostly_scoring(page_info):
+            continue
+        blocks = _page_blocks(page_info, pdf_blocks.get(page_num, []))
+        text = _normalized_text(" ".join(block.get("text", "") for block in blocks))
+        if not text:
+            continue
+
+        group_id = _infer_portuguese_source_group(page_info, blocks, questions, page_num)
+        if group_id not in {"grupo_i", "grupo_ii"}:
+            continue
+
+        first_q_y = first_q_by_page.get(page_num)
+        after_question_source_y = _find_after_question_source_y(blocks, first_q_y)
+        if after_question_source_y is not None:
+            top_pdf = max(0.0, after_question_source_y - 8.0)
+            bottom_pdf = _after_question_source_bottom_y(blocks, after_question_source_y) or _page_footer_y(blocks)
+        elif _looks_like_text_source_page(text):
+            top_pdf = 28.0
+            bottom_pdf = (first_q_y - 10.0) if first_q_y else _page_footer_y(blocks)
+        else:
+            continue
+
+        if bottom_pdf <= top_pdf + 40:
+            continue
+        candidates.append({
+            "sourceId": f"{group_id}_texto_p{page_num}",
+            "groupId": group_id,
+            "page": page_num,
+            "topPdf": top_pdf,
+            "bottomPdf": bottom_pdf,
+        })
+
+    return candidates
+
+
+def _best_portuguese_source_for_question(q: dict, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    group_id = str(q.get("groupId") or "")
+    try:
+        q_page = int(q.get("sourcePage"))
+    except (TypeError, ValueError):
+        return None
+    q_y = _question_region_top(q)
+    eligible = []
+    for candidate in candidates:
+        if candidate.get("groupId") != group_id:
+            continue
+        page = int(candidate.get("page") or 0)
+        if page > q_page:
+            continue
+        if page == q_page and q_y is not None and q_y < float(candidate.get("topPdf") or 0) - 12:
+            continue
+        eligible.append(candidate)
+    if not eligible:
+        return None
+    return max(eligible, key=lambda item: int(item.get("page") or 0))
+
+
+def _source_has_usable_crop(source: dict) -> bool:
+    crops = source.get("crops") if isinstance(source.get("crops"), dict) else {}
+    for key in ("best", "full"):
+        crop = crops.get(key)
+        if isinstance(crop, dict) and (crop.get("url") or crop.get("relativePath")):
+            return True
+    return False
+
+
+def _create_portuguese_text_source_crop(
+    output: dict,
+    page_info: dict | None,
+    source_id: str,
+    sources_dir: Path,
+    top_pdf: float | None = None,
+    bottom_pdf: float | None = None,
+) -> dict | None:
+    page_image_path = (page_info or {}).get("page_image_path")
+    if not page_image_path or not Path(page_image_path).exists():
+        return None
+    try:
+        img = Image.open(page_image_path)
+    except Exception:
+        return None
+
+    crop_box = _portuguese_text_crop_box(img.size, page_info or {}, top_pdf=top_pdf, bottom_pdf=bottom_pdf)
+    if crop_box is None:
+        return None
+    cropped = img.crop(crop_box)
+    if cropped.width < 120 or cropped.height < 120:
+        return None
+
+    filename = f"{source_id}_full.png"
+    path = sources_dir / filename
+    cropped.save(path)
+    rel = f"assets/sources/{filename}"
+    return {
+        "status": "success",
+        "method": "portuguese_page_text_source",
+        "relativePath": rel,
+        "url": f"/api/exams/{output.get('exam_id')}/assets/sources/{filename}",
+        "width": cropped.width,
+        "height": cropped.height,
+    }
+
+
+def _portuguese_text_crop_box(
+    size: tuple[int, int],
+    page_info: dict,
+    top_pdf: float | None = None,
+    bottom_pdf: float | None = None,
+) -> tuple[int, int, int, int] | None:
+    w, h = size
+    top = int(top_pdf * (200 / 72)) if top_pdf is not None else int(h * 0.04)
+    bottom = int(bottom_pdf * (200 / 72)) if bottom_pdf is not None else int(h * 0.92)
+    # Keep the page content. If the first question marker is detected far below the
+    # source text, trim before it; otherwise keep the whole page to avoid losing poems.
+    for block in page_info.get("blocks") or []:
+        text = str(block.get("text") or "").strip()
+        if not re.match(r"^(?:[1-7]|Grupo\s+[IVX]+)[.\s]", text, re.IGNORECASE):
+            continue
+        bbox = block.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        try:
+            y_px = float(bbox[1]) * (200 / 72)
+        except (TypeError, ValueError):
+            continue
+        if h * 0.28 < y_px < h * 0.9:
+            bottom = max(int(h * 0.25), int(y_px - h * 0.015))
+            break
+    left = int(w * 0.03)
+    right = int(w * 0.97)
+    top = max(0, min(h, top))
+    bottom = max(0, min(h, bottom))
+    if right <= left or bottom <= top:
+        return None
+    return (left, top, right, bottom)
+
+
+def _page_is_mostly_scoring(page_info: dict | None) -> bool:
+    text = _normalized_text(str((page_info or {}).get("text") or ""))
+    return "cotacoes" in text or "cotacao" in text or "cotações" in text or "cotação" in text
+
+
+def _load_pdf_text_blocks(output: dict) -> dict[int, list[dict[str, Any]]]:
+    exam_id = str(output.get("exam_id") or "")
+    candidates = []
+    raw_pdf = output.get("_pdf_path")
+    if raw_pdf:
+        candidates.append(Path(str(raw_pdf)))
+    if exam_id:
+        candidates.append(Path("data") / "uploads" / f"{exam_id}.pdf")
+
+    pdf_path = next((path for path in candidates if path.exists()), None)
+    if not pdf_path:
+        return {}
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        out: dict[int, list[dict[str, Any]]] = {}
+        for idx in range(doc.page_count):
+            blocks = []
+            for block in doc[idx].get_text("blocks"):
+                x0, y0, x1, y1, text, *_ = block
+                clean = " ".join(str(text or "").split())
+                if clean:
+                    blocks.append({"bbox": [x0, y0, x1, y1], "text": clean})
+            out[idx + 1] = blocks
+        doc.close()
+        return out
+    except Exception:
+        return {}
+
+
+def _page_blocks(page_info: dict, fallback: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    blocks = page_info.get("blocks") or []
+    clean = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        text = " ".join(str(block.get("text") or "").split())
+        bbox = block.get("bbox") or []
+        if text and len(bbox) == 4:
+            clean.append({"text": text, "bbox": bbox})
+    return clean or fallback
+
+
+def _first_question_y_by_page(questions: list[dict]) -> dict[int, float]:
+    out: dict[int, float] = {}
+    for q in questions:
+        try:
+            page = int(q.get("sourcePage"))
+        except (TypeError, ValueError):
+            continue
+        y = _question_region_top(q)
+        if y is None:
+            continue
+        out[page] = min(out.get(page, y), y)
+    return out
+
+
+def _question_region_top(q: dict) -> float | None:
+    bbox = ((q.get("region") or {}).get("bbox") or [])
+    if len(bbox) != 4:
+        return None
+    try:
+        return float(bbox[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _infer_portuguese_source_group(page_info: dict, blocks: list[dict[str, Any]], questions: list[dict], page_num: int) -> str:
+    text = _normalized_text(" ".join(block.get("text", "") for block in blocks))
+    if "grupo ii" in text:
+        return "grupo_ii"
+    if "grupo i" in text or "parte a" in text or "parte b" in text or "parte c" in text:
+        return "grupo_i"
+    groups = {
+        str(q.get("groupId") or "")
+        for q in questions
+        if q.get("sourcePage") == page_num and q.get("groupId") in {"grupo_i", "grupo_ii"}
+    }
+    if len(groups) == 1:
+        return next(iter(groups))
+    return ""
+
+
+def _looks_like_text_source_page(text: str) -> bool:
+    return bool(re.search(
+        r"\b(leia\s+(?:o\s+)?(?:texto|poema|nota|cantiga)|parte\s+[abc]|grupo\s+ii)\b",
+        text,
+        re.IGNORECASE,
+    ))
+
+
+def _find_after_question_source_y(blocks: list[dict[str, Any]], first_q_y: float | None) -> float | None:
+    if first_q_y is None:
+        return None
+    for block in blocks:
+        text = str(block.get("text") or "")
+        bbox = block.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        try:
+            y0 = float(bbox[1])
+        except (TypeError, ValueError):
+            continue
+        if y0 <= first_q_y + 20:
+            continue
+        if re.search(r"\b(PARTE\s+C|Leia\s+(?:a\s+)?(?:cantiga|o\s+poema|o\s+texto|o\s+excerto))\b", text, re.IGNORECASE):
+            return y0
+    return None
+
+
+def _after_question_source_bottom_y(blocks: list[dict[str, Any]], source_y: float) -> float | None:
+    for block in blocks:
+        text = str(block.get("text") or "")
+        bbox = block.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        try:
+            y0 = float(bbox[1])
+        except (TypeError, ValueError):
+            continue
+        if y0 <= source_y + 30:
+            continue
+        if re.search(r"\b(Escreva|Redija|Elabore|A\s+sua\s+exposi[cç][aã]o|No\s+seu\s+texto)\b", text, re.IGNORECASE):
+            return max(source_y + 40.0, y0 - 8.0)
+    return None
+
+
+def _page_footer_y(blocks: list[dict[str, Any]]) -> float:
+    footer_candidates = []
+    for block in blocks:
+        text = str(block.get("text") or "")
+        bbox = block.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        if re.search(r"Prova\s+639|P[aá]gina\s+\d+", text, re.IGNORECASE):
+            try:
+                footer_candidates.append(float(bbox[1]) - 8.0)
+            except (TypeError, ValueError):
+                pass
+    return min(footer_candidates) if footer_candidates else 760.0
 
 
 def _recover_missing_questions_from_scoring(output: dict, extraction: dict | None) -> None:

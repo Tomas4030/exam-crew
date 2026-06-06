@@ -13,7 +13,10 @@ export default function MathJaxProvider({ children }: { children: React.ReactNod
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    if (window.MathJax?.typesetPromise) { setReady(true); return; }
+    if (window.MathJax?.typesetPromise) {
+      queueMicrotask(() => setReady(true));
+      return;
+    }
 
     const existing = document.getElementById('mathjax-script');
     if (existing) { existing.addEventListener('load', () => setReady(true)); return; }

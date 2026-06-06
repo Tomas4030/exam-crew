@@ -851,7 +851,7 @@ export default function PreviewPage() {
         </header>
 
         <div className="flex flex-1 overflow-hidden">
-          <aside className="w-56 bg-white border-r overflow-y-auto shrink-0 p-3">
+          <aside className="w-56 bg-white overflow-y-auto shrink-0 p-3 shadow-[1px_0_0_#e2e8f0]">
             {(() => {
               const groups = [
                 ...new Set(questions.map((q) => q.group || "Perguntas")),
@@ -909,7 +909,7 @@ export default function PreviewPage() {
                       key={i}
                       src={url}
                       alt={`Figura ${i + 1}`}
-                      className="mx-auto max-h-[560px] max-w-full rounded border bg-white object-contain shadow-sm"
+                      className="mx-auto max-h-[560px] max-w-full rounded bg-white object-contain shadow-sm ring-1 ring-slate-200"
                     />
                   ))}
                 </div>
@@ -1113,7 +1113,7 @@ export default function PreviewPage() {
                               <img
                                 src={optionImageUrl}
                                 alt={`Opção ${opt.letter}`}
-                                className="max-h-72 max-w-full rounded border border-slate-300 bg-white object-contain"
+                                className="max-h-72 max-w-full rounded bg-white object-contain ring-1 ring-slate-200"
                               />
                             </span>
                           ) : (
@@ -1159,14 +1159,6 @@ export default function PreviewPage() {
             </div>
           </main>
 
-          <aside className="w-96 bg-slate-900 text-slate-100 overflow-y-auto shrink-0 p-4 border-l">
-            <h3 className="text-xs font-semibold text-slate-400 uppercase mb-2">
-              JSON da Pergunta
-            </h3>
-            <pre className="text-xs leading-relaxed whitespace-pre-wrap break-words font-mono">
-              {JSON.stringify(current, null, 2)}
-            </pre>
-          </aside>
         </div>
       </div>
     </MathJaxProvider>

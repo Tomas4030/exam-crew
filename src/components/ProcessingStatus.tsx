@@ -1,6 +1,6 @@
-'use client';
+"use client";
 
-import { useState, useEffect } from 'react';
+import { useEffect, useState } from "react";
 
 interface Progress {
   step: string;
@@ -17,123 +17,127 @@ interface StatusData {
 }
 
 const STEPS = [
-  { id: 'extract', label: 'Extrair PDF' },
-  { id: 'vision', label: 'Analisar páginas' },
-  { id: 'scoring', label: 'Extrair cotações' },
-  { id: 'assemble', label: 'Montar estrutura' },
-  { id: 'crop', label: 'Cortar imagens' },
-  { id: 'math_normalize', label: 'Normalizar fórmulas' },
-  { id: 'validate', label: 'Validar' },
-  { id: 'audit', label: 'Auditar' },
-  { id: 'audit_retry', label: 'Corrigir' },
-  { id: 'done', label: 'Concluído' },
+  { id: "extract", label: "Leitura de páginas", doneText: "PDF renderizado." },
+  { id: "vision", label: "Separação de perguntas", doneText: "Perguntas detetadas." },
+  { id: "scoring", label: "Extração de cotações", doneText: "Cotações estruturadas." },
+  { id: "assemble", label: "Geração de estrutura", doneText: "JSON estruturado." },
+  { id: "crop", label: "Extração de imagens", doneText: "Imagens e textos preparados." },
+  { id: "validate", label: "Validação", doneText: "Regras verificadas." },
+  { id: "audit", label: "Auditoria", doneText: "Qualidade validada." },
+  { id: "done", label: "Exportação", doneText: "Resultado pronto." },
 ];
 
 export default function ProcessingStatus({ examId }: { examId: string }) {
   const [data, setData] = useState<StatusData | null>(null);
 
   useEffect(() => {
-    let interval: ReturnType<typeof setInterval>;
     const fetchStatus = () =>
-      fetch(`/api/exams/${examId}/status`).then(r => r.json()).then(d => {
-        setData(d);
-        if (['completed', 'error', 'completed_with_warnings', 'needs_review', 'partial_failed'].includes(d.status)) {
-          clearInterval(interval);
+      fetch(`/api/exams/${examId}/status`).then((response) => response.json()).then((next) => {
+        setData(next);
+        if (["completed", "error", "completed_with_warnings", "needs_review", "partial_failed"].includes(next.status)) {
+          clearInterval(intervalId);
         }
       }).catch(() => {});
+    const intervalId = setInterval(fetchStatus, 2000);
     fetchStatus();
-    interval = setInterval(fetchStatus, 2000);
-    return () => clearInterval(interval);
+    return () => clearInterval(intervalId);
   }, [examId]);
 
-  if (!data) return <div className="p-4 text-gray-500">A carregar...</div>;
-
-  if (data.status === 'completed' || data.status === 'completed_with_warnings') {
+  if (!data) {
     return (
-      <div className="p-4 border border-green-200 bg-green-50 rounded-lg">
-        <div className="flex items-center gap-2">
-          <svg className="w-5 h-5 text-green-600" fill="currentColor" viewBox="0 0 20 20">
-            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
-          </svg>
-          <span className="font-semibold text-green-800">Processamento concluído</span>
-        </div>
+      <div className="rounded-lg border border-[#dce5f2] bg-white p-6 text-[#53617f]">
+        A carregar...
       </div>
     );
   }
 
-  if (data.status === 'needs_review' || data.status === 'partial_failed') {
+  if (data.status === "error") {
     return (
-      <div className="p-4 border border-amber-200 bg-amber-50 rounded-lg">
-        <div className="flex items-center gap-2">
-          <svg className="w-5 h-5 text-amber-600" fill="currentColor" viewBox="0 0 20 20">
-            <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l6.518 11.59c.75 1.334-.214 2.985-1.742 2.985H3.48c-1.528 0-2.492-1.65-1.742-2.985l6.518-11.59zM11 14a1 1 0 10-2 0 1 1 0 002 0zm-1-2a1 1 0 01-1-1V7a1 1 0 112 0v4a1 1 0 01-1 1z" clipRule="evenodd" />
-          </svg>
-          <span className="font-semibold text-amber-800">Revisao necessaria</span>
-        </div>
-        {data.progress?.message && <p className="mt-1 text-sm text-amber-700">{data.progress.message}</p>}
-      </div>
+      <StatusPanel tone="red" title="Erro no processamento" message={data.error || "O processamento falhou."} />
     );
   }
 
-  if (data.status === 'error') {
+  if (data.status === "needs_review" || data.status === "partial_failed") {
     return (
-      <div className="p-4 border border-red-200 bg-red-50 rounded-lg">
-        <p className="font-semibold text-red-800">Erro no processamento</p>
-        {data.error && <p className="mt-1 text-sm text-red-600">{data.error}</p>}
-      </div>
+      <StatusPanel tone="amber" title="Revisão necessária" message={data.progress?.message || "A auditoria encontrou pontos a rever."} />
+    );
+  }
+
+  if (data.status === "completed" || data.status === "completed_with_warnings") {
+    return (
+      <StatusPanel tone="green" title="Processamento concluído" message={data.status === "completed_with_warnings" ? "Resultado pronto com avisos." : "Resultado pronto para exportar."} />
     );
   }
 
   const progress = data.progress;
-  const currentStepIdx = progress ? STEPS.findIndex(s => s.id === progress.step) : -1;
+  const currentStepIdx = progress ? Math.max(0, STEPS.findIndex((step) => step.id === progress.step)) : 0;
 
   return (
-    <div className="p-5 border border-blue-100 bg-white rounded-lg space-y-4">
-      {/* Progress bar */}
-      <div>
-        <div className="flex justify-between text-sm mb-1">
-          <span className="font-medium text-gray-900">{progress?.label || 'A processar...'}</span>
-          <span className="text-gray-500">{progress?.pct || 0}%</span>
-        </div>
-        <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
-          <div
-            className="h-full bg-blue-600 rounded-full transition-all duration-700 ease-out"
-            style={{ width: `${progress?.pct || 0}%` }}
-          />
-        </div>
-        {progress?.message && (
-          <p className="mt-1.5 text-xs text-gray-500">{progress.message}</p>
-        )}
-      </div>
-
-      {/* Steps */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-        {STEPS.map((step, i) => {
-          const isDone = i < currentStepIdx || (i === currentStepIdx && progress?.step === 'done');
-          const isCurrent = i === currentStepIdx && progress?.step !== 'done';
+    <div className="rounded-lg border border-[#dce5f2] bg-white p-8 shadow-[0_18px_55px_rgba(25,45,78,0.05)]">
+      <h2 className="text-xl font-bold tracking-[-0.03em] text-[#07122f]">Progresso do pipeline</h2>
+      <div className="mt-8 space-y-0">
+        {STEPS.map((step, index) => {
+          const isDone = index < currentStepIdx || progress?.step === "done";
+          const isCurrent = index === currentStepIdx && progress?.step !== "done";
           return (
-            <div key={step.id} className={`flex items-center gap-1.5 text-xs rounded px-2 py-1.5 ${
-              isDone ? 'text-green-700 bg-green-50' :
-              isCurrent ? 'text-blue-700 bg-blue-50 font-medium' :
-              'text-gray-400'
-            }`}>
-              {isDone ? (
-                <svg className="w-3.5 h-3.5 shrink-0" fill="currentColor" viewBox="0 0 20 20">
-                  <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
-                </svg>
-              ) : isCurrent ? (
-                <svg className="w-3.5 h-3.5 shrink-0 animate-spin" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                </svg>
-              ) : (
-                <div className="w-3.5 h-3.5 shrink-0 rounded-full border border-gray-300" />
-              )}
-              <span className="truncate">{step.label}</span>
+            <div key={step.id} className="grid grid-cols-[42px_minmax(0,1fr)] gap-4">
+              <div className="flex flex-col items-center">
+                <div className={`flex h-9 w-9 items-center justify-center rounded-full border-3 ${
+                  isDone ? "border-emerald-500 text-emerald-600" : isCurrent ? "border-[#0b66f6] text-[#0b66f6]" : "border-[#b8c5d8] text-[#b8c5d8]"
+                }`}>
+                  {isDone ? <CheckIcon /> : isCurrent ? <span className="h-2.5 w-2.5 rounded-full bg-current" /> : null}
+                </div>
+                {index < STEPS.length - 1 && <div className="h-14 w-px bg-[#dce5f2]" />}
+              </div>
+              <div className="pb-7">
+                <h3 className="text-lg font-bold tracking-[-0.02em] text-[#07122f]">{step.label}</h3>
+                <p className={`mt-1 text-base ${isCurrent ? "text-[#0b66f6]" : "text-[#53617f]"}`}>
+                  {isCurrent ? progress?.message || progress?.label || "A processar..." : isDone ? step.doneText : "Aguardando conclusão da etapa."}
+                </p>
+              </div>
             </div>
           );
         })}
       </div>
+      <div className="mt-2">
+        <div className="mb-2 flex justify-between text-sm font-medium text-[#53617f]">
+          <span>{progress?.label || "A processar..."}</span>
+          <span>{progress?.pct || 0}%</span>
+        </div>
+        <div className="h-2 overflow-hidden rounded-full bg-[#e8eef7]">
+          <div className="h-full rounded-full bg-[#0b66f6] transition-all duration-700" style={{ width: `${progress?.pct || 0}%` }} />
+        </div>
+      </div>
     </div>
+  );
+}
+
+function StatusPanel({ tone, title, message }: { tone: "green" | "amber" | "red"; title: string; message: string }) {
+  const styles = {
+    green: "border-emerald-200 bg-emerald-50 text-emerald-700",
+    amber: "border-amber-200 bg-amber-50 text-amber-700",
+    red: "border-red-200 bg-red-50 text-red-700",
+  }[tone];
+
+  return (
+    <div className={`rounded-lg border p-6 ${styles}`}>
+      <div className="flex items-start gap-4">
+        <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border-2 border-current">
+          {tone === "green" ? <CheckIcon /> : <span className="text-lg font-bold">!</span>}
+        </div>
+        <div>
+          <h2 className="text-lg font-bold">{title}</h2>
+          <p className="mt-1 text-sm">{message}</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+      <path d="m6 12 4 4 8-8" />
+    </svg>
   );
 }

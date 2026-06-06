@@ -164,22 +164,32 @@ def _crop_context(img: Image.Image, label_rect: fitz.Rect, is_table: bool) -> Im
     return img.crop((left, top, right, bottom))
 
 
-def _crop_context_bbox(img: Image.Image, bbox: dict, is_table: bool) -> Image.Image:
+def _crop_context_bbox(img: Image.Image, bbox: dict, is_table: bool) -> Image.Image | None:
     """Context crop fallback using LLM bbox estimate with generous padding."""
     w, h = img.size
     pad = TABLE_PADDING_TOP_PCT if is_table else FALLBACK_PADDING_PCT
 
-    x_pct = max(0, bbox.get("x_pct", 0) - pad)
-    y_pct = max(0, bbox.get("y_pct", 0) - pad)
-    w_pct = min(100 - x_pct, bbox.get("w_pct", 0) + pad * 2)
-    h_pct = min(100 - y_pct, bbox.get("h_pct", 0) + (pad + TABLE_PADDING_BOTTOM_PCT if is_table else pad * 2))
+    try:
+        x_pct = max(0.0, float(bbox.get("x_pct", bbox.get("x", 0))) - pad)
+        y_pct = max(0.0, float(bbox.get("y_pct", bbox.get("y", 0))) - pad)
+        w_pct = min(100.0 - x_pct, float(bbox.get("w_pct", bbox.get("width", 0))) + pad * 2)
+        h_pct = min(
+            100.0 - y_pct,
+            float(bbox.get("h_pct", bbox.get("height", 0))) + (pad + TABLE_PADDING_BOTTOM_PCT if is_table else pad * 2),
+        )
+    except (TypeError, ValueError):
+        return None
 
     x = int(w * x_pct / 100)
     y = int(h * y_pct / 100)
     crop_w = int(w * w_pct / 100)
     crop_h = int(h * h_pct / 100)
 
-    return img.crop((x, y, min(w, x + crop_w), min(h, y + crop_h)))
+    right = min(w, x + crop_w)
+    bottom = min(h, y + crop_h)
+    if right <= x or bottom <= y:
+        return None
+    return img.crop((x, y, right, bottom))
 
 
 def _crop_visual_bbox(img: Image.Image, bbox: dict, is_table: bool = False) -> Image.Image | None:
@@ -221,6 +231,8 @@ def _crop_visual_bbox(img: Image.Image, bbox: dict, is_table: bool = False) -> I
     right = int(w * x1 / 100)
     bottom = int(h * y1 / 100)
 
+    if right <= left or bottom <= top:
+        return None
     if right - left < 50 or bottom - top < 50:
         return None
     return img.crop((left, top, right, bottom))
@@ -997,7 +1009,13 @@ def crop_assets(output: dict, extraction: dict, output_dir: Path) -> dict:
     # ── Option-image crops for visual multiple-choice items ───────────────
     option_dir = output_dir / "assets" / "options"
     option_dir.mkdir(parents=True, exist_ok=True)
-    _crop_option_images(output, extraction, page_images, option_dir, exam_id, pdf_path)
+    try:
+        _crop_option_images(output, extraction, page_images, option_dir, exam_id, pdf_path)
+    except Exception as exc:
+        output.setdefault("metadata", {}).setdefault("cropWarnings", []).append({
+            "code": "OPTION_CROP_FAILED",
+            "message": str(exc),
+        })
 
     # ── Source document crops (for History and similar) ────────────
     sources_dir = output_dir / "assets" / "sources"
@@ -1171,6 +1189,8 @@ def _do_context_crop(img, label_rect, bbox, is_table, filename, context_dir, leg
         status = "success"
     elif bbox:
         cropped = _crop_context_bbox(img, bbox, is_table)
+        if cropped is None:
+            return {"status": "failed", "reason": "invalid_bbox"}
         method = "bbox_fallback"
         status = "needs_review"
     else:
