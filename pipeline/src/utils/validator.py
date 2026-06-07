@@ -64,9 +64,10 @@ def validate_and_fix(output: dict, extraction: dict = None) -> dict:
 
     # ── Rule 3: Valid sourcePage ──────────────────────────────────
     for q in questions:
-        page = q.get("sourcePage", 0)
+        raw_page = q.get("sourcePage")
+        page = raw_page if isinstance(raw_page, int) else 0
         if page < 1 or (total_pages > 0 and page > total_pages):
-            warnings.append({"type": "invalid_page", "message": f"Q{q['number']} has invalid sourcePage={page}", "questionId": q["questionId"]})
+            warnings.append({"type": "invalid_page", "message": f"Q{q['number']} has invalid sourcePage={raw_page}", "questionId": q["questionId"]})
         if q.get("region"):
             region = q.get("region", {})
             bbox = region.get("bbox") or []

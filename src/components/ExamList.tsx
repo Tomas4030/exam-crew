@@ -242,11 +242,21 @@ function DayTable({
         </label>
       </div>
 
-      <div className="overflow-x-auto">
-        <table className="w-full min-w-[980px] border-collapse text-left">
+      <div className="max-w-full overflow-x-auto">
+        <table className="w-full min-w-[980px] table-fixed border-collapse text-left">
+          <colgroup>
+            <col className="w-[4%]" />
+            <col className="w-[33%]" />
+            <col className="w-[10%]" />
+            <col className="w-[13%]" />
+            <col className="w-[18%]" />
+            <col className="w-[8%]" />
+            <col className="w-[7%]" />
+            <col className="w-[7%]" />
+          </colgroup>
           <thead className="bg-[#fbfdff] text-xs font-bold uppercase tracking-wide text-[#667392]">
             <tr className="border-b border-[#dce5f2]">
-              <th className="w-12 px-5 py-4">
+              <th className="px-5 py-4">
                 <input type="checkbox" checked={groupAllSelected} onChange={() => toggleGroup(group.exams, groupAllSelected, setSelectedIds)} className="h-4 w-4 rounded border-[#b8c5d8] text-[#0b66f6]" />
               </th>
               <th className="px-4 py-4">Ficheiro</th>
@@ -255,7 +265,7 @@ function DayTable({
               <th className="px-4 py-4">Progresso</th>
               <th className="px-4 py-4">Duração</th>
               <th className="px-4 py-4">Tokens</th>
-              <th className="px-4 py-4">Criado em</th>
+              <th className="px-3 py-4 whitespace-nowrap">Criado</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-[#e8eef7]">
@@ -264,12 +274,12 @@ function DayTable({
                 <td className="px-5 py-4">
                   <input type="checkbox" checked={selectedIds.has(exam.id)} onChange={() => toggleExam(exam.id, setSelectedIds)} className="h-4 w-4 rounded border-[#b8c5d8] text-[#0b66f6]" aria-label={`Selecionar ${displayName(exam)}`} />
                 </td>
-                <td className="px-4 py-4">
+                <td className="min-w-0 px-4 py-4">
                   <Link href={`/exams/${exam.id}`} className="flex min-w-0 items-center gap-3 font-medium text-[#28477d] hover:text-[#0b66f6]">
                     <FileIcon />
-                    <span className="max-w-[310px] truncate">{displayName(exam)}</span>
+                    <span className="min-w-0 truncate">{displayName(exam)}</span>
                   </Link>
-                  {exam.sourceUrl && <p className="mt-1 max-w-[360px] truncate text-xs text-[#7a87a3]">{exam.sourceUrl}</p>}
+                  {exam.sourceUrl && <p className="mt-1 truncate text-xs text-[#7a87a3]">{exam.sourceUrl}</p>}
                 </td>
                 <td className="px-4 py-4 text-sm text-[#53617f]">{inferSubject(exam)}</td>
                 <td className="px-4 py-4">
@@ -278,17 +288,17 @@ function DayTable({
                     {statusLabels[exam.status] || exam.status}
                   </span>
                 </td>
-                <td className="px-4 py-4">
+                <td className="px-3 py-4">
                   <div className="flex items-center gap-3">
                     <span className="w-10 text-sm font-semibold text-[#0b66f6]">{progressFor(exam)}%</span>
-                    <div className="h-2 w-36 overflow-hidden rounded-full bg-[#e8eef7]">
+                    <div className="h-2 min-w-0 flex-1 overflow-hidden rounded-full bg-[#e8eef7]">
                       <div className="h-full rounded-full bg-[#0b66f6]" style={{ width: `${progressFor(exam)}%` }} />
                     </div>
                   </div>
                 </td>
-                <td className="px-4 py-4 text-sm font-medium text-[#07122f]">{formatDuration(getDurationMs(exam))}</td>
-                <td className="px-4 py-4 text-sm text-[#53617f]">{exam.tokenUsage?.totalTokens ? formatNumber(exam.tokenUsage.totalTokens) : "-"}</td>
-                <td className="px-4 py-4 text-sm text-[#53617f]">{formatDateTime(exam.createdAt)}</td>
+                <td className="px-3 py-4 text-sm font-medium text-[#07122f] whitespace-nowrap">{formatDuration(getDurationMs(exam))}</td>
+                <td className="px-3 py-4 text-sm text-[#53617f] truncate">{exam.tokenUsage?.totalTokens ? formatNumber(exam.tokenUsage.totalTokens) : "-"}</td>
+                <td className="px-3 py-4 text-sm text-[#53617f] leading-tight">{formatCompactDateTime(exam.createdAt)}</td>
               </tr>
             ))}
           </tbody>
@@ -392,11 +402,18 @@ function formatDay(value?: string) {
   return new Intl.DateTimeFormat("pt-PT", { day: "numeric", month: "long", year: "numeric" }).format(date);
 }
 
-function formatDateTime(value?: string) {
+function formatCompactDateTime(value?: string) {
   if (!value) return "-";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "-";
-  return new Intl.DateTimeFormat("pt-PT", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" }).format(date);
+  const day = new Intl.DateTimeFormat("pt-PT", { day: "2-digit", month: "2-digit" }).format(date);
+  const time = new Intl.DateTimeFormat("pt-PT", { hour: "2-digit", minute: "2-digit" }).format(date);
+  return (
+    <>
+      <span className="block whitespace-nowrap">{day}</span>
+      <span className="block whitespace-nowrap">{time}</span>
+    </>
+  );
 }
 
 function getDurationMs(exam: Exam) {

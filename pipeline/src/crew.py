@@ -406,8 +406,8 @@ Text:
             if q.get("type") != "multi_blank_choice" or q.get("blanks"):
                 continue
             # This question was marked multi_blank_choice but blanks weren't extracted
-            page_num = q.get("sourcePage", 0)
-            if page_num < 1 or page_num > pdf_doc.page_count:
+            page_num = q.get("sourcePage")
+            if not isinstance(page_num, int) or page_num < 1 or page_num > pdf_doc.page_count:
                 continue
             page = pdf_doc[page_num - 1]
             tables = page.find_tables().tables
@@ -494,6 +494,9 @@ Text:
 
         # Step 4.92: remove broken asset/media references before final save
         output = enforce_asset_integrity(output, self.output_dir)
+        if subject_profile and "portugues" in subject_profile.get("normalizers", []):
+            output = normalize_by_profile(output, extraction, subject_profile)
+            output = enforce_asset_integrity(output, self.output_dir)
 
         # Step 4.94: Subject-specific audit gate before any "done" status.
         from .utils.history_audit import apply_history_audit_gate
@@ -843,10 +846,11 @@ Text:
             # Re-sort and re-validate
             def sort_key(q):
                 parts = q["number"].split(".")
+                page = q.get("sourcePage") if isinstance(q.get("sourcePage"), int) else 999
                 try:
-                    return (q["sourcePage"], int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+                    return (page, int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
                 except ValueError:
-                    return (q["sourcePage"], 999, 0)
+                    return (page, 999, 0)
             output["questions"].sort(key=sort_key)
 
             # Re-apply scoring to new questions that missed the first pass
@@ -1772,10 +1776,11 @@ Text:
         def sort_key(q):
             num = q["number"]
             parts = num.split(".")
+            page = q.get("sourcePage") if isinstance(q.get("sourcePage"), int) else 999
             try:
-                return (q["sourcePage"], int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+                return (page, int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
             except ValueError:
-                return (q["sourcePage"], 999, 0)
+                return (page, 999, 0)
         all_questions.sort(key=sort_key)
 
         # Add per-question page region for safer crop boundaries

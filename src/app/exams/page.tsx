@@ -4,7 +4,7 @@ import ExamList from "@/components/ExamList";
 export default function ExamsPage() {
   return (
     <AppShell active="processamentos">
-      <main className="mx-auto max-w-7xl px-6 py-12 lg:px-10">
+      <main className="mx-auto w-full max-w-[1600px] px-6 py-12 lg:px-10">
         <div className="mb-10">
           <h1 className="text-4xl font-bold tracking-[-0.04em] text-[#07122f]">Processamentos</h1>
           <p className="mt-3 text-lg text-[#53617f]">

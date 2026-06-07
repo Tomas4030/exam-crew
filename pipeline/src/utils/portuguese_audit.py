@@ -273,8 +273,23 @@ def _audit_media_files(output: dict[str, Any], asset_base: str | Path, issues: l
     bundle = OutputBundle(output, Path(asset_base))
     asset_issues = _history_style_asset_audit(bundle)
     for issue in asset_issues:
-        if issue.code in {"MISSING_MEDIA_FILE", "MISSING_SOURCE_CROP_FILE", "MISSING_CHILD_CROP_FILE", "BROKEN_SOURCE_REF", "BROKEN_CHILD_REF"}:
+        if issue.code in {
+            "MISSING_MEDIA_FILE",
+            "MISSING_SOURCE_CROP_FILE",
+            "MISSING_CHILD_CROP_FILE",
+            "BROKEN_SOURCE_REF",
+            "BROKEN_CHILD_REF",
+        }:
             issues.append(issue)
+        elif issue.code == "SOURCE_WITHOUT_CROP":
+            # Portuguese text sources (texto de apoio) may not have crop images;
+            # the text content is already embedded in the JSON. Downgrade to MEDIUM
+            # so the exam processes instead of failing the audit gate.
+            issues.append(Issue(
+                issue.root, "MEDIUM", issue.code, issue.message,
+                issue.question_id, issue.group, issue.number,
+                issue.expected, issue.actual,
+            ))
 
     _audit_asset_ref_files(output, asset_base, issues)
 

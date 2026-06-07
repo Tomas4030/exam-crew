@@ -5,6 +5,7 @@ Keep this module subject-specific. Do not put Historia rules here.
 from __future__ import annotations
 
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ def normalize_portugues(output: dict, extraction: dict | None = None) -> dict:
     _repair_portuguese_text_sources(output, extraction)
     _recover_missing_questions_from_scoring(output, extraction)
     _repair_points_from_scoring_text(output, extraction)
+    _repair_composition_points_remainder(output)
     _sort_questions(output)
     _refresh_stats(output)
     return output
@@ -250,10 +252,20 @@ def _normalize_group_metadata(output: dict) -> None:
 
 def _remove_legacy_duplicate_questions(output: dict) -> None:
     questions = output.get("questions") or []
+    policy_numbers = {
+        (str(item.get("groupId") or ""), str(item.get("number") or ""))
+        for item in (((output.get("metadata") or {}).get("scoringPolicy") or {}).get("items") or [])
+        if isinstance(item, dict)
+    }
+    group_numbers: dict[str, set[str]] = {}
+    for item in questions:
+        group_numbers.setdefault(str(item.get("groupId") or ""), set()).add(str(item.get("number") or ""))
     clean = []
     seen = set()
     removed = 0
     for q in questions:
+        group_id = str(q.get("groupId") or "")
+        number = str(q.get("number") or "")
         qid = str(q.get("questionId") or "")
         text = _normalized_text(_question_prompt_text(q))
         if _is_scoring_artifact_text(text):
@@ -262,7 +274,24 @@ def _remove_legacy_duplicate_questions(output: dict) -> None:
         if _is_observation_artifact(q):
             removed += 1
             continue
-        if q.get("groupId") == "grupo_ii" and re.search(r"\bresponda\s+(?:aos?|de forma)", text):
+        if (
+            policy_numbers
+            and group_id in {"grupo_i", "grupo_ii"}
+            and (group_id, number) not in policy_numbers
+            and (q.get("points") is None or q.get("points") == 0)
+            and number.isdigit()
+            and int(number) >= 10
+        ):
+            removed += 1
+            continue
+        if q.get("groupId") == "grupo_ii" and re.search(r"\b(?:responda\s+(?:aos?|de forma)|para\s+responder\s+a\s+cada\s+um\s+dos\s+itens)", text):
+            removed += 1
+            continue
+        if (
+            group_id == "grupo_ii"
+            and number.isdigit()
+            and any(n.startswith(f"{number}.") for n in group_numbers.get(group_id, set()))
+        ):
             removed += 1
             continue
         key = (q.get("groupId"), q.get("number"), text[:180])
@@ -482,7 +511,11 @@ def _repair_portuguese_text_sources(output: dict, extraction: dict | None = None
     sources_needing_crops = [
         s for s in (output.get("sources") or [])
         if isinstance(s, dict)
-        and s.get("sourceId") in referenced_source_ids
+        and (
+            s.get("sourceId") in referenced_source_ids
+            or s.get("kind") == "text_source"
+            or str(s.get("sourceId") or "").startswith(("grupo_i_texto_p", "grupo_ii_texto_p"))
+        )
         and not _source_has_usable_crop(s)
     ]
     if not questions_needing_refs and not sources_needing_crops:
@@ -496,6 +529,25 @@ def _repair_portuguese_text_sources(output: dict, extraction: dict | None = None
 
     created = 0
     candidates = _detect_portuguese_text_source_candidates(output, pages, group_questions)
+    known_candidate_ids = {candidate["sourceId"] for candidate in candidates}
+    for source in sources_needing_crops:
+        source_id = str(source.get("sourceId") or "")
+        if source_id in known_candidate_ids:
+            continue
+        try:
+            page_num = int(source.get("pageStart") or source.get("pageEnd") or 0)
+        except (TypeError, ValueError):
+            page_num = 0
+        group_id = str(source.get("groupId") or "")
+        if page_num in pages and group_id in {"grupo_i", "grupo_ii"}:
+            candidates.append({
+                "sourceId": source_id,
+                "groupId": group_id,
+                "page": page_num,
+                "topPdf": None,
+                "bottomPdf": None,
+            })
+            known_candidate_ids.add(source_id)
     by_source_id: dict[str, dict] = {}
     for candidate in candidates:
         group_id = candidate["groupId"]
@@ -806,7 +858,7 @@ def _infer_portuguese_source_group(page_info: dict, blocks: list[dict[str, Any]]
 
 def _looks_like_text_source_page(text: str) -> bool:
     return bool(re.search(
-        r"\b(leia\s+(?:o\s+)?(?:texto|poema|nota|cantiga)|parte\s+[abc]|grupo\s+ii)\b",
+        r"\b(leia[\s,]+(?:atentamente[\s,]+)?(?:o\s+)?(?:texto|poema|nota|cantiga)|texto\s+a\s+seguir\s+transcrito|parte\s+[abc]|grupo\s+ii)\b",
         text,
         re.IGNORECASE,
     ))
@@ -826,7 +878,7 @@ def _find_after_question_source_y(blocks: list[dict[str, Any]], first_q_y: float
             continue
         if y0 <= first_q_y + 20:
             continue
-        if re.search(r"\b(PARTE\s+C|Leia\s+(?:a\s+)?(?:cantiga|o\s+poema|o\s+texto|o\s+excerto))\b", text, re.IGNORECASE):
+        if re.search(r"\b(PARTE\s+C|Leia[\s,]+(?:atentamente[\s,]+)?(?:a\s+)?(?:cantiga|o\s+poema|o\s+texto|o\s+excerto|texto))\b", text, re.IGNORECASE):
             return y0
     return None
 
@@ -867,6 +919,12 @@ def _recover_missing_questions_from_scoring(output: dict, extraction: dict | Non
     if not extraction:
         return
     entries = _parse_portuguese_scoring(extraction)
+    metadata_entries = _metadata_scoring_entries(output)
+    if metadata_entries:
+        by_key = {(entry.get("group"), str(entry.get("number"))): entry for entry in entries}
+        for entry in metadata_entries:
+            by_key.setdefault((entry.get("group"), str(entry.get("number"))), entry)
+        entries = list(by_key.values())
     if not entries:
         return
 
@@ -934,6 +992,31 @@ def _recover_missing_questions_from_scoring(output: dict, extraction: dict | Non
         })
 
 
+def _metadata_scoring_entries(output: dict) -> list[dict[str, Any]]:
+    items = ((output.get("metadata") or {}).get("scoringPolicy") or {}).get("items") or []
+    entries: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        group = item.get("groupId")
+        number = item.get("number")
+        points = item.get("points")
+        if not group or number is None or points is None:
+            continue
+        try:
+            points_i = int(points)
+        except (TypeError, ValueError):
+            continue
+        entries.append({
+            "group": str(group),
+            "number": str(number),
+            "points": points_i,
+            "isMandatory": bool(item.get("isMandatory", True)),
+            "optionalPoolId": item.get("optionalPoolId"),
+        })
+    return entries
+
+
 def _repair_points_from_scoring_text(output: dict, extraction: dict | None) -> None:
     entries = _parse_portuguese_scoring(extraction)
     if not entries:
@@ -956,11 +1039,38 @@ def _repair_points_from_scoring_text(output: dict, extraction: dict | None) -> N
             if entry.get("optionalPoolId"):
                 q.setdefault("disciplineData", {})["optionalPoolId"] = entry["optionalPoolId"]
 
+    applied += _repair_composition_points_remainder(output)
+
     if applied:
         output.setdefault("warnings", []).append({
             "type": "portuguese_points_repaired",
             "message": f"Applied Portuguese scoring table to {applied} question(s).",
         })
+
+
+def _repair_composition_points_remainder(output: dict) -> int:
+    questions = output.get("questions") or []
+    composition = next((q for q in questions if q.get("groupId") == "grupo_iii"), None)
+    if not composition:
+        return 0
+    total = sum(int(q.get("points") or 0) for q in questions)
+    if total >= 200:
+        return 0
+    remainder = 200 - (total - int(composition.get("points") or 0))
+    if remainder <= int(composition.get("points") or 0) or remainder > 100:
+        return 0
+    composition["points"] = remainder
+    policy = (output.get("metadata") or {}).get("scoringPolicy") or {}
+    for item in policy.get("items") or []:
+        if item.get("groupId") == "grupo_iii" and str(item.get("number") or "") == "1":
+            item["points"] = remainder
+    if isinstance(policy, dict) and policy.get("items"):
+        mandatory = sum(int(item.get("points") or 0) for item in policy["items"] if item.get("isMandatory", True))
+        optional = sum(int(item.get("points") or 0) for item in policy["items"] if not item.get("isMandatory", True))
+        policy["mandatorySubtotal"] = mandatory
+        policy["optionalPoolSubtotal"] = optional
+        policy["rawSubtotal"] = mandatory + optional
+    return 1
 
 
 def _store_portuguese_scoring_policy(output: dict, entries: list[dict[str, Any]]) -> None:
@@ -1447,10 +1557,15 @@ def _extract_grupo_iii_from_pages(extraction: dict | None) -> str:
     if not extraction:
         return ""
     pages = extraction.get("_processed_pages") or extraction.get("pages") or []
+    pdf_page_text = _load_extraction_pdf_page_text(extraction)
     for page in pages:
         if not isinstance(page, dict):
             continue
-        text = str(page.get("text") or "")
+        try:
+            page_num = int(page.get("page") or 0)
+        except (TypeError, ValueError):
+            page_num = 0
+        text = str(page.get("text") or "") or pdf_page_text.get(page_num, "")
         if re.search(r"\bGRUPO\s+III\b", text, re.IGNORECASE):
             statement = _extract_grupo_iii_statement(text)
             statement = re.sub(r"(?is)\bObserva[cç][oõ]es\s*:.*$", "", statement).strip()
@@ -1459,12 +1574,36 @@ def _extract_grupo_iii_from_pages(extraction: dict | None) -> str:
     return ""
 
 
+def _load_extraction_pdf_page_text(extraction: dict | None) -> dict[int, str]:
+    if not extraction:
+        return {}
+    pdf_path = extraction.get("_pdf_path")
+    if not pdf_path or not Path(str(pdf_path)).exists():
+        return {}
+    try:
+        import fitz
+        doc = fitz.open(str(pdf_path))
+        out = {idx + 1: doc[idx].get_text("text") for idx in range(doc.page_count)}
+        doc.close()
+        return out
+    except Exception:
+        return {}
+
+
 def _find_grupo_iii_page(extraction: dict | None) -> int | None:
     if not extraction:
         return None
     pages = extraction.get("_processed_pages") or extraction.get("pages") or []
+    pdf_page_text = _load_extraction_pdf_page_text(extraction)
     for page in pages:
-        if isinstance(page, dict) and re.search(r"\bGRUPO\s+III\b", str(page.get("text") or ""), re.IGNORECASE):
+        if not isinstance(page, dict):
+            continue
+        try:
+            page_num = int(page.get("page") or 0)
+        except (TypeError, ValueError):
+            page_num = 0
+        text = str(page.get("text") or "") or pdf_page_text.get(page_num, "")
+        if re.search(r"\bGRUPO\s+III\b", text, re.IGNORECASE):
             try:
                 return int(page.get("page") or 0) or None
             except (TypeError, ValueError):
@@ -1774,6 +1913,7 @@ def _extract_question_block_from_pages(number: Any, extraction: dict | None, req
     if not raw_number:
         return ""
     pages = extraction.get("_processed_pages") or extraction.get("pages") or []
+    pdf_page_text = _load_extraction_pdf_page_text(extraction)
     escaped = re.escape(raw_number)
     first_part = raw_number.split(".", 1)[0]
     try:
@@ -1788,13 +1928,17 @@ def _extract_question_block_from_pages(number: Any, extraction: dict | None, req
     for page in pages:
         if not isinstance(page, dict):
             continue
-        text = str(page.get("text") or "").replace("\x07", " ")
+        try:
+            page_num = int(page.get("page") or 0)
+        except (TypeError, ValueError):
+            page_num = 0
+        text = (str(page.get("text") or "") or pdf_page_text.get(page_num, "")).replace("\x07", " ")
         start = re.search(start_pattern, text)
         if not start:
             continue
         tail = text[start.start():]
         end_match = re.search(
-            rf"(?m)^\s*(?:{re.escape(next_number)}\.|GRUPO\s+[IVX]+|COTA\w+|FIM)\b",
+            rf"(?m)^\s*(?:{re.escape(next_number)}\.|GRUPO\s+[IVX]+\b|COTA\w+|FIM\b)",
             tail[start.end() - start.start():],
             re.IGNORECASE,
         )
@@ -1836,14 +1980,31 @@ def _set_question_text(q: dict, text: str) -> None:
     q["sourceTextRaw"] = text
 
 
-def _is_composition_prompt(text: str) -> bool:
+def _is_composition_prompt_legacy(text: str) -> bool:
     low = (text or "").lower()
+    if _looks_like_composition_instructions_only(low):
+        return False
+    if (
+        ("num texto" in low or "texto bem estruturado" in low)
+        and ("duzent" in low or "200" in low or "cento e cinquenta" in low or "150" in low)
+        and any(marker in low for marker in (
+            "apresente uma reflexão",
+            "desenvolva uma reflexão",
+            "apreciação crítica",
+            "texto de opinião",
+            "fundamente o seu ponto de vista",
+            "defenda um ponto de vista",
+        ))
+    ):
+        return True
     return (
-        "num texto" in low
-        and ("duzent" in low or "200" in low)
+        ("num texto" in low or "texto bem estruturado" in low or "elabore uma reflex" in low)
+        and ("duzent" in low or "200" in low or "cento e cinquenta" in low or "150" in low)
         and (
             "defenda uma perspetiva" in low
             or "defenda uma perspectiva" in low
+            or "elabore uma reflex" in low
+            or "fundamente o seu ponto de vista" in low
             or "apresente uma reflexão" in low
             or "apresente uma reflexao" in low
             or "desenvolva uma reflexão" in low
@@ -1856,10 +2017,85 @@ def _is_composition_prompt(text: str) -> bool:
     )
 
 
+def _looks_like_composition_instructions_only_legacy(text: str) -> bool:
+    low = (text or "").lower().strip()
+    if low.startswith("1. para efeitos de contagem") or low.startswith("para efeitos de contagem"):
+        return True
+    return (
+        "para efeitos de contagem" in low
+        and ("desvio dos limites" in low or "extens" in low)
+        and not any(marker in low for marker in (
+            "elabore uma reflex",
+            "defenda uma perspetiva",
+            "defenda uma perspectiva",
+            "texto de opinião",
+            "texto de opiniao",
+            "fundamente o seu ponto de vista",
+        ))
+    )
+
+
+def _plain_match_text(text: str) -> str:
+    plain = unicodedata.normalize("NFKD", text or "")
+    plain = "".join(ch for ch in plain if not unicodedata.combining(ch))
+    plain = (
+        plain.replace("Ã£", "a")
+        .replace("Ã§", "c")
+        .replace("Ã­", "i")
+        .replace("Ãµ", "o")
+        .replace("Ã©", "e")
+        .replace("Ãª", "e")
+        .replace("Ã¡", "a")
+        .replace("Ã³", "o")
+    )
+    return plain.lower()
+
+
+def _is_composition_prompt(text: str) -> bool:
+    low = _plain_match_text(text)
+    if _looks_like_composition_instructions_only(text):
+        return False
+    return (
+        ("num texto" in low or "texto bem estruturado" in low or "elabore uma reflex" in low)
+        and ("duzent" in low or "200" in low or "cento e cinquenta" in low or "150" in low)
+        and any(marker in low for marker in (
+            "defenda uma perspetiva",
+            "defenda uma perspectiva",
+            "defenda um ponto de vista",
+            "elabore uma reflex",
+            "fundamente o seu ponto de vista",
+            "apresente uma reflexao",
+            "desenvolva uma reflexao",
+            "apreciacao critica",
+            "texto de opiniao",
+        ))
+    )
+
+
+def _looks_like_composition_instructions_only(text: str) -> bool:
+    low = _plain_match_text(text).strip()
+    if low.startswith("1. para efeitos de contagem") or low.startswith("para efeitos de contagem"):
+        return True
+    return (
+        "para efeitos de contagem" in low
+        and ("desvio dos limites" in low or "extens" in low)
+        and not any(marker in low for marker in (
+            "elabore uma reflex",
+            "defenda uma perspetiva",
+            "defenda uma perspectiva",
+            "texto de opiniao",
+            "fundamente o seu ponto de vista",
+            "apresente uma reflexao",
+            "desenvolva uma reflexao",
+        ))
+    )
+
+
 def _is_observation_artifact(q: dict) -> bool:
     text = _question_prompt_text(q).lower().strip()
     return (
-        text.startswith("1. para efeitos de contagem")
+        _looks_like_composition_instructions_only(text)
+        or text.startswith("1. para efeitos de contagem")
         or text.startswith("2. relativamente ao desvio")
         or ("extensão inferior a oitenta palavras" in text and "num texto" not in text)
         or ("extensao inferior a oitenta palavras" in text and "num texto" not in text)
