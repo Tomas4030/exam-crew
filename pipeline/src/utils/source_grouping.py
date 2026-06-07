@@ -22,9 +22,29 @@ _CHILD_REF_PATTERN = re.compile(r'[Ii]magem\s+([A-Z])', re.IGNORECASE)
 
 _ROMAN_MAP = {"I": "i", "II": "ii", "III": "iii", "IV": "iv", "V": "v"}
 
+# Keywords that identify a scoring/cotações page
+_SCORING_KEYWORDS = ("cotaç", "cotaçõ", "cotações da prova", "tabela de cotações")
+
 
 def _roman_to_id(roman: str) -> str:
     return _ROMAN_MAP.get(roman.strip(), roman.strip().lower())
+
+
+def _is_scoring_page(text: str, text_lower: str | None = None) -> bool:
+    """Return True if this page is a scoring/cotações summary page.
+
+    Such pages list point values per group and per item but contain no exam
+    content.  They must not be treated as sources or question pages.
+    """
+    t = text_lower if text_lower is not None else text.lower()
+    # Primary signal: explicit cotações keyword
+    if any(kw in t for kw in _SCORING_KEYWORDS):
+        return True
+    # Secondary signal: all three groups + total + pontos, no question items
+    has_groups = "grupo i" in t and "grupo ii" in t and "grupo iii" in t
+    has_total = "total" in t and "pontos" in t
+    has_question_items = bool(re.search(r'^\s*\d{1,2}\.', text, re.MULTILINE))
+    return has_groups and has_total and not has_question_items
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -117,10 +137,11 @@ def _build_page_group_map(extraction: dict | None, questions: list[dict]) -> dic
         if is_cover:
             continue
 
-        # Skip scoring page (contains COTAÇÕES table with group references)
-        if "cotaç" in text_lower or "cotaçõ" in text_lower:
-            if current_group:
-                page_group_map[page_num] = current_group
+        # Skip scoring/cotações page entirely — it should never become a source.
+        # Previously it was added to page_group_map (so _detect_sources would
+        # create a "documento_1" for it).  Now we skip it completely; the
+        # current_group carry-forward continues on the next content page.
+        if _is_scoring_page(text, text_lower):
             continue
 
         match = _GROUP_PATTERN.search(text)
@@ -191,10 +212,11 @@ def _detect_sources(assets: list[dict], questions: list[dict],
         for p in extraction["pages"]:
             page_texts[p["page"]] = p.get("text", "")
 
-    # Find source pages (pages with group but no questions)
+    # Find source pages (pages with group but no questions, and not a scoring page)
     source_pages = sorted(
         pg for pg, gid in page_group_map.items()
         if pg not in pages_with_questions
+        and not _is_scoring_page(page_texts.get(pg, ""))
     )
 
     # For each source page, detect document labels from text

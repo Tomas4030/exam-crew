@@ -38,6 +38,7 @@ interface Source {
   label?: string;
   kind?: string;
   pageStart?: number;
+  text?: string;
   children?: string[];
   childCrops?: Record<string, CropInfo>;
   crops?: {
@@ -591,7 +592,8 @@ export default function PreviewPage() {
             }
           }
 
-          // Full source document
+          // Full source document — always prefer crop/image (including text_source kind).
+          // Plain text fallback is rendered separately only when NO crop exists.
           const sourceUrl =
             (src.crops as Record<string, any>)?.best?.url ||
             (src.crops as Record<string, any>)?.full?.url ||
@@ -804,6 +806,26 @@ export default function PreviewPage() {
     .join("\n\n");
 
   const images = getAllImages(current);
+
+  // Text sources (Portuguese Grupo I / II excerpts): only show the plain-text
+  // fallback when there is NO crop image available. When a crop exists it is
+  // already rendered as an <img> via getAllImages() above.
+  const sourceTextBlocks: Source[] = [];
+  for (const ref of current.sourceRefs || []) {
+    const src = data.sources?.find((s) => s.sourceId === ref.sourceId);
+    if (!src || src.kind !== "text_source" || !src.text) continue;
+    const hasCrop = !!(
+      src.crops?.best?.url ||
+      src.crops?.full?.url ||
+      (src.crops as any)?.document?.url ||
+      (src.crops as any)?.visual?.url
+    );
+    if (hasCrop) continue; // image already in getAllImages()
+    if (!sourceTextBlocks.find((s) => s.sourceId === src.sourceId)) {
+      sourceTextBlocks.push(src);
+    }
+  }
+
   const previewStatement = getPreviewStatement(current);
   const currentChoiceOptions = getChoiceOptions(current);
   const currentIsMultiSelect = current.type === "multi_select";
@@ -911,6 +933,26 @@ export default function PreviewPage() {
                       alt={`Figura ${i + 1}`}
                       className="mx-auto max-h-[560px] max-w-full rounded bg-white object-contain shadow-sm ring-1 ring-slate-200"
                     />
+                  ))}
+                </div>
+              )}
+
+              {sourceTextBlocks.length > 0 && (
+                <div className="space-y-4">
+                  {sourceTextBlocks.map((src) => (
+                    <div
+                      key={src.sourceId}
+                      className="rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-slate-800 shadow-sm"
+                    >
+                      {src.label && (
+                        <div className="text-xs font-semibold text-amber-700 uppercase tracking-wide mb-2">
+                          {src.label}
+                        </div>
+                      )}
+                      <div className="whitespace-pre-wrap leading-relaxed font-serif text-[0.9rem]">
+                        {src.text}
+                      </div>
+                    </div>
                   ))}
                 </div>
               )}

@@ -12,8 +12,19 @@ from typing import Any
 from PIL import Image
 
 
-def normalize_portugues(output: dict, extraction: dict | None = None) -> dict:
-    """Apply deterministic repairs for Portuguese national exams."""
+def normalize_portugues(
+    output: dict,
+    extraction: dict | None = None,
+    output_dir: Path | None = None,
+) -> dict:
+    """Apply deterministic repairs for Portuguese national exams.
+
+    Args:
+        output_dir: absolute path to the exam output directory
+            (e.g. ``{base}/data/output/{exam_id}``).  Must be provided so that
+            text-source crop files are written to the correct location and are
+            included in the ZIP export.
+    """
     _split_embedded_grupo_iii(output)
     _repair_grupo_iii_composition(output, extraction)
     _strip_embedded_group_iii_from_other_questions(output)
@@ -25,12 +36,23 @@ def normalize_portugues(output: dict, extraction: dict | None = None) -> dict:
     _repair_multi_blank_structure(output, extraction)
     _repair_missing_choice_options(output, extraction)
     _attach_visual_assets_to_composition(output)
-    _repair_portuguese_text_sources(output, extraction)
+    _normalize_portuguese_title(output)
+    _remove_cover_page_sources(output)
+    _filter_instruction_questions(output)
+    _repair_portuguese_text_sources(output, extraction, output_dir=output_dir)
+    _convert_document_images_to_text_sources(output, extraction)
+    _deduplicate_portuguese_sources(output)
     _recover_missing_questions_from_scoring(output, extraction)
     _repair_points_from_scoring_text(output, extraction)
+    _fix_historical_composition_points(output)
     _repair_composition_points_remainder(output)
+    _fix_legacy_mandatory_status(output)
+    _normalize_question_ids(output)
+    _repair_broken_parents(output)
+    _fix_text_source_visual_dependency(output)
     _sort_questions(output)
     _refresh_stats(output)
+    _update_status_for_recovered_questions(output)
     return output
 
 
@@ -481,8 +503,21 @@ def _repair_multi_blank_structure(output: dict, extraction: dict | None = None) 
         })
 
 
-def _repair_portuguese_text_sources(output: dict, extraction: dict | None = None) -> None:
-    """Create page-level text-source crops for Portuguese when source grouping missed them."""
+def _repair_portuguese_text_sources(
+    output: dict,
+    extraction: dict | None = None,
+    output_dir: Path | None = None,
+) -> None:
+    """Create page-level text-source crops for Portuguese when source grouping missed them.
+
+    Args:
+        output_dir: absolute path to the exam output directory
+            (e.g. ``{base}/data/output/{exam_id}``).  When provided the crop
+            files are written there so they are included in the ZIP export.
+            Falling back to a relative ``data/output/{exam_id}`` is kept for
+            backward-compat but will break when the pipeline runs from a
+            sub-directory such as ``pipeline/``.
+    """
     if not extraction or not output.get("exam_id"):
         return
 
@@ -523,9 +558,20 @@ def _repair_portuguese_text_sources(output: dict, extraction: dict | None = None
 
     sources = output.setdefault("sources", [])
     existing = {s.get("sourceId") for s in sources if isinstance(s, dict)}
-    output_base = Path("data") / "output" / str(output.get("exam_id"))
+
+    # Resolve the output directory — prefer the caller-supplied absolute path so
+    # the crop files land in the same tree the ZIP exporter will package.
+    if output_dir is not None:
+        output_base = Path(output_dir).resolve()
+    else:
+        # Legacy fallback: relative path.  Works only when cwd == project root.
+        output_base = Path("data") / "output" / str(output.get("exam_id"))
+
     sources_dir = output_base / "assets" / "sources"
     sources_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pre-load PDF text blocks for text extraction into sources
+    pdf_blocks = _load_pdf_text_blocks(output)
 
     created = 0
     candidates = _detect_portuguese_text_source_candidates(output, pages, group_questions)
@@ -560,11 +606,19 @@ def _repair_portuguese_text_sources(output: dict, extraction: dict | None = None
                 top_pdf=candidate.get("topPdf"),
                 bottom_pdf=candidate.get("bottomPdf"),
             )
-            if not crop:
+            # Extract the text content from this page so the frontend can render
+            # the source even when the crop image is unavailable.
+            page_text = _extract_source_page_text(pages.get(page_num), pdf_blocks.get(page_num, []))
+
+            if not crop and not page_text:
                 continue
             if source is not None:
-                source.setdefault("crops", {})["full"] = crop
-                source.setdefault("crops", {})["best"] = crop
+                if crop:
+                    source.setdefault("crops", {})["full"] = crop
+                    source.setdefault("crops", {})["best"] = crop
+                if page_text and not source.get("text"):
+                    source["text"] = page_text
+                source.setdefault("preferredRender", "image")
                 by_source_id[source_id] = source
                 continue
             roman = {"grupo_i": "I", "grupo_ii": "II"}.get(group_id, "")
@@ -573,12 +627,16 @@ def _repair_portuguese_text_sources(output: dict, extraction: dict | None = None
                 "groupId": group_id,
                 "label": f"Texto de apoio - Grupo {roman}, pagina {page_num}",
                 "kind": "text_source",
+                # Frontend renders the crop image when available; text is a
+                # search/debug/fallback field only.
+                "preferredRender": "image",
                 "pageStart": page_num,
                 "pageEnd": page_num,
                 "assetRefs": [],
                 "children": [],
                 "childCrops": {},
-                "crops": {"full": crop, "best": crop},
+                "crops": {"full": crop, "best": crop} if crop else {},
+                "text": page_text or "",
             }
             if source_id not in existing:
                 sources.append(source)
@@ -625,14 +683,546 @@ def _repair_portuguese_text_sources(output: dict, extraction: dict | None = None
         })
 
 
+_FOOTER_RE = re.compile(
+    r'Prova\s+\d{3}|[Pp][áa]gina\s+\d+\s+de\s+\d+|^\s*\d+\s*$',
+)
+
+
+def _extract_source_page_text(page_info: dict | None, blocks: list[dict]) -> str:
+    """Return the clean text content of a source page for embedding in the JSON.
+
+    Strategy (falls through in order):
+    1. ``blocks`` – fitz block list passed by caller (requires _load_pdf_text_blocks to work)
+    2. ``page_info["blocks"]`` – blocks stored inside the extraction page dict
+    3. ``page_info["text"]``  – raw page text string from the extraction
+
+    All three paths apply the same header/footer filter.
+    """
+    if not page_info and not blocks:
+        return ""
+
+    # If the fitz blocks were loaded (non-empty), prefer those (richest source)
+    effective_blocks = blocks or []
+    if not effective_blocks and page_info:
+        effective_blocks = page_info.get("blocks") or []
+
+    lines: list[str] = []
+    for block in effective_blocks:
+        text = str(block.get("text") or "").strip()
+        if not text:
+            continue
+        # Skip page footers / prova identifiers
+        if _FOOTER_RE.search(text):
+            continue
+        lines.append(text)
+
+    if not lines and page_info:
+        # Final fallback: split raw page text string
+        raw = str(page_info.get("text") or "").strip()
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if _FOOTER_RE.search(line):
+                continue
+            lines.append(line)
+
+    return "\n".join(lines).strip()
+
+
+# Patterns that identify standalone instruction paragraphs that the LLM
+# sometimes classifies as questions.
+_INSTRUCTION_PATTERNS = [
+    re.compile(r'^\s*leia\s*[,;]?\s*(?:atentamente\s*[,;]?\s*)?(?:o\s+)?(?:texto|poema|excerto|cantiga)', re.I),
+    re.compile(r'^\s*apresente\s*[,;]?\s*de\s+forma\s+bem\s+estruturada', re.I),
+    re.compile(r'^\s*para\s+responder\s+(?:ao[s]?\s+)?(?:itens|perguntas)', re.I),
+    re.compile(r'^\s*observa[cç][oõ]es\s*:?\s*$', re.I),
+    re.compile(r'^\s*(?:na?\s+)?(?:folha\s+de\s+resposta|espa[cç]o\s+de\s+resposta)', re.I),
+    re.compile(r'^\s*(?:utilizando|usando)\s+(?:o\s+)?espa[cç]o\s+(?:destinado|reservado)', re.I),
+]
+
+
+def _is_instruction_text(text: str) -> bool:
+    t = (text or "").strip()
+    if len(t) < 10 or len(t) > 300:
+        return False
+    return any(p.match(t) for p in _INSTRUCTION_PATTERNS)
+
+
+def _filter_instruction_questions(output: dict) -> None:
+    """Remove questions whose statement is a reading instruction, not a real question.
+
+    For example: "Leia, atentamente, o texto a seguir transcrito." or
+    "Para responder aos itens seguintes, leia o texto."
+    These get extracted by the LLM as question 1 on some older exams.
+    """
+    questions = output.get("questions") or []
+    before = len(questions)
+    filtered = [
+        q for q in questions
+        if not _is_instruction_text(q.get("statement") or q.get("statementPlain") or "")
+    ]
+    removed = before - len(filtered)
+    if removed:
+        output["questions"] = filtered
+        output.setdefault("warnings", []).append({
+            "type": "instruction_questions_removed",
+            "message": f"Removed {removed} question(s) whose statement was a reading instruction.",
+        })
+
+
+def _deduplicate_portuguese_sources(output: dict) -> None:
+    """Remove History-style documento_N sources superseded by texto_pN sources.
+
+    When source_grouping (which runs for Portuguese due to has_source_grouping=True)
+    creates grupo_i_documento_1 and the Portuguese repair creates grupo_i_texto_p2
+    for the same page, the documento source becomes stale.  This removes the
+    documento sources and any leftover sourceRefs pointing to them from questions
+    that already have a texto_pN ref.
+    """
+    sources = output.get("sources") or []
+    questions = output.get("questions") or []
+
+    # Collect all texto_pN source IDs already present
+    _texto_pat = re.compile(r'^grupo_(?:i{1,3}|ii)_texto_p\d+$')
+    _doc_pat = re.compile(r'^grupo_(?:i{1,3}|ii)_documento_\d+$')
+
+    text_source_ids: set[str] = {
+        str(s.get("sourceId") or "")
+        for s in sources
+        if isinstance(s, dict) and _texto_pat.match(str(s.get("sourceId") or ""))
+    }
+    if not text_source_ids:
+        return
+
+    # For each question: if it has BOTH documento_N AND texto_pN refs, drop the documento refs.
+    superseded_doc_ids: set[str] = set()
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        refs = q.get("sourceRefs")
+        if not refs:
+            continue
+        doc_ids = {
+            r.get("sourceId")
+            for r in refs
+            if isinstance(r, dict) and _doc_pat.match(r.get("sourceId") or "")
+        }
+        txt_ids = {
+            r.get("sourceId")
+            for r in refs
+            if isinstance(r, dict) and r.get("sourceId") in text_source_ids
+        }
+        if doc_ids and txt_ids:
+            superseded_doc_ids.update(doc_ids)
+            q["sourceRefs"] = [
+                r for r in refs
+                if not (isinstance(r, dict) and r.get("sourceId") in doc_ids)
+            ]
+
+    if not superseded_doc_ids:
+        return
+
+    # Also remove any media entries that point to superseded documento sources
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        media = q.get("media")
+        if media:
+            q["media"] = [
+                m for m in media
+                if not (isinstance(m, dict) and m.get("sourceId") in superseded_doc_ids)
+            ]
+
+    # Remove documento sources that are now unreferenced
+    still_referenced = {
+        r.get("sourceId")
+        for q in questions
+        for r in (q.get("sourceRefs") or [])
+        if isinstance(r, dict) and r.get("sourceId")
+    }
+    output["sources"] = [
+        s for s in sources
+        if not (
+            isinstance(s, dict)
+            and s.get("sourceId") in superseded_doc_ids
+            and s.get("sourceId") not in still_referenced
+        )
+    ]
+
+
+_COVER_PAGE_SIGNALS = re.compile(
+    r'exame nacional|prova\s+\d{3}|decreto.lei|duração\s+da\s+prova|'
+    r'instruções\s+(?:gerais|para)|folha\s+de\s+resposta',
+    re.IGNORECASE,
+)
+
+
+def _remove_cover_page_sources(output: dict) -> None:
+    """Remove sources that originate from the cover/instructions page (page 1).
+
+    The cover page of Portuguese exams contains the exam header, legal notices,
+    and general instructions.  ``apply_source_grouping`` sometimes assigns it to
+    ``grupo_i`` or ``grupo_ii`` when it encounters "Grupo I" in the instructions.
+    Any source with ``pageStart == 1`` must be removed.
+    """
+    sources = output.get("sources") or []
+    bad_ids: set[str] = set()
+
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        if source.get("groupId") not in {"grupo_i", "grupo_ii", "grupo_iii"}:
+            continue
+        try:
+            page_start = int(source.get("pageStart") or 0)
+        except (TypeError, ValueError):
+            continue
+        if page_start == 1:
+            bad_ids.add(str(source.get("sourceId") or ""))
+
+    if not bad_ids:
+        return
+
+    output["sources"] = [
+        s for s in sources
+        if not (isinstance(s, dict) and s.get("sourceId") in bad_ids)
+    ]
+    # Remove references to dropped sources from questions
+    for q in output.get("questions") or []:
+        if not isinstance(q, dict):
+            continue
+        if q.get("sourceRefs"):
+            q["sourceRefs"] = [
+                r for r in q["sourceRefs"]
+                if isinstance(r, dict) and r.get("sourceId") not in bad_ids
+            ]
+        if q.get("media"):
+            q["media"] = [
+                m for m in q["media"]
+                if isinstance(m, dict) and m.get("sourceId") not in bad_ids
+            ]
+
+
+def _normalize_portuguese_title(output: dict) -> None:
+    """Force the Portuguese exam title to contain the correct year.
+
+    The LLM sometimes extracts the cover page mention of a baseline year (e.g.
+    "modelo de 2012") and uses it for the title even when the actual exam year
+    (detected from the URL or filename) is different.
+    """
+    metadata = output.get("metadata") or {}
+    year = str(metadata.get("year") or "").strip()
+    if not year:
+        return
+    title = str(metadata.get("title") or "").strip()
+    # If the year already appears in the title, we're good
+    if year in title:
+        return
+    # Build a canonical title; preserve any phase info
+    phase = str(metadata.get("phase") or "").strip()
+    canonical = f"Exame Nacional de Português - {year}"
+    if phase:
+        canonical = f"{canonical} ({phase})"
+    metadata["title"] = canonical
+
+
+def _convert_document_images_to_text_sources(output: dict, extraction: dict | None) -> None:
+    """Convert grupo_i/grupo_ii sources with kind 'image' that are actually text
+
+    excerpts (description starts with 'Leia o texto', 'Leia o seguinte', etc.)
+    into text_source kind so the frontend renders them as text, not an image box.
+    """
+    _TEXT_DESC_RE = re.compile(
+        r'leia\s+(?:o\s+)?(?:texto|seguinte|excerto|poema|cantiga)|'
+        r'texto\s+seguinte|glossário|notas\s+ao\s+texto',
+        re.IGNORECASE,
+    )
+    sources = output.get("sources") or []
+    pages: dict[int, dict] = {}
+    if extraction:
+        for p in (extraction.get("_processed_pages") or extraction.get("pages") or []):
+            if isinstance(p, dict):
+                try:
+                    pages[int(p.get("page") or 0)] = p
+                except (TypeError, ValueError):
+                    pass
+
+    pdf_blocks = _load_pdf_text_blocks(output)
+
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        if source.get("groupId") not in {"grupo_i", "grupo_ii"}:
+            continue
+        if source.get("kind") == "text_source":
+            continue  # already correct
+
+        desc = str(source.get("description") or source.get("label") or "").strip()
+        if not _TEXT_DESC_RE.search(desc):
+            continue
+
+        # Convert to text_source; frontend should render the crop image when available
+        source["kind"] = "text_source"
+        source["preferredRender"] = "image"
+        source["label"] = source.get("label") or "Texto de apoio"
+
+        # Populate text if missing
+        if not source.get("text"):
+            page_num = source.get("pageStart") or source.get("pageEnd")
+            if page_num:
+                try:
+                    page_num = int(page_num)
+                except (TypeError, ValueError):
+                    page_num = None
+            if page_num:
+                page_text = _extract_source_page_text(
+                    pages.get(page_num),
+                    pdf_blocks.get(page_num, []),
+                )
+                if page_text:
+                    source["text"] = page_text
+
+
+def _fix_historical_composition_points(output: dict) -> None:
+    """For Portuguese exams 2008-2014, Grupo III (composition) is always 50 pts.
+
+    The scoring tables in these older editions use a different layout and the
+    parser sometimes extracts 58, 66 or 40 instead of the correct 50.  This
+    function enforces the known-correct value before `_repair_composition_points_remainder`
+    tries to re-distribute the difference.
+    """
+    metadata = output.get("metadata") or {}
+    try:
+        year = int(metadata.get("year") or 0)
+    except (TypeError, ValueError):
+        year = 0
+    if not (2008 <= year <= 2014):
+        return
+
+    questions = output.get("questions") or []
+    composition = next((q for q in questions if q.get("groupId") == "grupo_iii"), None)
+    if not composition:
+        return
+
+    current_pts = composition.get("points")
+    try:
+        current_pts_i = int(current_pts)
+    except (TypeError, ValueError):
+        current_pts_i = 0
+
+    if current_pts_i == 50:
+        return  # already correct
+
+    composition["points"] = 50
+
+    # Keep scoringPolicy in sync
+    policy = (output.get("metadata") or {}).get("scoringPolicy") or {}
+    for item in policy.get("items") or []:
+        if isinstance(item, dict) and item.get("groupId") == "grupo_iii":
+            item["points"] = 50
+
+
+def _normalize_question_ids(output: dict) -> None:
+    """Ensure all question IDs use the full ``{groupId}_q{number}`` namespace.
+
+    The LLM occasionally generates short IDs like ``q1_1``, ``q2_1`` or
+    ``q1_1_p9`` (page-suffixed).  This function rewrites them to the canonical
+    form and updates any cross-references (parentQuestion, sourceRefs, etc.)
+    so the question graph remains consistent.
+    """
+    questions = output.get("questions") or []
+    if not questions:
+        return
+
+    # Map old ID → new ID for each question that needs renaming
+    renames: dict[str, str] = {}
+
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        old_id = str(q.get("questionId") or "")
+        gid = str(q.get("groupId") or "")
+        number = str(q.get("number") or "").strip()
+        if not gid or not number:
+            continue
+
+        # Already correctly namespaced?
+        expected_prefix = f"{gid}_q"
+        if old_id.startswith(expected_prefix) and not re.search(r'_p\d+$', old_id):
+            continue
+
+        # Build canonical ID
+        num_slug = number.replace(".", "_").lower()
+        new_id = f"{gid}_q{num_slug}"
+        # Handle special "B" section of grupo_i
+        if gid == "grupo_i" and number.upper() == "B":
+            new_id = "grupo_i_b"
+        if old_id != new_id:
+            renames[old_id] = new_id
+            q["questionId"] = new_id
+
+    if not renames:
+        return
+
+    # Update cross-references
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        parent = q.get("parentQuestion")
+        if parent and parent in renames:
+            q["parentQuestion"] = renames[parent]
+
+
+def _repair_broken_parents(output: dict) -> None:
+    """Fix or null-out parentQuestion references to non-existent questions.
+
+    After ID normalisation, some parentQuestion references may still point to
+    IDs that do not exist (e.g. old LLM-generated short IDs that were not
+    renamed).  Broken parents confuse the frontend's question-tree builder.
+
+    Strategy:
+    - If the parent ID is not found but there IS a question with the same
+      number prefix (e.g. parent "grupo_ii_q1" and we have "grupo_ii_q1_1"),
+      keep the reference (the parent may simply be a container we haven't
+      created yet, which is fine).
+    - Otherwise, null the reference out.
+    """
+    questions = output.get("questions") or []
+    existing_ids = {str(q.get("questionId") or "") for q in questions if isinstance(q, dict)}
+
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        parent = q.get("parentQuestion")
+        if not parent:
+            continue
+        if parent in existing_ids:
+            continue  # intact
+        # Check if some question starts with parent (container scenario)
+        if any(eid.startswith(parent + "_") for eid in existing_ids):
+            continue  # parent is a not-yet-created container — leave as-is
+        # Broken reference — null out
+        q["parentQuestion"] = None
+
+
+def _fix_legacy_mandatory_status(output: dict) -> None:
+    """Before 2020, Portuguese exams had no optional-question system.
+
+    The modern scoringPolicy parser sometimes marks questions isMandatory=False
+    for pre-2020 exams when it misinterprets "Grupo de escolha" text.  Force
+    all questions to isMandatory=True and clear optionalPoolId for these years.
+    """
+    metadata = output.get("metadata") or {}
+    try:
+        year = int(metadata.get("year") or 0)
+    except (TypeError, ValueError):
+        year = 0
+    if not year or year >= 2020:
+        return  # modern optional system — leave as-is
+
+    for q in output.get("questions") or []:
+        if not isinstance(q, dict):
+            continue
+        q["isMandatory"] = True
+        q.pop("optionalPoolId", None)
+        if isinstance(q.get("disciplineData"), dict):
+            q["disciplineData"].pop("optionalPoolId", None)
+
+    # Also clear optional pool fields from scoringPolicy
+    policy = metadata.get("scoringPolicy") or {}
+    if isinstance(policy, dict):
+        policy.pop("optionalPool", None)
+        policy.pop("optionalPoolSubtotal", None)
+        if policy.get("items"):
+            for item in policy["items"]:
+                if isinstance(item, dict):
+                    item["isMandatory"] = True
+                    item.pop("optionalPoolId", None)
+
+
+def _update_status_for_recovered_questions(output: dict) -> None:
+    """Lower processingStatus when recovered questions are present.
+
+    A recovered question is one that the LLM missed and we rebuilt from the PDF
+    text layer.  Their quality is lower, so the exam should not be `completed`.
+
+    Rules:
+    - Any recovered without sourcePage → ``needs_review``
+    - Any recovered with sourcePage but processingStatus would be `completed`
+      → ``completed_with_warnings``
+    """
+    questions = output.get("questions") or []
+    recovered = [
+        q for q in questions
+        if isinstance(q, dict) and "_recovered" in str(q.get("questionId") or "")
+    ]
+    if not recovered:
+        return
+
+    current_status = output.get("processingStatus") or "completed"
+    recovered_without_page = [q for q in recovered if not q.get("sourcePage")]
+
+    if recovered_without_page and current_status == "completed":
+        output["processingStatus"] = "needs_review"
+        output["needsHumanReview"] = True
+        output.setdefault("warnings", []).append({
+            "type": "recovered_questions_without_source_page",
+            "message": (
+                f"{len(recovered_without_page)} recovered question(s) lack sourcePage. "
+                "Manual review recommended."
+            ),
+        })
+    elif recovered and current_status == "completed":
+        output["processingStatus"] = "completed_with_warnings"
+        output.setdefault("warnings", []).append({
+            "type": "recovered_questions_present",
+            "message": f"{len(recovered)} question(s) were recovered from PDF text (LLM missed them).",
+        })
+
+
+def _fix_text_source_visual_dependency(output: dict) -> None:
+    """Correct visualDependency for questions that reference a text source.
+
+    Questions in Grupo I/II typically depend on literary text, not an image.
+    If the question has sourceRefs but no assetRefs/imageRefs, the visual
+    dependency flag should be False.
+    """
+    for q in output.get("questions") or []:
+        if (
+            q.get("sourceRefs")
+            and not q.get("assetRefs")
+            and not q.get("imageRefs")
+            and q.get("groupId") in {"grupo_i", "grupo_ii"}
+        ):
+            q["visualDependency"] = False
+            q.setdefault("textDependency", True)
+
+
 def _detect_portuguese_text_source_candidates(output: dict, pages: dict[int, dict], questions: list[dict]) -> list[dict[str, Any]]:
     pdf_blocks = _load_pdf_text_blocks(output)
     first_q_by_page = _first_question_y_by_page(questions)
     candidates: list[dict[str, Any]] = []
 
+    # Build the set of pages that contain at least one question — source pages won't be in this set.
+    pages_with_questions: set[int] = set()
+    for q in questions:
+        try:
+            pages_with_questions.add(int(q["sourcePage"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+
     for page_num, page_info in sorted(pages.items()):
+        # Page 1 is always the cover page in Portuguese national exams.
+        # It frequently mentions "Grupo II" in the instructions ("respostas aos itens do Grupo II"),
+        # which would otherwise be mis-detected as a text source — causing the cover image to appear
+        # as the "source" image for Grupo II questions.
+        if page_num == 1:
+            continue
+
         if _page_is_mostly_scoring(page_info):
             continue
+
         blocks = _page_blocks(page_info, pdf_blocks.get(page_num, []))
         text = _normalized_text(" ".join(block.get("text", "") for block in blocks))
         if not text:
@@ -648,6 +1238,12 @@ def _detect_portuguese_text_source_candidates(output: dict, pages: dict[int, dic
             top_pdf = max(0.0, after_question_source_y - 8.0)
             bottom_pdf = _after_question_source_bottom_y(blocks, after_question_source_y) or _page_footer_y(blocks)
         elif _looks_like_text_source_page(text):
+            top_pdf = 28.0
+            bottom_pdf = (first_q_y - 10.0) if first_q_y else _page_footer_y(blocks)
+        elif page_num not in pages_with_questions and not _has_question_items(text) and len(text) > 150:
+            # Fallback: page is in a group range, has no detected question items, and has
+            # substantial text. Many source pages don't include "Leia atentamente…" keywords
+            # but are still clearly text/poem pages that precede the questions.
             top_pdf = 28.0
             bottom_pdf = (first_q_y - 10.0) if first_q_y else _page_footer_y(blocks)
         else:
@@ -841,11 +1437,24 @@ def _question_region_top(q: dict) -> float | None:
 
 
 def _infer_portuguese_source_group(page_info: dict, blocks: list[dict[str, Any]], questions: list[dict], page_num: int) -> str:
+    # First pass: look for standalone section-header blocks (short blocks whose entire
+    # content is the group label, possibly with a sub-label like "(10 pontos)").
+    # This avoids matching "Grupo II" that appears in the middle of a long instruction
+    # sentence on the cover page or elsewhere.
+    for block in blocks:
+        bt = _normalized_text(block.get("text", ""))
+        # A header block contains *only* "Grupo II" (optionally followed by "(…)" or "—…")
+        if re.match(r'^grupo\s+ii\b[\s\-—–(]?[^.]{0,40}$', bt) and len(bt) < 60:
+            return "grupo_ii"
+        if re.match(r'^grupo\s+i\b[\s\-—–(]?[^.]{0,40}$', bt) and len(bt) < 60:
+            return "grupo_i"
+
+    # Second pass: full-page text for Parte A/B/C markers (always Grupo I in PT exams)
     text = _normalized_text(" ".join(block.get("text", "") for block in blocks))
-    if "grupo ii" in text:
-        return "grupo_ii"
-    if "grupo i" in text or "parte a" in text or "parte b" in text or "parte c" in text:
+    if "parte a" in text or "parte b" in text or "parte c" in text:
         return "grupo_i"
+
+    # Third pass: inherit from questions on this page
     groups = {
         str(q.get("groupId") or "")
         for q in questions
@@ -857,11 +1466,23 @@ def _infer_portuguese_source_group(page_info: dict, blocks: list[dict[str, Any]]
 
 
 def _looks_like_text_source_page(text: str) -> bool:
+    # NOTE: do NOT include bare "grupo ii" here — that phrase also appears in cover-page
+    # instructions ("respostas aos itens do Grupo II") and causes false positives.
+    # Group detection is handled by _infer_portuguese_source_group via block-level matching.
     return bool(re.search(
-        r"\b(leia[\s,]+(?:atentamente[\s,]+)?(?:o\s+)?(?:texto|poema|nota|cantiga)|texto\s+a\s+seguir\s+transcrito|parte\s+[abc]|grupo\s+ii)\b",
+        r"\b(leia[\s,]+(?:atentamente[\s,]+)?(?:o\s+)?(?:texto|poema|nota|cantiga|excerto)|"
+        r"leia\s+os\s+seguintes\s+textos?|"
+        r"leia\s+o\s+seguinte\s+(?:texto|poema|excerto)|"
+        r"texto\s+a\s+seguir\s+transcrito|"
+        r"parte\s+[abc])\b",
         text,
         re.IGNORECASE,
     ))
+
+
+def _has_question_items(text: str) -> bool:
+    """Return True if the page text contains numbered question items (e.g. "1." or "1.1")."""
+    return bool(re.search(r'^\s*\d{1,2}\.(?:\d+\.?)?\s+\S', text, re.MULTILINE))
 
 
 def _find_after_question_source_y(blocks: list[dict[str, Any]], first_q_y: float | None) -> float | None:
@@ -939,12 +1560,16 @@ def _recover_missing_questions_from_scoring(output: dict, extraction: dict | Non
             continue
 
         block = ""
+        source_page: int | None = None
         if gid == "grupo_i" and number == "5":
             block = _extract_group_i_b_block(extraction)
         if not block:
             block = _extract_question_block_from_pages(number, extraction, require_options=False)
         if not block or len(block) < 20:
             continue
+
+        # Populate sourcePage so the frontend can order and display the question correctly
+        source_page = _find_question_source_page(number, extraction)
 
         options = _extract_letter_options(block)
         qtype = "multiple_choice" if len(options) >= 3 else "open_answer"
@@ -953,7 +1578,7 @@ def _recover_missing_questions_from_scoring(output: dict, extraction: dict | Non
             "questionId": f"{gid}_q{number.replace('.', '_')}_recovered",
             "number": number,
             "type": qtype,
-            "sourcePage": None,
+            "sourcePage": source_page,
             "statement": block,
             "statementPlain": block,
             "statementLatex": block,
@@ -972,9 +1597,9 @@ def _recover_missing_questions_from_scoring(output: dict, extraction: dict | Non
             "sourceRefs": [],
             "media": [],
             "visualDependency": False,
-            "confidence": 0.78,
-            "needsHumanReview": False,
-            "warnings": [{"type": "portuguese_recovered_from_pdf_text", "message": "Recovered missing question from extracted PDF text."}],
+            "confidence": 0.78 if source_page else 0.6,
+            "needsHumanReview": source_page is None,
+            "warnings": [{"type": "portuguese_recovered_from_pdf_text", "message": "Recovered missing question from extracted PDF text." + ("" if source_page else " sourcePage unknown.")}],
             "points": entry["points"],
             "isMandatory": True,
             "groupId": gid,
@@ -1036,8 +1661,13 @@ def _repair_points_from_scoring_text(output: dict, extraction: dict | None) -> N
             applied += 1
         if entry:
             q["isMandatory"] = bool(entry.get("isMandatory", True))
-            if entry.get("optionalPoolId"):
-                q.setdefault("disciplineData", {})["optionalPoolId"] = entry["optionalPoolId"]
+            pool_id = entry.get("optionalPoolId")
+            if not q.get("isMandatory") and not pool_id:
+                pool_id = "portuguese_optional_pool_1"
+            if pool_id:
+                # Store both at top level and in disciplineData for compatibility
+                q["optionalPoolId"] = pool_id
+                q.setdefault("disciplineData", {})["optionalPoolId"] = pool_id
 
     applied += _repair_composition_points_remainder(output)
 
@@ -1155,15 +1785,21 @@ def _parse_portuguese_scoring(extraction: dict | None) -> list[dict[str, Any]]:
         page_upper = page_text.upper()
         if _has_scoring_heading(page_text) and "TOTAL" in page_upper:
             scoring_pages.append(page_text)
+    # Use only the first recognised scoring page (has explicit "COTA…" heading + TOTAL).
+    # Joining multiple pages risks pulling in normal question pages that mention "pontos"
+    # and inflating the entry count to 25-32.
     scoring_text = scoring_pages[0] if scoring_pages else ""
     if not scoring_text:
-        scoring_text = "\n".join(
-            str(page.get("text") or "")
-            for page in pages[-4:]
-            if isinstance(page, dict) and _looks_like_scoring_text(str(page.get("text") or ""))
-        )
-    if not scoring_text:
-        scoring_text = "\n".join(str(page.get("text") or "") for page in pages[-2:] if isinstance(page, dict))
+        # Secondary fallback: last 4 pages but BOTH heading and content checks must pass.
+        for page in pages[-4:]:
+            if not isinstance(page, dict):
+                continue
+            pt = str(page.get("text") or "")
+            if _has_scoring_heading(pt) and _looks_like_scoring_text(pt) and "TOTAL" in pt.upper():
+                scoring_text = pt
+                break
+    # Note: removed the unconditional pages[-2:] fallback — it captured ordinary question
+    # pages that happened to mention "pontos", producing 25-32 spurious scoring entries.
 
     text = re.sub(r"[ \t]+", " ", scoring_text.replace("\x07", " "))
     if not _looks_like_scoring_text(text):
@@ -1904,6 +2540,38 @@ def _best_visual_asset_for_question(q: dict, assets: list[dict]) -> dict:
         if cartoon:
             return cartoon[0]
     return candidates[0]
+
+
+def _find_question_source_page(number: Any, extraction: dict | None) -> int | None:
+    """Return the PDF page number where question *number* first appears.
+
+    Uses the same page-scan logic as ``_extract_question_block_from_pages`` but
+    returns only the page number so callers can populate ``sourcePage`` on
+    recovered questions.
+    """
+    if number is None or not extraction:
+        return None
+    raw_number = str(number).strip()
+    if not raw_number:
+        return None
+    pages = extraction.get("_processed_pages") or extraction.get("pages") or []
+    pdf_page_text = _load_extraction_pdf_page_text(extraction)
+    escaped = re.escape(raw_number)
+    first_part = raw_number.split(".", 1)[0]
+    start_pattern = rf"(?m)^\s*{escaped}\.\s+"
+    if raw_number.endswith(".0"):
+        start_pattern = rf"(?m)^\s*{re.escape(first_part)}\.\s+"
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        try:
+            page_num = int(page.get("page") or 0)
+        except (TypeError, ValueError):
+            page_num = 0
+        text = (str(page.get("text") or "") or pdf_page_text.get(page_num, "")).replace("\x07", " ")
+        if re.search(start_pattern, text):
+            return page_num or None
+    return None
 
 
 def _extract_question_block_from_pages(number: Any, extraction: dict | None, require_options: bool = False) -> str:

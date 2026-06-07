@@ -1,9 +1,24 @@
 """Normalizers: discipline-aware post-processing pipeline."""
+from __future__ import annotations
+
+from pathlib import Path
+
 from .common import normalize_common
 
 
-def normalize_by_profile(output: dict, extraction: dict | None, profile: dict) -> dict:
-    """Apply normalizers based on subject profile."""
+def normalize_by_profile(
+    output: dict,
+    extraction: dict | None,
+    profile: dict,
+    output_dir: Path | None = None,
+) -> dict:
+    """Apply normalizers based on subject profile.
+
+    Args:
+        output_dir: absolute path to the exam output directory
+            (e.g. ``{base}/data/output/{exam_id}``).  Required for normalizers
+            that write files to disk (Portuguese text-source crops).
+    """
     output = normalize_common(output, extraction)
 
     normalizers = profile.get("normalizers", ["common"])
@@ -22,6 +37,6 @@ def normalize_by_profile(output: dict, extraction: dict | None, profile: dict) -
 
     if "portugues" in normalizers:
         from .portugues import normalize_portugues
-        output = normalize_portugues(output, extraction)
+        output = normalize_portugues(output, extraction, output_dir=output_dir)
 
     return output

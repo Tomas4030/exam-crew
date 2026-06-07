@@ -456,7 +456,10 @@ Text:
 
         # Step 3.7c: Profile-based normalizer (discipline-specific rules)
         from .normalizers import normalize_by_profile
-        output = normalize_by_profile(output, extraction, subject_profile)
+        output = normalize_by_profile(
+            output, extraction, subject_profile,
+            output_dir=self.output_dir / self.exam_id,
+        )
 
         # Step 3.8: Math normalization (LaTeX, textQuality)
         report_progress("math_normalize", "Normalizing mathematical text")
@@ -495,53 +498,58 @@ Text:
         # Step 4.92: remove broken asset/media references before final save
         output = enforce_asset_integrity(output, self.output_dir)
         if subject_profile and "portugues" in subject_profile.get("normalizers", []):
-            output = normalize_by_profile(output, extraction, subject_profile)
+            output = normalize_by_profile(
+                output, extraction, subject_profile,
+                output_dir=self.output_dir / self.exam_id,
+            )
             output = enforce_asset_integrity(output, self.output_dir)
 
         # Step 4.94: Subject-specific audit gate before any "done" status.
-        from .utils.history_audit import apply_history_audit_gate
-        max_audit_retries = 2
+        # Historia audit only runs for historia_a exams — not for Portuguese or others.
         history_audit_issues = []
         history_audit_summary = {"verdict": "SKIPPED"}
-        for audit_attempt in range(max_audit_retries + 1):
-            report_progress("audit", f"Running Historia quality audit (attempt {audit_attempt + 1})")
-            output, history_audit_issues, history_audit_summary = apply_history_audit_gate(
-                output,
-                self.output_dir / self.exam_id,
-            )
-            if history_audit_summary.get("verdict") != "FAIL":
-                break
-            if audit_attempt >= max_audit_retries:
-                break
+        if subject_key == "historia_a":
+            from .utils.history_audit import apply_history_audit_gate
+            max_audit_retries = 2
+            for audit_attempt in range(max_audit_retries + 1):
+                report_progress("audit", f"Running Historia quality audit (attempt {audit_attempt + 1})")
+                output, history_audit_issues, history_audit_summary = apply_history_audit_gate(
+                    output,
+                    self.output_dir / self.exam_id,
+                )
+                if history_audit_summary.get("verdict") != "FAIL":
+                    break
+                if audit_attempt >= max_audit_retries:
+                    break
 
-            retryable = self._retryable_history_audit_issues(history_audit_issues)
-            if not retryable:
-                break
+                retryable = self._retryable_history_audit_issues(history_audit_issues)
+                if not retryable:
+                    break
 
-            report_progress(
-                "audit_retry",
-                f"Retrying deterministic repairs for {len(retryable)} Historia audit issue(s)",
-            )
-            output = self._repair_history_audit_issues(
-                output,
-                extraction,
-                subject_profile,
-                retryable,
-            )
-            output.setdefault("metadata", {})["historyAuditRetries"] = audit_attempt + 1
+                report_progress(
+                    "audit_retry",
+                    f"Retrying deterministic repairs for {len(retryable)} Historia audit issue(s)",
+                )
+                output = self._repair_history_audit_issues(
+                    output,
+                    extraction,
+                    subject_profile,
+                    retryable,
+                )
+                output.setdefault("metadata", {})["historyAuditRetries"] = audit_attempt + 1
 
-        if history_audit_summary.get("verdict") == "FAIL":
-            out_file = self.output_dir / f"{self.exam_id}.json"
-            output = self._attach_run_metrics(output)
-            out_file.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
-            top = history_audit_issues[0].code if history_audit_issues else "UNKNOWN"
-            message = (
-                "Historia audit failed before completion: "
-                f"{history_audit_summary.get('blocker', 0)} blocker(s), "
-                f"{history_audit_summary.get('high', 0)} high issue(s). Top issue: {top}."
-            )
-            report_progress("error", message)
-            raise RuntimeError(message)
+            if history_audit_summary.get("verdict") == "FAIL":
+                out_file = self.output_dir / f"{self.exam_id}.json"
+                output = self._attach_run_metrics(output)
+                out_file.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+                top = history_audit_issues[0].code if history_audit_issues else "UNKNOWN"
+                message = (
+                    "Historia audit failed before completion: "
+                    f"{history_audit_summary.get('blocker', 0)} blocker(s), "
+                    f"{history_audit_summary.get('high', 0)} high issue(s). Top issue: {top}."
+                )
+                report_progress("error", message)
+                raise RuntimeError(message)
 
         portuguese_audit_issues = []
         portuguese_audit_summary = {"verdict": "SKIPPED"}

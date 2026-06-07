@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,11 +18,16 @@ def audit_output(output: dict[str, Any], asset_base: str | Path) -> list[Issue]:
 
     _audit_groups(root, questions, issues)
     _audit_duplicate_numbers(root, questions, issues)
-    _audit_points(root, questions, issues)
+    _audit_points(root, output, questions, issues)
     _audit_scoring_policy(root, output, questions, issues)
     _audit_question_types(root, questions, issues)
     _audit_composition(root, questions, issues)
     _audit_media_files(output, asset_base, issues)
+    _audit_metadata(root, output, issues)
+    _audit_sources(root, output, issues)
+    _audit_broken_parents(root, questions, issues)
+    _audit_cover_page_sources(root, output, issues)
+    _audit_scoring_policy_completeness(root, output, issues)
 
     issues.sort(key=lambda i: (SEVERITY_ORDER.get(i.severity, 99), i.root, i.question_id, i.code))
     return issues
@@ -121,7 +127,7 @@ def _audit_duplicate_numbers(root: str, questions: list[dict], issues: list[Issu
             ))
 
 
-def _audit_points(root: str, questions: list[dict], issues: list[Issue]) -> None:
+def _audit_points(root: str, output: dict[str, Any], questions: list[dict], issues: list[Issue]) -> None:
     total = 0
     invalid = []
     for q in questions:
@@ -144,13 +150,26 @@ def _audit_points(root: str, questions: list[dict], issues: list[Issue]) -> None
             actual=str(len(invalid)),
         ))
 
-    if not invalid and questions and total < 200:
-        issues.append(Issue(
-            root, "HIGH", "PORTUGUESE_TOTAL_POINTS_TOO_LOW",
-            f"Portuguese exam total points = {total}, expected at least 200",
-            expected=">=200",
-            actual=str(total),
-        ))
+    if not invalid and questions:
+        metadata = output.get("metadata") or {}
+        has_optional_pool = bool(
+            (metadata.get("scoringPolicy") or {}).get("optionalPool") or
+            (metadata.get("scoringPolicy") or {}).get("optionalPoolSubtotal")
+        )
+        if total < 200:
+            issues.append(Issue(
+                root, "HIGH", "PORTUGUESE_TOTAL_POINTS_TOO_LOW",
+                f"Portuguese exam total points = {total}, expected at least 200",
+                expected=">=200",
+                actual=str(total),
+            ))
+        elif total > 210 and not has_optional_pool:
+            issues.append(Issue(
+                root, "HIGH", "PORTUGUESE_TOTAL_POINTS_TOO_HIGH",
+                f"Portuguese exam total points = {total} (>210) without an optional pool — possible scoring extraction error",
+                expected="~200",
+                actual=str(total),
+            ))
 
 
 def _audit_scoring_policy(root: str, output: dict[str, Any], questions: list[dict], issues: list[Issue]) -> None:
@@ -372,3 +391,144 @@ def _composition_requires_visual(text: str) -> bool:
 
 def _qid(q: dict) -> str:
     return str(q.get("questionId") or q.get("id") or "")
+
+
+# ---------------------------------------------------------------------------
+# New audit checks added in round 3
+# ---------------------------------------------------------------------------
+
+def _audit_metadata(root: str, output: dict[str, Any], issues: list[Issue]) -> None:
+    """Check that the exam title contains the correct year."""
+    metadata = output.get("metadata") or {}
+    year = str(metadata.get("year") or "").strip()
+    title = str(metadata.get("title") or "").strip()
+    if year and title and year not in title:
+        issues.append(Issue(
+            root, "HIGH", "PORTUGUESE_TITLE_YEAR_MISMATCH",
+            f"Exam title '{title}' does not contain the detected year {year}",
+            expected=f"year {year} in title",
+            actual=title,
+        ))
+
+
+def _audit_sources(root: str, output: dict[str, Any], issues: list[Issue]) -> None:
+    """Check that text_source entries actually have text content."""
+    for source in output.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        if source.get("groupId") not in {"grupo_i", "grupo_ii"}:
+            continue
+        if source.get("kind") != "text_source":
+            continue
+        has_text = bool(str(source.get("text") or "").strip())
+        has_crop = bool(
+            (source.get("crops") or {}).get("full") or
+            (source.get("crops") or {}).get("best")
+        )
+        if not has_text and not has_crop:
+            issues.append(Issue(
+                root, "HIGH", "PORTUGUESE_TEXT_SOURCE_EMPTY",
+                f"text_source {source.get('sourceId')} has no text and no crop",
+                expected="text or crop",
+                actual="empty",
+            ))
+
+
+def _audit_broken_parents(root: str, questions: list[dict], issues: list[Issue]) -> None:
+    """Check that parentQuestion references point to existing question IDs."""
+    existing_ids = {str(q.get("questionId") or "") for q in questions if isinstance(q, dict)}
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        parent = q.get("parentQuestion")
+        if not parent:
+            continue
+        if parent in existing_ids:
+            continue
+        # Allow container scenario: parent prefix exists
+        if any(eid.startswith(str(parent) + "_") for eid in existing_ids):
+            continue
+        issues.append(Issue(
+            root, "HIGH", "PORTUGUESE_BROKEN_PARENT",
+            f"question {_qid(q)} references non-existent parentQuestion {parent}",
+            question_id=_qid(q),
+            group=str(q.get("groupId") or ""),
+            number=str(q.get("number") or ""),
+            expected="existing questionId",
+            actual=str(parent),
+        ))
+
+
+# ---------------------------------------------------------------------------
+# New audit checks added in round 4
+# ---------------------------------------------------------------------------
+
+def _audit_cover_page_sources(root: str, output: dict[str, Any], issues: list[Issue]) -> None:
+    """Flag sources whose pageStart is 1 (cover page) — never a valid source."""
+    _COVER_SIGNALS = re.compile(
+        r'exame nacional|prova\s+\d{3}|decreto.lei|duração da prova|instruções|folha de resposta',
+        re.IGNORECASE,
+    )
+    for source in output.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        if source.get("groupId") not in {"grupo_i", "grupo_ii", "grupo_iii"}:
+            continue
+        page_start = source.get("pageStart")
+        try:
+            page_start_i = int(page_start)
+        except (TypeError, ValueError):
+            continue
+        if page_start_i != 1:
+            continue
+        # pageStart = 1 is cover/instructions page
+        issues.append(Issue(
+            root, "HIGH", "PORTUGUESE_COVER_PAGE_AS_SOURCE",
+            f"source {source.get('sourceId')} has pageStart=1 (cover page), not a valid text source",
+            expected="pageStart > 1",
+            actual=str(page_start_i),
+        ))
+
+
+def _audit_scoring_policy_completeness(root: str, output: dict[str, Any], issues: list[Issue]) -> None:
+    """Flag scoring policies that only captured a fraction of the expected entries."""
+    import re as _re
+    metadata = output.get("metadata") or {}
+    try:
+        year = int(metadata.get("year") or 0)
+    except (TypeError, ValueError):
+        year = 0
+
+    policy = metadata.get("scoringPolicy") or {}
+    items = policy.get("items") or []
+    if not items:
+        return  # no policy extracted → different check
+
+    raw_subtotal = policy.get("rawSubtotal") or 0
+    try:
+        raw_subtotal_i = int(raw_subtotal)
+    except (TypeError, ValueError):
+        raw_subtotal_i = 0
+
+    # A complete Portuguese scoring table must have at least 8 items and sum ≥ 180
+    if len(items) < 8 or raw_subtotal_i < 180:
+        issues.append(Issue(
+            root, "HIGH", "PORTUGUESE_SCORING_POLICY_INCOMPLETE",
+            (
+                f"scoringPolicy has only {len(items)} item(s) and rawSubtotal={raw_subtotal_i} "
+                f"— scoring table likely mis-parsed"
+            ),
+            expected=">=8 items and rawSubtotal>=180",
+            actual=f"{len(items)} items, subtotal={raw_subtotal_i}",
+        ))
+
+    # Pre-2020 exams should not have optional questions
+    if year and year < 2020:
+        optional_items = [i for i in items if isinstance(i, dict) and not i.get("isMandatory", True)]
+        if optional_items:
+            issues.append(Issue(
+                root, "HIGH", "PORTUGUESE_LEGACY_EXAM_HAS_OPTIONAL",
+                f"exam year {year} (<2020) has {len(optional_items)} optional scoring item(s) — likely mis-parsed",
+                expected="all isMandatory for pre-2020",
+                actual=str(len(optional_items)),
+            ))
