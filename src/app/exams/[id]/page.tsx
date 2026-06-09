@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import ProcessingStatus from '@/components/ProcessingStatus';
+import CriteriaPanel from '@/components/CriteriaPanel';
 
 export default function ExamDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -78,6 +79,7 @@ export default function ExamDetailPage() {
           )}
         </div>
       )}
+      {showActions && <CriteriaPanel examId={id} autoRun />}
     </div>
   );
 }

@@ -55,6 +55,27 @@ interface Blank {
   number: string;
   options: { letter: string; text: string; latex?: string }[];
 }
+interface CriteriaItem {
+  criteriaId?: string;
+  groupId: string;
+  number: string;
+  points: number | null;
+  type: string;
+  correctAnswer: Record<string, string> | null;
+  rawText?: string;
+  contentTopics?: string[];
+  sourcePage?: number | null;
+  confidence?: number;
+  questionId?: string | null;
+  status?: string;
+  needsHumanReview?: boolean;
+}
+interface CriteriaDoc {
+  items: CriteriaItem[];
+  answerKeys?: unknown[];
+  audit?: { verdict: string };
+}
+
 interface Question {
   questionId: string;
   number: string;
@@ -441,11 +462,17 @@ export default function PreviewPage() {
   const [data, setData] = useState<ExamData | null>(null);
   const [selected, setSelected] = useState(0);
   const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [criteriaDoc, setCriteriaDoc] = useState<CriteriaDoc | null>(null);
 
   useEffect(() => {
     fetch(`/api/exams/${id}/result`)
       .then((r) => r.json())
       .then(setData)
+      .catch(() => {});
+    // Load criteria non-blocking — if not built yet, just shows nothing
+    fetch(`/api/exams/${id}/criteria`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (d) setCriteriaDoc(d); })
       .catch(() => {});
   }, [id]);
 
@@ -477,6 +504,11 @@ export default function PreviewPage() {
 
   const current = questions[selected];
   if (!current) return <div className="p-8">Sem perguntas.</div>;
+
+  // Find the criteria item matched to the current question (if criteria were built).
+  const criteriaForCurrent = criteriaDoc?.items.find(
+    (it) => it.questionId === current.questionId && it.status === "matched",
+  ) ?? null;
 
   const getAncestors = (q: Question): Question[] => {
     const ancestors: Question[] = [];
@@ -1178,6 +1210,70 @@ export default function PreviewPage() {
                   }
                   className="w-full h-32 p-3 border border-slate-300 rounded-lg resize-y text-sm text-slate-900 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                 />
+              )}
+
+              {/* Critérios oficiais — only shown after criteria have been built + matched */}
+              {criteriaForCurrent && (
+                <div className="rounded-lg border border-indigo-100 bg-indigo-50/40 p-4 space-y-3 text-sm">
+                  <div className="text-xs font-bold text-indigo-700 uppercase tracking-wide">
+                    Critérios oficiais
+                  </div>
+
+                  {criteriaForCurrent.correctAnswer && (
+                    <div className="space-y-1">
+                      <div className="text-xs font-medium text-slate-500">Chave de resposta</div>
+                      <div className="flex flex-wrap gap-2">
+                        {Object.entries(criteriaForCurrent.correctAnswer).map(([k, v]) => (
+                          <span
+                            key={k}
+                            className="inline-flex items-center gap-1 rounded bg-indigo-100 px-2 py-0.5 text-xs font-semibold text-indigo-800"
+                          >
+                            {k === "v1" ? "Versão 1" : k === "v2" ? "Versão 2" : k}
+                            {" "}
+                            <span className="font-bold">({String(v).toUpperCase()})</span>
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {criteriaForCurrent.points != null && (
+                    <div>
+                      <span className="text-xs font-medium text-slate-500">Cotação: </span>
+                      <span className="font-semibold text-slate-800">
+                        {criteriaForCurrent.points} pontos
+                      </span>
+                    </div>
+                  )}
+
+                  {(criteriaForCurrent.contentTopics ?? []).length > 0 && (
+                    <div className="space-y-1">
+                      <div className="text-xs font-medium text-slate-500">Observações</div>
+                      <ul className="list-disc pl-4 space-y-0.5 text-xs text-slate-700">
+                        {criteriaForCurrent.contentTopics!.map((t, i) => (
+                          <li key={i}>{t}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {criteriaForCurrent.rawText && (
+                    <details className="text-xs text-slate-500">
+                      <summary className="cursor-pointer select-none font-medium hover:text-slate-700">
+                        Texto literal do critério
+                      </summary>
+                      <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded border border-indigo-100 bg-white p-2 text-[11px] leading-snug text-slate-600">
+                        {criteriaForCurrent.rawText}
+                      </pre>
+                    </details>
+                  )}
+
+                  {criteriaForCurrent.needsHumanReview && (
+                    <div className="rounded bg-amber-50 px-3 py-1.5 text-xs text-amber-700">
+                      ⚠ Associação incerta — requer revisão manual
+                    </div>
+                  )}
+                </div>
               )}
 
               <div className="flex gap-3 pt-4">

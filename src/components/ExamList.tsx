@@ -11,6 +11,12 @@ interface TokenUsage {
   totalTokens?: number;
 }
 
+interface CriteriaAuditIssue {
+  code: string;
+  severity: string;
+  message: string;
+}
+
 interface Exam {
   id: string;
   filename: string;
@@ -23,6 +29,10 @@ interface Exam {
   tokenUsage?: TokenUsage;
   sourceUrl?: string;
   batchIndex?: number;
+  hasCriteria?: boolean;
+  criteriaVerdict?: string | null;
+  criteriaIssues?: CriteriaAuditIssue[] | null;
+  criteriaMatchedQuestions?: number | null;
 }
 
 const terminalStatuses = new Set(["completed", "completed_with_warnings", "needs_review", "partial_failed", "error"]);
@@ -52,6 +62,12 @@ const statusStyles: Record<string, string> = {
 
 // Friendly Portuguese descriptions for the technical warning/issue codes.
 const issueLabels: Record<string, string> = {
+  // Criteria-specific codes
+  CRITERIA_ITEM_MISSING: "Item do exame sem critério de classificação correspondente",
+  CRITERIA_POINTS_MISMATCH: "Pontos nos critérios diferem dos pontos do exame",
+  CRITERIA_GROUP_MISSING: "Grupo em falta nos critérios oficiais",
+  CRITERIA_QUESTION_NOT_GROUPED: "Pergunta nos critérios sem grupo definido",
+  // Exam extraction codes
   SCORING_POLICY_REBUILT: "Pontuação reconstruída a partir das perguntas (cotações não lidas diretamente)",
   PORTUGUESE_SCORING_POLICY_REBUILT: "Pontuação reconstruída a partir das perguntas",
   grupo_ii_points_rescaled: "Pontos do Grupo II reajustados ao total oficial (50 pts)",
@@ -337,7 +353,7 @@ function DayTable({
                     <FileIcon />
                     <span className="min-w-0 truncate">{displayName(exam)}</span>
                   </Link>
-                  {exam.sourceUrl && <p className="mt-1 truncate text-xs text-[#7a87a3]">{exam.sourceUrl}</p>}
+                  <CriteriaBadge exam={exam} />
                 </td>
                 <td className="px-4 py-4 text-sm text-[#53617f]">{inferSubject(exam)}</td>
                 <td className="px-4 py-4">
@@ -502,6 +518,111 @@ function StatusBadge({ exam }: { exam: Exam }) {
               )}
             </div>
           )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CriteriaBadge({ exam }: { exam: Exam }) {
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  if (!exam.hasCriteria) return null;
+
+  const isPass = exam.criteriaVerdict === 'PASS';
+  const issues = exam.criteriaIssues ?? [];
+  const hasIssues = issues.length > 0;
+
+  const badgeClass = isPass
+    ? 'bg-emerald-50 text-emerald-700'
+    : 'bg-amber-50 text-amber-700';
+
+  const buildCopyText = () => {
+    const lines: string[] = [];
+    lines.push(`ID: ${exam.id}`);
+    lines.push(`Critérios: ${exam.criteriaVerdict ?? '?'}`);
+    if (exam.criteriaMatchedQuestions != null) {
+      lines.push(`Itens associados: ${exam.criteriaMatchedQuestions}`);
+    }
+    if (issues.length > 0) {
+      lines.push(`\nAvisos dos critérios (${issues.length}):`);
+      for (const iss of issues) {
+        lines.push(`  [${iss.severity.toUpperCase()}] ${iss.code} — ${iss.message || friendlyIssue(iss.code)}`);
+      }
+    }
+    return lines.join('\n');
+  };
+
+  const handleClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!hasIssues || isPass) return;
+    navigator.clipboard.writeText(buildCopyText()).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(() => {});
+  };
+
+  const badge = (
+    <span
+      onClick={handleClick}
+      className={`mt-1.5 inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-semibold ${badgeClass} ${!isPass && hasIssues ? 'cursor-pointer' : ''}`}
+    >
+      {copied ? (
+        <>
+          <svg className="h-2.5 w-2.5 shrink-0" viewBox="0 0 20 20" fill="currentColor">
+            <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
+          </svg>
+          Copiado!
+        </>
+      ) : (
+        <>
+          {isPass ? (
+            <svg className="h-2.5 w-2.5" viewBox="0 0 20 20" fill="currentColor">
+              <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
+            </svg>
+          ) : (
+            <span className="h-1.5 w-1.5 rounded-full bg-current" />
+          )}
+          {isPass ? 'Critérios' : 'Critérios c/ avisos'}
+          {!isPass && (
+            <svg className="h-3 w-3 opacity-60" viewBox="0 0 20 20" fill="currentColor">
+              <path fillRule="evenodd" d="M18 10A8 8 0 11 2 10a8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+            </svg>
+          )}
+        </>
+      )}
+    </span>
+  );
+
+  if (isPass || !hasIssues) return badge;
+
+  return (
+    <div
+      className="relative inline-block"
+      onMouseEnter={() => setOpen(true)}
+      onMouseLeave={() => setOpen(false)}
+    >
+      {badge}
+      {open && !copied && (
+        <div className="absolute left-0 top-full z-50 mt-2 w-80 rounded-lg border border-[#dce5f2] bg-white p-3 text-left shadow-[0_18px_55px_rgba(25,45,78,0.18)]">
+          <div className="space-y-2">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-[#7a87a3]">
+              Avisos dos critérios ({issues.length}) · clica para copiar
+            </p>
+            {issues.map((issue, i) => (
+              <div key={i} className="flex items-start gap-2 text-xs">
+                <span
+                  className={`mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${severityStyles[issue.severity] || severityStyles.low}`}
+                >
+                  {issue.severity}
+                </span>
+                <span className="text-[#3d4965]">
+                  {issue.message || friendlyIssue(issue.code)}
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>

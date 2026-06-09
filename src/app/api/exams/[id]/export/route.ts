@@ -35,6 +35,12 @@ export async function GET(
 
     archive.append(JSON.stringify(examData, null, 2), { name: 'exam.json' });
 
+    // Include criteria.json if it has been built
+    const criteriaJsonPath = path.join(outputDir, `${id}.criteria.json`);
+    if (fs.existsSync(criteriaJsonPath)) {
+      archive.file(criteriaJsonPath, { name: 'criteria.json' });
+    }
+
     // Add only used assets
     for (const relPath of usedFiles) {
       const absPath = path.join(outputDir, id, relPath);

@@ -48,7 +48,12 @@ export async function GET(_request: NextRequest, context: RouteContext) {
 
     const clientData = buildClientData(examData, assetState);
     const zipFilename = makeZipFilename(clientData, safeId);
-    const zipBuffer = await createZipBuffer(clientData, assetState.usedAssets);
+
+    // Resolve criteria path (may not exist yet)
+    const criteriaFilePath = path.join(OUTPUT_DIR, `${safeId}.criteria.json`);
+    const resolvedCriteriaPath = fs.existsSync(criteriaFilePath) ? criteriaFilePath : null;
+
+    const zipBuffer = await createZipBuffer(clientData, assetState.usedAssets, resolvedCriteriaPath);
 
     return new NextResponse(zipBuffer as unknown as BodyInit, {
       headers: {
@@ -369,6 +374,7 @@ function rewritePathsDeep(value: unknown, pathRewrite: Map<string, string>) {
 async function createZipBuffer(
   clientData: AnyObj,
   usedAssets: Map<string, string>,
+  criteriaJsonPath: string | null = null,
 ) {
   const archive = archiver("zip", { zlib: { level: 6 } });
   const chunks: Buffer[] = [];
@@ -388,6 +394,18 @@ async function createZipBuffer(
     archive.append(JSON.stringify(clientData, null, 2), {
       name: "data/exam.json",
     });
+
+    // Include criteria if it has been built:
+    //   data/criteria.json  — raw data for downstream use
+    //   criteria.js         — window.CRITERIA_DATA for app.js answer-key rendering
+    if (criteriaJsonPath) {
+      archive.file(criteriaJsonPath, { name: "data/criteria.json" });
+      const criteriaRaw = fs.readFileSync(criteriaJsonPath, "utf-8");
+      archive.append(
+        `window.CRITERIA_DATA = ${safeJsonForScript(JSON.parse(criteriaRaw))};`,
+        { name: "criteria.js" },
+      );
+    }
 
     for (const [zipPath, absPath] of usedAssets) {
       archive.file(absPath, { name: zipPath });
@@ -434,6 +452,7 @@ function indexHtml(clientData: AnyObj) {
   <link rel="stylesheet" href="styles.css">
   <script>window.MathJax={tex:{inlineMath:[['\\\\(','\\\\)']],displayMath:[['\\\\[','\\\\]']],processEscapes:true,macros:{sen:'\\\\operatorname{sen}',tg:'\\\\operatorname{tg}',cotg:'\\\\operatorname{cotg}',arctg:'\\\\operatorname{arctg}'}},startup:{typeset:false}};</script>
   <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+  <script defer src="criteria.js"></script>
   <script defer src="data.js"></script>
   <script defer src="app.js"></script>
 </head>
@@ -894,6 +913,59 @@ mjx-container{outline:none;max-width:100%;overflow-x:auto}
 mjx-container[display="true"]{display:block;margin:1rem 0}
 .statement{overflow-wrap:anywhere}
 .option-text{overflow-wrap:anywhere}
+.criteria-block{
+  margin-top:20px;
+  border:1px solid #c7d7f7;
+  border-radius:16px;
+  padding:14px 16px;
+  background:#f4f8ff;
+}
+.crit-title{
+  font-size:.72rem;
+  font-weight:950;
+  text-transform:uppercase;
+  letter-spacing:.14em;
+  color:#3568da;
+  margin-bottom:10px;
+}
+.crit-row{
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  gap:8px;
+  font-size:.88rem;
+  margin-bottom:6px;
+}
+.crit-row:last-child{margin-bottom:0}
+.crit-label{
+  font-size:.74rem;
+  font-weight:950;
+  color:#64748b;
+  min-width:68px;
+}
+.crit-badge{
+  display:inline-flex;
+  align-items:center;
+  gap:4px;
+  border-radius:999px;
+  background:#dbeafe;
+  color:#1e40af;
+  padding:4px 10px;
+  font-size:.82rem;
+  font-weight:900;
+}
+.crit-pts{
+  font-weight:950;
+  color:#172033;
+}
+.crit-topics ul{
+  margin:0;
+  padding-left:16px;
+  color:#374151;
+  font-size:.82rem;
+  line-height:1.6;
+  list-style:disc;
+}
 `;
 const APP_JS = String.raw`const state = {
   exam: null,
@@ -938,6 +1010,17 @@ function bootApp() {
   state.storageKey = 'quiz_answers_' + safeStorageKey(state.exam.exam_id || document.title || 'local');
   state.answers = loadAnswers();
   state.questions = getVisibleQuestions(state.exam.questions || []);
+
+  // Build questionId → criteria item map (if criteria.js was included)
+  state.criteriaMap = {};
+  var cd = window.CRITERIA_DATA;
+  if (cd && Array.isArray(cd.items)) {
+    cd.items.forEach(function(it) {
+      if (it.questionId && it.status === 'matched') {
+        state.criteriaMap[it.questionId] = it;
+      }
+    });
+  }
 
   var subtitle = document.getElementById('subtitle');
   if (subtitle) {
@@ -1070,7 +1153,8 @@ function render() {
     '</div>' +
     renderImages(q) +
     '<div class="statement">' + formatText(statement(q)) + '</div>' +
-    (isGroup ? renderGroupChildren(children) : renderAnswer(q));
+    (isGroup ? renderGroupChildren(children) : renderAnswer(q)) +
+    renderCriteria(q);
 
   bindQuestionEvents(card);
   if(window.MathJax&&window.MathJax.typesetPromise){window.MathJax.typesetPromise([card]).catch(function(){});}
@@ -1633,6 +1717,42 @@ function renderGroupChildren(children) {
         '</button>';
       }).join('') +
     '</div>';
+}
+
+function renderCriteria(q) {
+  var crit = state.criteriaMap && state.criteriaMap[q.questionId];
+  if (!crit) return '';
+
+  var parts = [];
+
+  // Answer key badges
+  var ca = crit.correctAnswer;
+  if (ca && typeof ca === 'object') {
+    var keys = Object.keys(ca);
+    if (keys.length) {
+      var badges = keys.map(function(k) {
+        var label = k === 'v1' ? 'V1' : k === 'v2' ? 'V2' : esc(k);
+        return '<span class="crit-badge">' + label + ' <strong>' + esc(String(ca[k]).toUpperCase()) + '</strong></span>';
+      }).join('');
+      parts.push('<div class="crit-row"><span class="crit-label">Chave</span>' + badges + '</div>');
+    }
+  }
+
+  // Points
+  if (crit.points != null) {
+    parts.push('<div class="crit-row"><span class="crit-label">Cotação</span><span class="crit-pts">' + esc(crit.points) + ' pts</span></div>');
+  }
+
+  // Content topics
+  var topics = Array.isArray(crit.contentTopics) ? crit.contentTopics : [];
+  if (topics.length) {
+    var topicItems = topics.map(function(t) { return '<li>' + esc(t) + '</li>'; }).join('');
+    parts.push('<div class="crit-row crit-topics"><span class="crit-label">Conteúdos</span><ul>' + topicItems + '</ul></div>');
+  }
+
+  if (!parts.length) return '';
+
+  return '<div class="criteria-block"><div class="crit-title">Critérios oficiais</div>' + parts.join('') + '</div>';
 }
 
 function labelType(type) {
