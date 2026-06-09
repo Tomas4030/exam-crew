@@ -289,12 +289,17 @@ Text:
             # Remove any existing scoring entries to avoid duplicates
             page_results = [pr for pr in page_results if not pr.get("scoring")]
             page_results.append({"page": extraction["total_pages"], "pageType": "scoring", "questions": [], "figures": [], "scoring": scoring_collected})
+            # Also store in extraction so normalizer can use vision scoring as fallback
+            extraction["_vision_scoring"] = scoring_collected
             report_progress("scoring", f"Extracted {len(scoring_collected)} scoring entries")
 
         # Step 3: Assemble
         report_progress("assemble", "Building structured output")
         self._last_page_results = page_results  # Store for retry scoring re-application
         extraction["_processed_pages"] = pages_to_process
+        # Normalizers need the PDF path to recover content (e.g. the Grupo III
+        # composition prompt) from pages that processing/vision skipped.
+        extraction["_pdf_path"] = self.pdf_path
         output = self._assemble_output(extraction, page_results, subject_profile)
         output["metadata"]["subject"] = subject_key.replace("_", " ").title() if subject_key != "unknown" else None
         output["metadata"]["sourceUrl"] = source_url or None
@@ -503,6 +508,15 @@ Text:
                 output_dir=self.output_dir / self.exam_id,
             )
             output = enforce_asset_integrity(output, self.output_dir)
+            # Re-validate after Portuguese normalizer runs so that issues fixed by
+            # the normalizer (e.g. missing points repaired from scoring table) don't
+            # leave stale HIGH warnings that block the audit gate upgrade.
+            output["warnings"] = [
+                w for w in output.get("warnings", [])
+                if w.get("type") not in ("missing_points_critical", "question_count_mismatch",
+                                          "possible_hallucination", "missing_table_data")
+            ]
+            output = validate_and_fix(output, extraction)
 
         # Step 4.94: Subject-specific audit gate before any "done" status.
         # Historia audit only runs for historia_a exams — not for Portuguese or others.

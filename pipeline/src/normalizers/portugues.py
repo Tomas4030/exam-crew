@@ -46,7 +46,11 @@ def normalize_portugues(
     _repair_points_from_scoring_text(output, extraction)
     _fix_historical_composition_points(output)
     _repair_composition_points_remainder(output)
+    _normalize_grupo_ii_to_official_total(output)
+    _reconcile_legacy_grupo_i_b(output, extraction)
+    _repair_legacy_portuguese_scoring_policy(output)
     _fix_legacy_mandatory_status(output)
+    _repair_multi_select_max_selections(output)
     _normalize_question_ids(output)
     _repair_broken_parents(output)
     _fix_text_source_visual_dependency(output)
@@ -393,7 +397,7 @@ def _strip_inline_options_from_selection_statements(output: dict) -> None:
             repaired += 1
 
         if qtype == "multi_select":
-            wanted = _infer_max_selections(stripped)
+            wanted = _infer_max_selections(stripped, len(q.get("options") or []))
             if wanted:
                 q["maxSelections"] = wanted
     if repaired:
@@ -618,7 +622,10 @@ def _repair_portuguese_text_sources(
                     source.setdefault("crops", {})["best"] = crop
                 if page_text and not source.get("text"):
                     source["text"] = page_text
-                source.setdefault("preferredRender", "image")
+                if crop:
+                    source.setdefault("preferredRender", "image")
+                else:
+                    source["preferredRender"] = "text"
                 by_source_id[source_id] = source
                 continue
             roman = {"grupo_i": "I", "grupo_ii": "II"}.get(group_id, "")
@@ -627,9 +634,7 @@ def _repair_portuguese_text_sources(
                 "groupId": group_id,
                 "label": f"Texto de apoio - Grupo {roman}, pagina {page_num}",
                 "kind": "text_source",
-                # Frontend renders the crop image when available; text is a
-                # search/debug/fallback field only.
-                "preferredRender": "image",
+                "preferredRender": "image" if crop else "text",
                 "pageStart": page_num,
                 "pageEnd": page_num,
                 "assetRefs": [],
@@ -1047,6 +1052,9 @@ def _normalize_question_ids(output: dict) -> None:
         if not gid or not number:
             continue
 
+        # Preserve _recovered suffix so _update_status_for_recovered_questions can detect it
+        recovered_suffix = "_recovered" if old_id.endswith("_recovered") else ""
+
         # Already correctly namespaced?
         expected_prefix = f"{gid}_q"
         if old_id.startswith(expected_prefix) and not re.search(r'_p\d+$', old_id):
@@ -1054,10 +1062,10 @@ def _normalize_question_ids(output: dict) -> None:
 
         # Build canonical ID
         num_slug = number.replace(".", "_").lower()
-        new_id = f"{gid}_q{num_slug}"
+        new_id = f"{gid}_q{num_slug}{recovered_suffix}"
         # Handle special "B" section of grupo_i
         if gid == "grupo_i" and number.upper() == "B":
-            new_id = "grupo_i_b"
+            new_id = f"grupo_i_b{recovered_suffix}"
         if old_id != new_id:
             renames[old_id] = new_id
             q["questionId"] = new_id
@@ -1106,6 +1114,184 @@ def _repair_broken_parents(output: dict) -> None:
         q["parentQuestion"] = None
 
 
+def _pt_era_group_totals(year: int) -> dict | None:
+    """Return the official mandatory group totals for the Português 639 exam era.
+
+    Confirmed against the official cotações pages (examesnacionais.com.pt):
+      - 2008-2017: Grupo I=100, Grupo II=50, Grupo III=50  (total 200)
+      - 2018-2019: Grupo I=104, Grupo II=56, Grupo III=40  (total 200)
+      - 2020+: optional-pool format (raw 226) — not a fixed mandatory split,
+               so returns None (handled by the generic policy rebuild instead).
+    """
+    if 2008 <= year <= 2017:
+        return {"grupo_i": 100, "grupo_ii": 50, "grupo_iii": 50}
+    if 2018 <= year <= 2019:
+        return {"grupo_i": 104, "grupo_ii": 56, "grupo_iii": 40}
+    return None
+
+
+def _leaf_questions(output: dict) -> list[dict]:
+    """Return questions that carry points (skip container questions whose id is a
+    parentQuestion of another question — their children hold the points)."""
+    questions = output.get("questions") or []
+    parent_refs = {
+        str(q.get("parentQuestion") or "")
+        for q in questions
+        if isinstance(q, dict) and q.get("parentQuestion")
+    }
+    ids = {str(q.get("questionId") or "") for q in questions if isinstance(q, dict)}
+    containers = parent_refs & ids
+    return [
+        q for q in questions
+        if isinstance(q, dict) and str(q.get("questionId") or "") not in containers
+    ]
+
+
+def _normalize_grupo_ii_to_official_total(output: dict) -> None:
+    """Rescale Grupo II question points to the official group total when the vision
+    model mis-read the per-item cotações (a chronic problem in 2008-2010 editions).
+
+    Only Grupo II is rescaled here:
+      - Grupo I deficits are a *missing* item B (handled by _reconcile_legacy_grupo_i_b)
+      - Grupo III is fixed to its known value separately.
+
+    Points are rescaled proportionally (largest-remainder rounding) so the relative
+    weighting the model captured is preserved while the group sums exactly to the
+    official total.  Every item keeps at least 1 point.
+    """
+    metadata = output.get("metadata") or {}
+    try:
+        year = int(metadata.get("year") or 0)
+    except (TypeError, ValueError):
+        year = 0
+    totals = _pt_era_group_totals(year)
+    if not totals:
+        return
+    official = totals.get("grupo_ii")
+    if not official:
+        return
+
+    gii = [q for q in _leaf_questions(output) if q.get("groupId") == "grupo_ii"]
+    if not gii:
+        return
+    current = sum(int(q.get("points") or 0) for q in gii)
+    if current == official or current <= 0:
+        return
+    # Only correct plausible mis-reads, not garbage extractions.
+    # Upper bound is generous (5x) because the 2008-2015 dot-leader font artifact
+    # inflates single-digit cotações 5-fold ("5 pontos" decoded as "25 pontos").
+    if not (official * 0.4 <= current <= official * 5):
+        return
+    n = len(gii)
+    if official < n:
+        return  # cannot give every item at least 1 point
+
+    weights = [max(0, int(q.get("points") or 0)) for q in gii]
+    wsum = sum(weights) or n
+    remaining = official - n  # after reserving 1 pt per item
+    raw = [remaining * w / wsum for w in weights]
+    floor = [int(x) for x in raw]
+    rem = remaining - sum(floor)
+    order = sorted(range(n), key=lambda i: raw[i] - floor[i], reverse=True)
+    for k in range(rem):
+        floor[order[k % n]] += 1
+    for q, extra in zip(gii, floor):
+        q["points"] = 1 + extra
+
+    output.setdefault("warnings", []).append({
+        "type": "grupo_ii_points_rescaled",
+        "message": (
+            f"Grupo II points rescaled from {current} to official total {official} "
+            f"across {n} item(s) — per-item cotações were mis-read."
+        ),
+        "severity": "medium",
+    })
+    output["needsHumanReview"] = True
+
+
+def _repair_legacy_portuguese_scoring_policy(output: dict) -> None:
+    """Rebuild scoringPolicy from the question points whenever the parsed policy is
+    incomplete or inconsistent — for ANY exam year.
+
+    The PDF cotações tables are parsed unreliably across editions (old two-column
+    layouts, grid layouts, optional-pool tables), often capturing only a handful of
+    items.  The questions themselves, however, end up with correct points after the
+    earlier normalisation passes.  This rebuilds the authoritative policy from the
+    questions, preserving each item's mandatory/optional flag so optional-pool
+    exams (2020+) keep their semantics.
+    """
+    metadata = output.get("metadata") or {}
+    leaves = _leaf_questions(output)
+    if not leaves:
+        return
+
+    new_items: list[dict] = []
+    for q in leaves:
+        group_id = str(q.get("groupId") or "").strip()
+        number = str(q.get("number") or "").strip()
+        try:
+            pts = int(q.get("points") or 0)
+        except (TypeError, ValueError):
+            pts = 0
+        if not group_id or not number or pts <= 0:
+            continue
+        is_mandatory = bool(q.get("isMandatory", True))
+        item = {
+            "groupId": group_id,
+            "number": number,
+            "points": pts,
+            "isMandatory": is_mandatory,
+        }
+        if not is_mandatory:
+            opid = q.get("optionalPoolId") or (q.get("disciplineData") or {}).get("optionalPoolId")
+            item["optionalPoolId"] = opid or "portuguese_optional_pool_1"
+        new_items.append(item)
+
+    if not new_items:
+        return
+
+    q_total = sum(item["points"] for item in new_items)
+
+    policy = metadata.get("scoringPolicy") or {}
+    existing_items = policy.get("items") or []
+    try:
+        raw_subtotal = int(policy.get("rawSubtotal") or 0)
+    except (TypeError, ValueError):
+        raw_subtotal = 0
+
+    # Existing policy already complete and consistent with the questions → keep it.
+    if existing_items and len(existing_items) >= len(new_items) and raw_subtotal == q_total:
+        return
+
+    # Guard against rebuilding from a clearly-broken question set.
+    if not (180 <= q_total <= 260):
+        return
+
+    mandatory_total = sum(i["points"] for i in new_items if i.get("isMandatory", True))
+    optional_items = [i for i in new_items if not i.get("isMandatory", True)]
+    optional_total = sum(i["points"] for i in optional_items)
+
+    metadata["scoringPolicy"] = {
+        "source": "rebuilt_from_questions",
+        "totalPoints": policy.get("totalPoints") or 200,
+        "rawSubtotal": q_total,
+        "mandatorySubtotal": mandatory_total,
+        "optionalPoolSubtotal": optional_total,
+        "optionalPool": policy.get("optionalPool"),
+        "items": new_items,
+    }
+
+    output.setdefault("warnings", []).append({
+        "type": "SCORING_POLICY_REBUILT",
+        "message": (
+            f"scoringPolicy incompleta ({len(existing_items)} itens, "
+            f"rawSubtotal={raw_subtotal}); reconstruída a partir das perguntas "
+            f"({len(new_items)} itens, total={q_total})."
+        ),
+        "severity": "medium",
+    })
+
+
 def _fix_legacy_mandatory_status(output: dict) -> None:
     """Before 2020, Portuguese exams had no optional-question system.
 
@@ -1145,12 +1331,15 @@ def _update_status_for_recovered_questions(output: dict) -> None:
     """Lower processingStatus when recovered questions are present.
 
     A recovered question is one that the LLM missed and we rebuilt from the PDF
-    text layer.  Their quality is lower, so the exam should not be `completed`.
+    text layer.  Their quality is lower, so the exam should not be a clean
+    `completed`.
 
-    Rules:
-    - Any recovered without sourcePage → ``needs_review``
-    - Any recovered with sourcePage but processingStatus would be `completed`
-      → ``completed_with_warnings``
+    The Portuguese audit gate is the single authority for the ``needs_review``
+    decision (it blocks on real scoring/structure errors).  Here we only
+    DOWNGRADE a would-be `completed` to `completed_with_warnings` and set the
+    human-review flag — we never force `needs_review`, otherwise we would block
+    exams whose scoring is provably correct (total == 200) just because a
+    recovered question lacks page metadata.
     """
     questions = output.get("questions") or []
     recovered = [
@@ -1163,8 +1352,9 @@ def _update_status_for_recovered_questions(output: dict) -> None:
     current_status = output.get("processingStatus") or "completed"
     recovered_without_page = [q for q in recovered if not q.get("sourcePage")]
 
-    if recovered_without_page and current_status == "completed":
-        output["processingStatus"] = "needs_review"
+    if recovered_without_page:
+        if current_status == "completed":
+            output["processingStatus"] = "completed_with_warnings"
         output["needsHumanReview"] = True
         output.setdefault("warnings", []).append({
             "type": "recovered_questions_without_source_page",
@@ -1173,11 +1363,42 @@ def _update_status_for_recovered_questions(output: dict) -> None:
                 "Manual review recommended."
             ),
         })
-    elif recovered and current_status == "completed":
-        output["processingStatus"] = "completed_with_warnings"
+    elif recovered:
+        # Has sourcePage: only bump completed → completed_with_warnings
+        if current_status == "completed":
+            output["processingStatus"] = "completed_with_warnings"
         output.setdefault("warnings", []).append({
             "type": "recovered_questions_present",
             "message": f"{len(recovered)} question(s) were recovered from PDF text (LLM missed them).",
+        })
+
+
+def _repair_multi_select_max_selections(output: dict) -> None:
+    """Ensure every multi_select question has a valid maxSelections value.
+
+    The LLM sometimes produces ``type: "multi_select"`` without ``maxSelections``
+    (or with ``maxSelections: null``).  This function attempts to infer the count
+    from the question statement.  If inference fails the question is left as-is so
+    the audit check ``PORTUGUESE_MULTI_SELECT_INVALID_MAX`` can block the exam for
+    human review.
+    """
+    repaired = 0
+    for q in output.get("questions") or []:
+        if not isinstance(q, dict) or q.get("type") != "multi_select":
+            continue
+        if q.get("maxSelections"):
+            continue  # already set
+        statement = str(q.get("statement") or "")
+        options_count = len(q.get("options") or [])
+        inferred = _infer_max_selections(statement, options_count)
+        if inferred:
+            q["maxSelections"] = inferred
+            repaired += 1
+    if repaired:
+        output.setdefault("warnings", []).append({
+            "type": "multi_select_max_inferred",
+            "message": f"Inferred maxSelections for {repaired} multi_select question(s) from statement text.",
+            "severity": "low",
         })
 
 
@@ -1539,7 +1760,7 @@ def _page_footer_y(blocks: list[dict[str, Any]]) -> float:
 def _recover_missing_questions_from_scoring(output: dict, extraction: dict | None) -> None:
     if not extraction:
         return
-    entries = _parse_portuguese_scoring(extraction)
+    entries = [e for e in _parse_portuguese_scoring(extraction) if "_choose_hint" not in e]
     metadata_entries = _metadata_scoring_entries(output)
     if metadata_entries:
         by_key = {(entry.get("group"), str(entry.get("number"))): entry for entry in entries}
@@ -1617,6 +1838,106 @@ def _recover_missing_questions_from_scoring(output: dict, extraction: dict | Non
         })
 
 
+def _reconcile_legacy_grupo_i_b(output: dict, extraction: dict | None) -> None:
+    """Inject the missing Grupo I 'B' item (30 pts) for 2008-2017 legacy exams.
+
+    Confirmed structure of Exame Nacional de Português 639 (2008-2017), verified
+    against the official cotações pages:
+
+        Grupo I  = 100 pts   (items 1-4 sum to 70  +  item B = 30)
+        Grupo II = 50 pts
+        Grupo III = 50 pts   (composition)
+        Total = 200
+
+    When the vision model and the scoring-table parser miss the Grupo I 'B'
+    mini-composition, the exam total comes out at 170.  Because the deficit is
+    provably the B item (200 - 170 == 30) and every other group is already
+    correct, we deterministically reconstruct B with 30 pts, recovering its
+    statement from the PDF text layer when available.
+    """
+    metadata = output.get("metadata") or {}
+    try:
+        year = int(metadata.get("year") or 0)
+    except (TypeError, ValueError):
+        year = 0
+    if not (2008 <= year <= 2017):
+        return
+
+    questions = output.get("questions") or []
+    grupo_i = [q for q in questions if isinstance(q, dict) and q.get("groupId") == "grupo_i"]
+    if not grupo_i:
+        return
+
+    def _is_b(q: dict) -> bool:
+        num = str(q.get("number") or "").strip().upper()
+        return num in {"B", "5"}
+
+    if any(_is_b(q) for q in grupo_i):
+        return  # B already present
+
+    total = sum(int(q.get("points") or 0) for q in questions if isinstance(q, dict))
+    grupo_i_sum = sum(int(q.get("points") or 0) for q in grupo_i)
+
+    # Only inject when the deficit is *exactly* the missing B item.  B is always
+    # 30 pts in the 2008-2017 editions, and the rest of the exam must already be
+    # correct (so that adding B yields exactly 200).
+    if total != 170 or grupo_i_sum != 70:
+        return
+
+    block = _extract_group_i_b_block(extraction)
+    source_page = (
+        _find_question_source_page("B", extraction)
+        or _find_question_source_page("5", extraction)
+    )
+    statement = block or "Grupo I — B (item de resposta extensa; texto não extraído do PDF)."
+
+    b_question = {
+        "questionId": "grupo_i_q5_recovered",
+        "number": "5",
+        "type": "open_answer",
+        "sourcePage": source_page,
+        "statement": statement,
+        "statementPlain": statement,
+        "statementLatex": statement,
+        "statementRaw": statement,
+        "statementFormatted": statement,
+        "statementPlainFormatted": statement,
+        "statementLatexFormatted": statement,
+        "sourceTextRaw": statement,
+        "rawText": statement,
+        "options": [],
+        "blanks": None,
+        "maxSelections": None,
+        "imageRefs": [],
+        "tableRefs": [],
+        "assetRefs": [],
+        "sourceRefs": [],
+        "media": [],
+        "visualDependency": False,
+        "confidence": 0.7 if block else 0.5,
+        "needsHumanReview": not block,
+        "warnings": [{
+            "type": "portuguese_grupo_i_b_reconstructed",
+            "message": (
+                "Grupo I item B (30 pts) reconstructed deterministically from the "
+                "100-pt group total."
+                + ("" if block else " Statement text not found in PDF — review required.")
+            ),
+        }],
+        "points": 30,
+        "isMandatory": True,
+        "groupId": "grupo_i",
+        "group": "Grupo I",
+        "displayNumber": "Grupo I, B",
+    }
+    questions.append(b_question)
+    output.setdefault("warnings", []).append({
+        "type": "portuguese_grupo_i_b_reconstructed",
+        "message": f"year {year}: reconstructed missing Grupo I B item (30 pts); total 170 → 200.",
+        "severity": "medium",
+    })
+
+
 def _metadata_scoring_entries(output: dict) -> list[dict[str, Any]]:
     items = ((output.get("metadata") or {}).get("scoringPolicy") or {}).get("items") or []
     entries: list[dict[str, Any]] = []
@@ -1648,6 +1969,10 @@ def _repair_points_from_scoring_text(output: dict, extraction: dict | None) -> N
         return
 
     _store_portuguese_scoring_policy(output, entries)
+    # Strip metadata markers (e.g. _choose_hint) — only real scoring entries from here on
+    entries = [e for e in entries if "_choose_hint" not in e]
+    if not entries:
+        return
     by_key = {(entry["group"], str(entry["number"])): entry["points"] for entry in entries}
     applied = 0
     for q in output.get("questions") or []:
@@ -1679,6 +2004,18 @@ def _repair_points_from_scoring_text(output: dict, extraction: dict | None) -> N
 
 
 def _repair_composition_points_remainder(output: dict) -> int:
+    metadata = output.get("metadata") or {}
+    try:
+        year = int(metadata.get("year") or 0)
+    except (TypeError, ValueError):
+        year = 0
+
+    # For 2008-2014, Grupo III is always exactly 50 pts (enforced by
+    # _fix_historical_composition_points).  Never inflate it here to compensate
+    # for a deficit in Grupo I/II — that would mask the real data problem.
+    if 2008 <= year <= 2014:
+        return 0
+
     questions = output.get("questions") or []
     composition = next((q for q in questions if q.get("groupId") == "grupo_iii"), None)
     if not composition:
@@ -1707,8 +2044,15 @@ def _store_portuguese_scoring_policy(output: dict, entries: list[dict[str, Any]]
     if not entries:
         return
 
+    # Extract any explicit choose hint injected by parsers
+    explicit_choose: int | None = next(
+        (int(e["_choose_hint"]) for e in entries if "_choose_hint" in e), None
+    )
+
     items = []
     for entry in entries:
+        if "_choose_hint" in entry:
+            continue
         group = str(entry.get("group") or "")
         number = str(entry.get("number") or "")
         points = entry.get("points")
@@ -1731,7 +2075,8 @@ def _store_portuguese_scoring_policy(output: dict, entries: list[dict[str, Any]]
     optional_items = [item for item in items if not item.get("isMandatory")]
     optional_points = sum(int(item["points"]) for item in optional_items)
     optional_each = _common_point_value(optional_items)
-    choose = _infer_optional_choose(optional_items, mandatory_points)
+    # Prefer explicit choose from the table formula ("N × M pontos") over inference
+    choose = explicit_choose if explicit_choose is not None else _infer_optional_choose(optional_items, mandatory_points)
     output.setdefault("metadata", {})["scoringPolicy"] = {
         "source": "cotacoes",
         "totalPoints": 200,
@@ -1777,34 +2122,68 @@ def _parse_portuguese_scoring(extraction: dict | None) -> list[dict[str, Any]]:
     if not extraction:
         return []
     pages = extraction.get("_processed_pages") or extraction.get("pages") or []
-    scoring_pages = []
+    scoring_pages: list[str] = []
     for page in pages:
         if not isinstance(page, dict):
             continue
         page_text = str(page.get("text") or "")
-        page_upper = page_text.upper()
-        if _has_scoring_heading(page_text) and "TOTAL" in page_upper:
+        if _has_scoring_heading(page_text) and "TOTAL" in page_text.upper():
             scoring_pages.append(page_text)
-    # Use only the first recognised scoring page (has explicit "COTA…" heading + TOTAL).
-    # Joining multiple pages risks pulling in normal question pages that mention "pontos"
-    # and inflating the entry count to 25-32.
-    scoring_text = scoring_pages[0] if scoring_pages else ""
-    if not scoring_text:
-        # Secondary fallback: last 4 pages but BOTH heading and content checks must pass.
+    if not scoring_pages:
+        # Secondary fallback: last 4 pages, but BOTH heading and content checks must pass.
         for page in pages[-4:]:
             if not isinstance(page, dict):
                 continue
             pt = str(page.get("text") or "")
             if _has_scoring_heading(pt) and _looks_like_scoring_text(pt) and "TOTAL" in pt.upper():
-                scoring_text = pt
-                break
-    # Note: removed the unconditional pages[-2:] fallback — it captured ordinary question
-    # pages that happened to mention "pontos", producing 25-32 spurious scoring entries.
+                scoring_pages.append(pt)
 
-    text = re.sub(r"[ \t]+", " ", scoring_text.replace("\x07", " "))
-    if not _looks_like_scoring_text(text):
-        return []
+    # An exam can contain more than one "COTAÇÕES" page (e.g. a per-item table early on
+    # AND the authoritative grid with the optional pool on the last page). Parse every
+    # candidate and keep the most complete result instead of blindly taking the first.
+    best: list[dict[str, Any]] | None = None
+    best_score = (-1, -1, 10 ** 9)  # (groups_covered, has_optional_pool, |effective-200|)
+    for scoring_text in scoring_pages:
+        text = re.sub(r"[ \t]+", " ", scoring_text.replace("\x07", " "))
+        if not _looks_like_scoring_text(text):
+            continue
+        candidate = _parse_scoring_text(text, extraction)
+        real = [e for e in candidate if "_choose_hint" not in e]
+        if not real:
+            continue
+        groups_covered = len({e["group"] for e in real})
+        has_pool = 1 if (any("_choose_hint" in e for e in candidate)
+                         or any(not e.get("isMandatory", True) for e in real)) else 0
+        mandatory = sum(int(e["points"]) for e in real if e.get("isMandatory", True))
+        effective = mandatory + _effective_optional_points(candidate, real)
+        score = (groups_covered, has_pool, -abs(effective - 200))
+        # Compare: more groups, then optional-pool present, then closest to 200.
+        cmp = (groups_covered, has_pool, abs(effective - 200))
+        if best is None or cmp[:2] > best_score[:2] or (
+            cmp[:2] == best_score[:2] and cmp[2] < best_score[2]
+        ):
+            best = candidate
+            best_score = cmp
 
+    return best or []
+
+
+def _effective_optional_points(candidate: list[dict[str, Any]], real: list[dict[str, Any]]) -> int:
+    """Points the optional pool actually contributes to the 200-pt total: choose × pointsEach
+    (best-N-of-M), not the raw sum of all optional items."""
+    optional = [e for e in real if not e.get("isMandatory", True)]
+    if not optional:
+        return 0
+    choose = next((int(e["_choose_hint"]) for e in candidate if "_choose_hint" in e), None)
+    points_each = optional[0]["points"]
+    if choose is not None and all(o["points"] == points_each for o in optional):
+        return choose * points_each
+    return sum(int(o["points"]) for o in optional)
+
+
+def _parse_scoring_text(text: str, extraction: dict | None) -> list[dict[str, Any]]:
+    """Parse a single cotações page's text into scoring entries (with optional
+    `_choose_hint` marker). Tries each known table format in priority order."""
     modern = _parse_modern_portuguese_scoring(text)
     if modern:
         return modern
@@ -1818,27 +2197,52 @@ def _parse_portuguese_scoring(extraction: dict | None) -> list[dict[str, Any]]:
         return grid
 
     legacy = _parse_legacy_portuguese_scoring(text)
-    if legacy:
-        return legacy
-
     entries: list[dict[str, Any]] = []
-    group_aliases = (
-        ("grupo_i", r"Grupo\s+I"),
-        ("grupo_ii", r"Grupo\s+II"),
-        ("grupo_iii", r"Grupo\s+III"),
-    )
-    for idx, (gid, pattern) in enumerate(group_aliases):
-        start = re.search(pattern, text, re.IGNORECASE)
-        if not start:
-            continue
-        next_start = None
-        for _, next_pattern in group_aliases[idx + 1:]:
-            m = re.search(next_pattern, text[start.end():], re.IGNORECASE)
-            if m:
-                next_start = start.end() + m.start()
-                break
-        block = text[start.end():next_start]
-        entries.extend(_parse_group_scoring_block(gid, block))
+
+    if not legacy:
+        group_aliases = (
+            ("grupo_i", r"Grupo\s+I"),
+            ("grupo_ii", r"Grupo\s+II"),
+            ("grupo_iii", r"Grupo\s+III"),
+        )
+        for idx, (gid, pattern) in enumerate(group_aliases):
+            start = re.search(pattern, text, re.IGNORECASE)
+            if not start:
+                continue
+            next_start = None
+            for _, next_pattern in group_aliases[idx + 1:]:
+                m = re.search(next_pattern, text[start.end():], re.IGNORECASE)
+                if m:
+                    next_start = start.end() + m.start()
+                    break
+            block = text[start.end():next_start]
+            entries.extend(_parse_group_scoring_block(gid, block))
+    else:
+        entries = list(legacy)
+
+    # Fill in any groups missing from text parsing using vision-extracted scoring.
+    # This handles old PDFs where font encoding artifacts corrupt text values for
+    # specific groups (e.g. "5 pontos" rendered as "25 pontos" in the text layer).
+    vision_scoring = extraction.get("_vision_scoring") if extraction else None
+    if vision_scoring and entries:
+        present_groups = {e["group"] for e in entries}
+        for raw in vision_scoring:
+            grp = str(raw.get("group") or "").strip().lower().replace(" ", "_")
+            if not grp or grp in present_groups:
+                continue
+            q_num = str(raw.get("question") or raw.get("number") or "").strip().rstrip(".")
+            try:
+                pts = int(raw.get("points") or 0)
+            except (TypeError, ValueError):
+                pts = 0
+            if q_num and pts > 0:
+                entries.append({
+                    "group": grp,
+                    "number": q_num,
+                    "points": pts,
+                    "isMandatory": True,
+                })
+
     return entries
 
 
@@ -1852,11 +2256,15 @@ def _parse_modern_portuguese_scoring(text: str) -> list[dict[str, Any]]:
     if heading_index >= 0:
         scoring_text = text[heading_index:]
 
-    split = re.split(r"(?im)^\s*Destes\b", scoring_text, maxsplit=1)
+    # "Destes N itens..." or "Dos restantes N itens..." both introduce the optional section
+    split = re.split(r"(?im)^\s*(?:Destes|Dos\s+restantes)\b", scoring_text, maxsplit=1)
     before_optional = split[0]
     optional_block = split[1] if len(split) > 1 else ""
     entries = _parse_modern_mandatory_scoring(before_optional)
-    entries.extend(_parse_modern_optional_scoring(optional_block))
+    opt_entries, explicit_choose = _parse_modern_optional_scoring(optional_block)
+    entries.extend(opt_entries)
+    if explicit_choose is not None:
+        entries.append({"_choose_hint": explicit_choose})
     return _dedupe_entries(entries)
 
 
@@ -1865,47 +2273,74 @@ def _parse_grid_portuguese_scoring(text: str) -> list[dict[str, Any]]:
     if "Item" not in lines or not any("Cotação" in line or "Cotacao" in line for line in lines):
         return []
 
-    entries: list[dict[str, Any]] = []
-    roman_indexes = [(idx, line) for idx, line in enumerate(lines) if line in {"I", "II", "III"}]
-    if len(roman_indexes) < 2:
-        return []
+    # Split into mandatory and optional sections if the divider keyword is present
+    opt_split_idx = next(
+        (i for i, ln in enumerate(lines) if re.match(r"^(?:Destes|Dos\s+restantes)\b", ln, re.IGNORECASE)),
+        None,
+    )
+    mandatory_lines = lines[:opt_split_idx] if opt_split_idx is not None else lines
+    optional_lines = lines[opt_split_idx + 1:] if opt_split_idx is not None else []
 
-    for pos, (idx, roman) in enumerate(roman_indexes):
-        next_idx = roman_indexes[pos + 1][0] if pos + 1 < len(roman_indexes) else len(lines)
-        block = lines[idx + 1:next_idx]
-        gid = _roman_to_group(roman)
-        if gid == "grupo_iii":
-            point = _last_points_before_total(block)
-            if point:
-                entries.append({"group": gid, "number": "1", "points": point})
-            continue
+    def _extract_group_entries(group_lines: list[str], is_mandatory: bool, optional_pts: int = 0) -> list[dict]:
+        result: list[dict] = []
+        roman_indexes = [(idx, ln) for idx, ln in enumerate(group_lines) if ln in {"I", "II", "III"}]
+        if len(roman_indexes) < 2:
+            return result
 
-        range_match = re.search(r"(?is)(\d{1,2})\.\s*a\s*(\d{1,2})\..*?(\d+)\s*[x×]\s*(\d+)\s*pontos", "\n".join(block))
-        if range_match:
-            start = int(range_match.group(1))
-            end = int(range_match.group(2))
-            points_each = int(range_match.group(4))
-            if 0 < points_each <= 100 and start <= end:
-                for number in range(start, end + 1):
-                    entries.append({"group": gid, "number": str(number), "points": points_each, "isMandatory": True})
+        for pos, (idx, roman) in enumerate(roman_indexes):
+            next_idx = roman_indexes[pos + 1][0] if pos + 1 < len(roman_indexes) else len(group_lines)
+            block = group_lines[idx + 1:next_idx]
+            gid = _roman_to_group(roman)
+            if gid == "grupo_iii":
+                point = _last_points_before_total(block)
+                if point:
+                    result.append({"group": gid, "number": "1", "points": point, "isMandatory": is_mandatory})
                 continue
 
-        item_numbers: list[str] = []
-        point_values: list[int] = []
-        seen_points = False
-        for line in block:
-            if re.match(r"^\d{1,3}$", line):
-                seen_points = True
-                value = int(line)
-                if 0 < value <= 100:
-                    point_values.append(value)
-                continue
-            if not seen_points and (m := re.match(r"^(\d{1,2})\.$", line)):
-                item_numbers.append(m.group(1))
+            range_match = re.search(r"(?is)(\d{1,2})\.\s*a\s*(\d{1,2})\..*?(\d+)\s*[x×]\s*(\d+)\s*pontos", "\n".join(block))
+            if range_match:
+                start = int(range_match.group(1))
+                end = int(range_match.group(2))
+                pts = int(range_match.group(4))
+                if 0 < pts <= 100 and start <= end:
+                    for number in range(start, end + 1):
+                        entry: dict = {"group": gid, "number": str(number), "points": pts, "isMandatory": is_mandatory}
+                        if not is_mandatory:
+                            entry["optionalPoolId"] = "portuguese_optional_pool_1"
+                        result.append(entry)
+                    continue
 
-        if item_numbers and point_values:
-            for number, point in zip(item_numbers, point_values[:len(item_numbers)]):
-                entries.append({"group": gid, "number": number, "points": point, "isMandatory": True})
+            item_numbers: list[str] = []
+            point_values: list[int] = []
+            seen_points = False
+            for line in block:
+                if re.match(r"^\d{1,3}$", line):
+                    seen_points = True
+                    value = int(line)
+                    if 0 < value <= 100:
+                        point_values.append(value)
+                    continue
+                if not seen_points and (m := re.match(r"^(\d{1,2})\.$", line)):
+                    item_numbers.append(m.group(1))
+
+            if item_numbers:
+                pts_to_use = optional_pts if not is_mandatory and optional_pts else None
+                for number in item_numbers:
+                    pt = pts_to_use if pts_to_use else (point_values.pop(0) if point_values else 0)
+                    if pt > 0:
+                        entry = {"group": gid, "number": number, "points": pt, "isMandatory": is_mandatory}
+                        if not is_mandatory:
+                            entry["optionalPoolId"] = "portuguese_optional_pool_1"
+                        result.append(entry)
+
+        return result
+
+    entries = _extract_group_entries(mandatory_lines, is_mandatory=True)
+
+    if optional_lines:
+        opt_formula = re.search(r"(\d+)\s*[x×]\s*(\d+)\s*pontos", "\n".join(optional_lines), re.IGNORECASE)
+        opt_pts = int(opt_formula.group(2)) if opt_formula else 0
+        entries.extend(_extract_group_entries(optional_lines, is_mandatory=False, optional_pts=opt_pts))
 
     return _dedupe_entries(entries)
 
@@ -1921,27 +2356,111 @@ def _parse_legacy_portuguese_scoring(text: str) -> list[dict[str, Any]]:
         "grupo_iii": _extract_scoring_group_block(text, "III"),
     }
 
-    for match in re.finditer(r"(?im)^\s*(\d{1,2})\.\s*.*?\n\s*(\d{1,3})\s+pontos?\b", group_blocks["grupo_i"]):
+    # One pattern for all three layouts the cotações tables use:
+    #   "1. ......... 20 pontos"   (same line)
+    #   "1.\n20 pontos"            (split, no leader)
+    #   "1. .........\n20 pontos"  (leader dots, then points on next line — 2015+)
+    # [.\s] spans leader dots + the line break; non-greedy stops at the first
+    # "N pontos" so sub-scores like "Conteúdo (12 pontos)" are never captured first.
+    _item_re = re.compile(
+        r"^[ \t]*(\d{1,2})\.[.\s]{0,120}?(\d{1,3})\s*pontos?\b",
+        re.MULTILINE | re.IGNORECASE,
+    )
+
+    for match in _item_re.finditer(group_blocks["grupo_i"]):
+        num = match.group(1)
         point = int(match.group(2))
         if 0 < point <= 100:
-            entries.append({"group": "grupo_i", "number": match.group(1), "points": point, "isMandatory": True})
+            entries.append({"group": "grupo_i", "number": num, "points": point, "isMandatory": True})
 
-    b_match = re.search(r"(?im)^\s*B\s*[\.\s]+.*?\n\s*(\d{1,3})\s+pontos?\b", group_blocks["grupo_i"])
+    # Grupo I sub-section "B": this is EITHER a standalone composition item (2008-2014,
+    # worth ~30) OR a subsection header grouping items 4-5 (2015+, worth ~40).
+    # It is only a real item when NO numbered items appear after it in the block —
+    # otherwise "B ... 40 pontos" is the subsection total and the numbered items
+    # (already captured above) hold the real points.
+    b_match = re.search(
+        r"^[ \t]*B[\.\s][.\s]{0,120}?(\d{1,3})\s*pontos?\b",
+        group_blocks["grupo_i"],
+        re.MULTILINE | re.IGNORECASE,
+    )
     if b_match:
+        tail = group_blocks["grupo_i"][b_match.end():]
+        has_numbered_after_b = bool(re.search(r"^[ \t]*\d{1,2}\.", tail, re.MULTILINE))
         point = int(b_match.group(1))
-        if 0 < point <= 100:
+        existing_gi = {e["number"] for e in entries if e["group"] == "grupo_i"}
+        if not has_numbered_after_b and 0 < point <= 100 and "5" not in existing_gi:
             entries.append({"group": "grupo_i", "number": "5", "points": point, "isMandatory": True})
 
-    for match in re.finditer(r"(?im)^\s*(\d)\.(\d)\.\s*.*?\n\s*(\d{1,3})\s+pontos?\b", group_blocks["grupo_ii"]):
-        point = int(match.group(3))
+    # Grupo II: try sub-items (1.1, 1.2 — modern) then simple items (1., 2. — legacy)
+    _subitem_re = re.compile(
+        r"^\s*(\d)\.(\d)\.\s*[^\n\d]*?(\d{1,3})\s*pontos?\b"
+        r"|"
+        r"^\s*(\d)\.(\d)\.\s*\n\s*(\d{1,3})\s*pontos?\b",
+        re.MULTILINE | re.IGNORECASE,
+    )
+    for match in _subitem_re.finditer(group_blocks["grupo_ii"]):
+        if match.group(1):
+            point = int(match.group(3))
+            num = f"{match.group(1)}.{match.group(2)}"
+        else:
+            point = int(match.group(6))
+            num = f"{match.group(4)}.{match.group(5)}"
         if 0 < point <= 100:
-            entries.append({"group": "grupo_ii", "number": f"{match.group(1)}.{match.group(2)}", "points": point, "isMandatory": True})
+            entries.append({"group": "grupo_ii", "number": num, "points": point, "isMandatory": True})
 
-    point = _last_points_before_total(_scoring_lines(group_blocks["grupo_iii"]))
-    if point:
-        entries.append({"group": "grupo_iii", "number": "1", "points": point, "isMandatory": True})
+    if not any(e["group"] == "grupo_ii" for e in entries):
+        # Legacy simple numbered items: "1. 5 pontos" or "7. 20 pontos"
+        g2_candidates: list[dict] = []
+        for match in _item_re.finditer(group_blocks["grupo_ii"]):
+            num = match.group(1)
+            point = int(match.group(2))
+            if 0 < point <= 100:
+                g2_candidates.append({"group": "grupo_ii", "number": num, "points": point, "isMandatory": True})
+        # Validate Grupo II per-item sum against the group header total.
+        # Old PDFs (2008-2015) have a custom font where dot-leaders are decoded as a
+        # leading "2", so "5 pontos" reads as "25 pontos" — inflating the group total.
+        # When the per-item sum doesn't match the header total, the text layer is
+        # unreliable: drop these candidates so the vision-extracted scoring fills the gap.
+        g2_expected = _group_header_total(text, "II")
+        g2_sum = sum(c["points"] for c in g2_candidates)
+        if g2_candidates and g2_expected and abs(g2_sum - g2_expected) <= 5:
+            entries.extend(g2_candidates)
+        elif g2_candidates and not g2_expected and g2_sum <= 60:
+            # No header total to validate against, but the sum is in the plausible
+            # Grupo II range (≈50) — accept it.
+            entries.extend(g2_candidates)
+        # else: text extraction is unreliable for this group (font encoding issue) →
+        # leave Grupo II empty so vision scoring (read from the page image) fills it.
+
+    # Grupo III: prefer the group-level total from the header line ("GRUPO III ... 50 pontos")
+    # over sub-scores (e.g. "Conteúdo 30 pontos", "Linguística 20 pontos") which are partial.
+    g3_point = _group_header_total(text, "III")
+    if not g3_point or not (10 <= g3_point <= 100):
+        g3_point = _last_points_before_total(_scoring_lines(group_blocks["grupo_iii"]))
+    if g3_point:
+        entries.append({"group": "grupo_iii", "number": "1", "points": g3_point, "isMandatory": True})
 
     return _dedupe_entries(entries)
+
+
+def _group_header_total(text: str, roman: str) -> int | None:
+    """Extract the official group total from a cotações header line such as
+    "GRUPO II ......... 50 pontos" — including the common layout where the total
+    spills onto the next line ("GRUPO II ......\n50 pontos").
+
+    `roman` is "I", "II" or "III".  A negative lookahead stops "II" from matching
+    inside "III".
+    """
+    not_more_i = r"(?!I)" if roman != "III" else ""
+    pattern = rf"GRUPO\s+{roman}{not_more_i}[.\s]{{0,250}}?(\d{{1,3}})\s*pontos?\b"
+    match = re.search(pattern, text, re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        value = int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    return value if 0 < value <= 200 else None
 
 
 def _parse_modern_mandatory_scoring(block: str) -> list[dict[str, Any]]:
@@ -1978,13 +2497,24 @@ def _parse_modern_mandatory_scoring(block: str) -> list[dict[str, Any]]:
     return entries
 
 
-def _parse_modern_optional_scoring(block: str) -> list[dict[str, Any]]:
+def _parse_modern_optional_scoring(block: str) -> tuple[list[dict[str, Any]], int | None]:
+    """Parse optional-pool section.  Returns (entries, explicit_choose) where
+    explicit_choose is the N from "N × M pontos" (or from "os N itens…"), or None."""
     if not block:
-        return []
-    match = re.search(r"(\d+)\s*[x×]\s*(\d+)\s*pontos", block, re.IGNORECASE)
-    if not match:
-        return []
-    points_each = int(match.group(2))
+        return [], None
+
+    # "N × M pontos" — N = how many optional questions count, M = points each
+    formula_match = re.search(r"(\d+)\s*[x×]\s*(\d+)\s*pontos", block, re.IGNORECASE)
+    if not formula_match:
+        return [], None
+    explicit_choose = int(formula_match.group(1))
+    points_each = int(formula_match.group(2))
+
+    # "os N itens cujas respostas…" — double-check or override choose from header text
+    text_choose_m = re.search(r"\bos\s+(\d+)\s+iten[s]?\s+cuj", block, re.IGNORECASE)
+    if text_choose_m:
+        explicit_choose = int(text_choose_m.group(1))
+
     lines = _scoring_lines(block)
     group_tokens = [line.lower() for line in lines if line in {"I", "II", "III"}]
     item_numbers = [int(m.group(1)) for line in lines if (m := re.match(r"^(\d{1,2})\.$", line))]
@@ -1999,7 +2529,7 @@ def _parse_modern_optional_scoring(block: str) -> list[dict[str, Any]]:
                 "isMandatory": False,
                 "optionalPoolId": "portuguese_optional_pool_1",
             })
-    return entries
+    return entries, explicit_choose
 
 
 def _parse_textual_modern_portuguese_scoring(text: str) -> list[dict[str, Any]]:
@@ -2008,7 +2538,7 @@ def _parse_textual_modern_portuguese_scoring(text: str) -> list[dict[str, Any]]:
 
     heading_index = _find_scoring_heading_index(text)
     scoring_text = text[heading_index:] if heading_index >= 0 else text
-    split = re.split(r"(?is)\bDos\s+restantes\b", scoring_text, maxsplit=1)
+    split = re.split(r"(?is)\b(?:Dos\s+restantes|Destes)\b", scoring_text, maxsplit=1)
     mandatory = split[0]
     optional = split[1] if len(split) > 1 else ""
 
@@ -2029,6 +2559,13 @@ def _parse_textual_modern_portuguese_scoring(text: str) -> list[dict[str, Any]]:
 
     opt_match = re.search(r"(\d+)\s*[x×]\s*(\d+)\s*pontos", optional, re.IGNORECASE)
     if opt_match:
+        explicit_choose = int(opt_match.group(1))
+        # "os N itens cujas respostas…" overrides the formula choose count if present
+        text_choose_m = re.search(r"\bos\s+(\d+)\s+iten[s]?\s+cuj", optional, re.IGNORECASE)
+        if text_choose_m:
+            explicit_choose = int(text_choose_m.group(1))
+        entries.append({"_choose_hint": explicit_choose})
+
         points_each = int(opt_match.group(2))
         for gid, roman in (("grupo_i", "I"), ("grupo_ii", "II")):
             block_match = re.search(rf"(?is)Grupo\s+{roman}\s+Itens?\s+(.+?)(?=Grupo\s+(?:I|II|III)|SUBTOTAL|TOTAL|$)", optional)
@@ -2152,6 +2689,10 @@ def _dedupe_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen = set()
     clean = []
     for entry in entries:
+        # Preserve metadata markers (no "group"/"number" keys) as-is
+        if "_choose_hint" in entry:
+            clean.append(entry)
+            continue
         key = (entry["group"], entry["number"])
         if key in seen:
             continue
@@ -2185,6 +2726,9 @@ def _extract_grupo_iii_statement(text: str) -> str:
     text = re.sub(r"(?is)^.*?\bGRUPO\s+III\b", "", text, count=1).strip()
     text = re.sub(r"(?is)\bFIM\b.*$", "", text).strip()
     text = re.sub(r"(?is)\bCOTAÇÕES\b.*$", "", text).strip()
+    # Drop the trailing "Observações" notes block (word-count / length-penalty rules).
+    # The colon is optional — many editions print "Observações\n1. Para efeitos…".
+    text = re.sub(r"(?is)\bObserva[cç][oõ]es\b\s*:?.*$", "", text).strip()
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -2194,6 +2738,12 @@ def _extract_grupo_iii_from_pages(extraction: dict | None) -> str:
         return ""
     pages = extraction.get("_processed_pages") or extraction.get("pages") or []
     pdf_page_text = _load_extraction_pdf_page_text(extraction)
+
+    # Build an ordered map of page_num -> text from the processed pages, then fill in
+    # ANY pages the PDF has but processing skipped. The Grupo III composition often
+    # sits on a page that vision/processing dropped (e.g. a dense text page), so we
+    # must scan the full PDF text layer, not just the processed subset.
+    page_texts: dict[int, str] = {}
     for page in pages:
         if not isinstance(page, dict):
             continue
@@ -2201,10 +2751,14 @@ def _extract_grupo_iii_from_pages(extraction: dict | None) -> str:
             page_num = int(page.get("page") or 0)
         except (TypeError, ValueError):
             page_num = 0
-        text = str(page.get("text") or "") or pdf_page_text.get(page_num, "")
+        page_texts[page_num] = str(page.get("text") or "") or pdf_page_text.get(page_num, "")
+    for page_num, text in pdf_page_text.items():
+        page_texts.setdefault(page_num, text)
+
+    for page_num in sorted(page_texts):
+        text = page_texts[page_num]
         if re.search(r"\bGRUPO\s+III\b", text, re.IGNORECASE):
-            statement = _extract_grupo_iii_statement(text)
-            statement = re.sub(r"(?is)\bObserva[cç][oõ]es\s*:.*$", "", statement).strip()
+            statement = _extract_grupo_iii_statement(text)  # also strips Observações
             if _is_composition_prompt(statement):
                 return statement
     return ""
@@ -2473,7 +3027,7 @@ def _dedupe_options(options: list[dict[str, str]]) -> list[dict[str, str]]:
     return clean
 
 
-def _infer_max_selections(text: str) -> int | None:
+def _infer_max_selections(text: str, options_count: int = 0) -> int | None:
     low = (text or "").lower()
     words = {
         "duas": 2,
@@ -2486,7 +3040,13 @@ def _infer_max_selections(text: str) -> int | None:
         if re.search(rf"\b{word}\b", low):
             return value
     match = re.search(r"\b([2-4])\s+(?:afirmações|opções|letras)", low)
-    return int(match.group(1)) if match else None
+    if match:
+        return int(match.group(1))
+    # V/F classification question ("verdadeiras ou falsas") — students classify all options
+    if re.search(r"\bv(erdadeiras?)?\b.*\bf(alsas?)?\b|\bverdadeir", low):
+        if options_count >= 4:
+            return max(2, options_count // 2)
+    return None
 
 
 def _asset_visual_path(asset: dict) -> str:
@@ -2723,21 +3283,39 @@ def _is_composition_prompt(text: str) -> bool:
     low = _plain_match_text(text)
     if _looks_like_composition_instructions_only(text):
         return False
-    return (
-        ("num texto" in low or "texto bem estruturado" in low or "elabore uma reflex" in low)
-        and ("duzent" in low or "200" in low or "cento e cinquenta" in low or "150" in low)
-        and any(marker in low for marker in (
-            "defenda uma perspetiva",
-            "defenda uma perspectiva",
-            "defenda um ponto de vista",
-            "elabore uma reflex",
-            "fundamente o seu ponto de vista",
-            "apresente uma reflexao",
-            "desenvolva uma reflexao",
-            "apreciacao critica",
-            "texto de opiniao",
-        ))
-    )
+    # Condition 1: the prompt asks the student to WRITE a text/reflection. The exact
+    # wording varies by year ("Num texto…", "Escreva um texto…", "Redija…",
+    # "apresente uma reflexão…"), so accept any of the common openers.
+    writes_text = any(opener in low for opener in (
+        "num texto",
+        "texto bem estruturado",
+        "escreva um texto",
+        "redija um texto",
+        "elabore um texto",
+        "elabore uma reflex",
+        "apresente uma reflex",
+        "desenvolva uma reflex",
+        "produza um texto",
+    ))
+    # Condition 2: an explicit length requirement (word count).
+    has_length = any(marker in low for marker in (
+        "duzent", "200", "cento e cinquenta", "150", "trezent", "300",
+    ))
+    # Condition 3: an argumentation / opinion marker.
+    has_marker = any(marker in low for marker in (
+        "defenda uma perspetiva",
+        "defenda uma perspectiva",
+        "defenda um ponto de vista",
+        "elabore uma reflex",
+        "fundamente o seu ponto de vista",
+        "apresente uma reflexao",
+        "desenvolva uma reflexao",
+        "reflexao sobre",
+        "apreciacao critica",
+        "texto de opiniao",
+        "ponto de vista",
+    ))
+    return writes_text and has_length and has_marker
 
 
 def _looks_like_composition_instructions_only(text: str) -> bool:

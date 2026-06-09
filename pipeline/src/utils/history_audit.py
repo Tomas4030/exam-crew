@@ -485,6 +485,8 @@ def _audit_crops(root: str, sources: list[dict], bundle: ExamBundle, issues: lis
                 group="grupo_i", actual=str(source.get("sourceId") or ""),
             ))
         if not rel:
+            if source.get("preferredRender") == "text":
+                continue
             issues.append(Issue(root, "HIGH", "SOURCE_WITHOUT_CROP",
                                 f"source has no best/full crop: {source.get('sourceId')}", actual=str(source.get("sourceId"))))
             continue

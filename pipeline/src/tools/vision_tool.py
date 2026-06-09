@@ -358,18 +358,21 @@ Rules:
 
 def _extract_scoring(image_path: str, page_num: int) -> list[dict] | None:
     """Extract scoring table from page."""
-    prompt = """Extract the scoring/grading table (cotações) from this exam page.
+    prompt = """Extract the scoring/grading table (cotações da prova) from this Portuguese exam page.
+
+The table is organised in GRUPO I, GRUPO II, GRUPO III sections.
 
 CRITICAL RULES:
-- Read EACH ROW of the table exactly as printed
-- The "question" field must be the EXACT number shown in the table (e.g. "1", "2.1", "3", "12.1")
-- The "points" field must be the integer value shown next to that question number
-- Do NOT guess or reorder — transcribe exactly what the table shows
-- If a question number has sub-items (e.g. "12.1", "12.2"), list each separately
-- If the table shows a GROUP total (e.g. "12" with points), include it too
+- Include a "group" field: "grupo_i", "grupo_ii", or "grupo_iii"
+- The "question" field is the item number within that group (e.g. "1", "2", "3", "5")
+- The "points" field is the TOTAL integer points for that item (e.g. 20, not a sub-score like 12)
+- For Grupo I sub-section "B." (essay/composition within Grupo I), use question "5"
+- IGNORE sub-score lines like "Conteúdo (12 pontos)" — only capture the item TOTAL
+- Do NOT include group-level totals like "GRUPO I ... 100 pontos"
+- Do NOT guess — only include items explicitly listed with a point value
 
-Respond ONLY with a JSON array, one entry per row:
-[{"question": "1", "points": 12}, {"question": "2.1", "points": 14}]"""
+Respond ONLY with a JSON array:
+[{"group": "grupo_i", "question": "1", "points": 20}, {"group": "grupo_ii", "question": "7", "points": 20}]"""
 
     content = _call_vision(image_path, prompt, max_tokens=1024)
     if not content:

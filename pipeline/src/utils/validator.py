@@ -179,8 +179,13 @@ def validate_and_fix(output: dict, extraction: dict = None) -> dict:
             for q in questions
         )
         if not referenced:
+            # Check if any child of this asset is referenced (parent tables shouldn't be hallucination)
+            child_referenced = any(
+                any(ref.startswith(aid + "_") for ref in q.get("imageRefs", []) + q.get("tableRefs", []) + q.get("assetRefs", []))
+                for q in questions
+            )
             # Check linkedQuestions
-            if not asset.get("linkedQuestions"):
+            if not asset.get("linkedQuestions") and not child_referenced:
                 # Check if it's on a source page (page with no questions)
                 pages_with_questions = {q["sourcePage"] for q in questions}
                 if asset.get("page") not in pages_with_questions:
@@ -207,6 +212,9 @@ def validate_and_fix(output: dict, extraction: dict = None) -> dict:
         if q.get("hasTable") or q.get("tableRefs"):
             for table_id in q.get("tableRefs", []):
                 table_asset = next((a for a in assets if a["id"] == table_id), None)
+                # Embedded images used as table visuals don't have rows — skip them
+                if table_asset and table_asset.get("type") == "embedded_image":
+                    continue
                 if not table_asset or not table_asset.get("rows"):
                     q["needsHumanReview"] = True
                     q.setdefault("warnings", []).append({

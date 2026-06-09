@@ -50,6 +50,64 @@ const statusStyles: Record<string, string> = {
   error: "bg-red-50 text-red-700",
 };
 
+// Friendly Portuguese descriptions for the technical warning/issue codes.
+const issueLabels: Record<string, string> = {
+  SCORING_POLICY_REBUILT: "Pontuação reconstruída a partir das perguntas (cotações não lidas diretamente)",
+  PORTUGUESE_SCORING_POLICY_REBUILT: "Pontuação reconstruída a partir das perguntas",
+  grupo_ii_points_rescaled: "Pontos do Grupo II reajustados ao total oficial (50 pts)",
+  suspicious_points: "Pergunta de resposta aberta com pontuação baixa (verificar)",
+  possible_hallucination: "Possível conteúdo gerado indevidamente (verificar)",
+  missing_points_critical: "Perguntas sem pontos atribuídos",
+  question_count_mismatch: "Nº de perguntas não bate certo com o esperado",
+  missing_table_data: "Tabela referida sem dados extraídos",
+  portuguese_points_repaired: "Pontos aplicados a partir da tabela de cotações",
+  portuguese_text_sources_repaired: "Textos de apoio reparados/associados",
+  portuguese_inline_options_stripped: "Opções duplicadas removidas do enunciado",
+  portuguese_legacy_duplicates_removed: "Perguntas duplicadas removidas",
+  portuguese_group_iii_duplicates_removed: "Composições duplicadas do Grupo III removidas",
+  portuguese_group_iii_recovered: "Composição do Grupo III recuperada do PDF",
+  portuguese_grupo_i_b_reconstructed: "Item B do Grupo I reconstruído",
+  portuguese_missing_questions_recovered: "Perguntas em falta recuperadas das cotações/texto",
+  portuguese_composition_visual_attached: "Imagem associada à composição",
+  recovered_questions_present: "Perguntas recuperadas do texto do PDF (a visão falhou)",
+  partial_text_fallback_used: "Recuperação parcial via texto do PDF",
+  text_fallback_used: "Todas as perguntas recuperadas do texto (a visão falhou)",
+  PORTUGUESE_COMPOSITION_TRUNCATED: "Enunciado da composição (Grupo III) truncado/em falta",
+  PORTUGUESE_TOTAL_POINTS_TOO_HIGH: "Total de pontos acima do esperado (~200)",
+  PORTUGUESE_TOTAL_POINTS_TOO_LOW: "Total de pontos abaixo de 200",
+  PORTUGUESE_POINTS_INVALID: "Perguntas com pontos nulos/inválidos",
+  PORTUGUESE_SCORING_ITEM_MISSING: "Itens da tabela de cotações em falta nas perguntas",
+  PORTUGUESE_SCORING_POINTS_MISMATCH: "Pontos das perguntas não batem com as cotações",
+};
+
+const severityStyles: Record<string, string> = {
+  blocker: "bg-red-100 text-red-700",
+  high: "bg-orange-100 text-orange-700",
+  medium: "bg-amber-100 text-amber-700",
+  low: "bg-slate-100 text-slate-600",
+};
+
+function friendlyIssue(code: string): string {
+  return issueLabels[code] || code.replace(/_/g, " ");
+}
+
+interface IssueItem {
+  type: string;
+  severity: string;
+  count: number;
+  sample: string;
+}
+interface AuditIssue {
+  code: string;
+  severity: string;
+  message: string;
+}
+interface IssuesResponse {
+  items: IssueItem[];
+  audit: AuditIssue[];
+  auditError: string | null;
+}
+
 export default function ExamList() {
   const [exams, setExams] = useState<Exam[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -283,10 +341,7 @@ function DayTable({
                 </td>
                 <td className="px-4 py-4 text-sm text-[#53617f]">{inferSubject(exam)}</td>
                 <td className="px-4 py-4">
-                  <span className={`inline-flex items-center gap-2 rounded-md px-3 py-1 text-xs font-semibold ${statusStyles[exam.status] || "bg-slate-100 text-slate-700"}`}>
-                    <span className="h-2 w-2 rounded-full bg-current" />
-                    {statusLabels[exam.status] || exam.status}
-                  </span>
+                  <StatusBadge exam={exam} />
                 </td>
                 <td className="px-3 py-4">
                   <div className="flex items-center gap-3">
@@ -304,6 +359,151 @@ function DayTable({
           </tbody>
         </table>
       </div>
+    </div>
+  );
+}
+
+// Statuses that carry issues worth explaining on hover.
+const hoverableStatuses = new Set(["completed_with_warnings", "needs_review", "partial_failed", "error"]);
+
+function StatusBadge({ exam }: { exam: Exam }) {
+  const [open, setOpen] = useState(false);
+  const [data, setData] = useState<IssuesResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const hoverable = hoverableStatuses.has(exam.status);
+
+  const loadIssues = () => {
+    setOpen(true);
+    if (data || loading || !hoverable) return;
+    setLoading(true);
+    fetch(`/api/exams/${exam.id}/issues`)
+      .then((r) => r.json())
+      .then((d: IssuesResponse) => setData(d))
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  };
+
+  const buildCopyText = (d: IssuesResponse): string => {
+    const lines: string[] = [];
+    lines.push(`ID: ${exam.id}`);
+    lines.push(`Estado: ${statusLabels[exam.status] || exam.status}`);
+    if (d.auditError) lines.push(`\nMotivo da revisão: ${d.auditError}`);
+    if (d.audit?.length) {
+      lines.push("\nProblemas da auditoria:");
+      for (const a of d.audit)
+        lines.push(`  [${a.severity.toUpperCase()}] ${a.code} — ${a.message || friendlyIssue(a.code)}`);
+    }
+    if (d.items?.length) {
+      const total = d.items.reduce((s, it) => s + it.count, 0);
+      lines.push(`\nAvisos (${total}):`);
+      for (const it of d.items) {
+        const suffix = it.count > 1 ? ` ×${it.count}` : "";
+        lines.push(`  [${it.severity.toUpperCase()}] ${it.type} — ${friendlyIssue(it.type)}${suffix}`);
+      }
+    }
+    return lines.join("\n");
+  };
+
+  const handleBadgeClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!hoverable) return;
+    if (data) {
+      navigator.clipboard.writeText(buildCopyText(data)).then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      }).catch(() => {});
+    } else {
+      // Data not yet loaded — open dropdown and it'll fetch automatically
+      loadIssues();
+    }
+  };
+
+  const badge = (
+    <span
+      onClick={handleBadgeClick}
+      className={`inline-flex items-center gap-2 rounded-md px-3 py-1 text-xs font-semibold ${statusStyles[exam.status] || "bg-slate-100 text-slate-700"} ${hoverable ? "cursor-pointer" : ""}`}
+    >
+      {copied ? (
+        <>
+          <svg className="h-3 w-3 shrink-0" viewBox="0 0 20 20" fill="currentColor">
+            <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
+          </svg>
+          Copiado!
+        </>
+      ) : (
+        <>
+          <span className="h-2 w-2 rounded-full bg-current" />
+          {statusLabels[exam.status] || exam.status}
+          {hoverable && (
+            <svg className="h-3 w-3 opacity-60" viewBox="0 0 20 20" fill="currentColor">
+              <path fillRule="evenodd" d="M18 10A8 8 0 11 2 10a8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+            </svg>
+          )}
+        </>
+      )}
+    </span>
+  );
+
+  if (!hoverable) return badge;
+
+  const totalWarnings = data?.items?.reduce((sum, it) => sum + it.count, 0) ?? 0;
+
+  return (
+    <div
+      className="relative inline-block"
+      onMouseEnter={loadIssues}
+      onMouseLeave={() => setOpen(false)}
+    >
+      {badge}
+      {open && (
+        <div className="absolute left-0 top-full z-50 mt-2 w-80 rounded-lg border border-[#dce5f2] bg-white p-3 text-left shadow-[0_18px_55px_rgba(25,45,78,0.18)]">
+          {loading && <p className="text-xs text-[#7a87a3]">A carregar…</p>}
+          {!loading && data && (
+            <div className="space-y-2">
+              {data.auditError && (
+                <div className="rounded-md bg-red-50 px-2 py-1.5 text-xs text-red-700">
+                  <span className="font-semibold">Motivo da revisão:</span> {data.auditError}
+                </div>
+              )}
+              {data.audit?.length > 0 && (
+                <div className="space-y-1">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-[#7a87a3]">Problemas da auditoria</p>
+                  {data.audit.map((a, i) => (
+                    <div key={`a${i}`} className="flex items-start gap-2 text-xs">
+                      <span className={`mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${severityStyles[a.severity] || severityStyles.low}`}>
+                        {a.severity}
+                      </span>
+                      <span className="text-[#3d4965]">{a.message || friendlyIssue(a.code)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {data.items?.length > 0 && (
+                <div className="space-y-1">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-[#7a87a3]">
+                    Avisos ({totalWarnings})
+                  </p>
+                  {data.items.map((it) => (
+                    <div key={it.type} className="flex items-start gap-2 text-xs">
+                      <span className={`mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${severityStyles[it.severity] || severityStyles.low}`}>
+                        {it.severity}
+                      </span>
+                      <span className="text-[#3d4965]">
+                        {friendlyIssue(it.type)}
+                        {it.count > 1 && <span className="text-[#7a87a3]"> ×{it.count}</span>}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {!data.auditError && (data.audit?.length ?? 0) === 0 && (data.items?.length ?? 0) === 0 && (
+                <p className="text-xs text-[#7a87a3]">Sem avisos registados.</p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

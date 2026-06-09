@@ -28,6 +28,8 @@ def audit_output(output: dict[str, Any], asset_base: str | Path) -> list[Issue]:
     _audit_broken_parents(root, questions, issues)
     _audit_cover_page_sources(root, output, issues)
     _audit_scoring_policy_completeness(root, output, issues)
+    _audit_legacy_grupo_iii_points(root, output, questions, issues)
+    _audit_recovered_without_source_page(root, questions, issues)
 
     issues.sort(key=lambda i: (SEVERITY_ORDER.get(i.severity, 99), i.root, i.question_id, i.code))
     return issues
@@ -71,7 +73,14 @@ def apply_portuguese_audit_gate(output: dict[str, Any], asset_base: str | Path) 
         })
     elif summary["verdict"] == "REVIEW" and output.get("processingStatus") != "partial_failed":
         output["processingStatus"] = "completed_with_warnings"
-        output["needsHumanReview"] = False
+        # Flag for human review when the warnings stem from reconstructed/recovered
+        # data or a rebuilt scoring policy — these are trustworthy enough to ship
+        # but a human should confirm them.
+        _review_codes = {
+            "PORTUGUESE_RECOVERED_WITHOUT_SOURCE_PAGE",
+            "PORTUGUESE_SCORING_POLICY_REBUILT",
+        }
+        output["needsHumanReview"] = any(i.code in _review_codes for i in issues)
     elif summary["verdict"] == "PASS" and output.get("processingStatus") != "partial_failed":
         output["processingStatus"] = "completed"
         output["needsHumanReview"] = False
@@ -522,6 +531,20 @@ def _audit_scoring_policy_completeness(root: str, output: dict[str, Any], issues
             actual=f"{len(items)} items, subtotal={raw_subtotal_i}",
         ))
 
+    # Policy was auto-rebuilt from question points (normalizer repair) — flag as MEDIUM
+    # so the exam lands at completed_with_warnings rather than silently completed.
+    if policy.get("source") == "rebuilt_from_questions":
+        issues.append(Issue(
+            root, "MEDIUM", "PORTUGUESE_SCORING_POLICY_REBUILT",
+            (
+                f"scoringPolicy was rebuilt automatically from question points "
+                f"({len(items)} items, rawSubtotal={raw_subtotal_i}) — "
+                f"verify the point values match the original scoring table"
+            ),
+            expected="source=cotacoes (parsed from PDF)",
+            actual="source=rebuilt_from_questions",
+        ))
+
     # Pre-2020 exams should not have optional questions
     if year and year < 2020:
         optional_items = [i for i in items if isinstance(i, dict) and not i.get("isMandatory", True)]
@@ -532,3 +555,75 @@ def _audit_scoring_policy_completeness(root: str, output: dict[str, Any], issues
                 expected="all isMandatory for pre-2020",
                 actual=str(len(optional_items)),
             ))
+
+
+def _audit_legacy_grupo_iii_points(
+    root: str,
+    output: dict[str, Any],
+    questions: list[dict],
+    issues: list[Issue],
+) -> None:
+    """For 2008-2014 Portuguese exams, Grupo III (composition) must be exactly 50 pts.
+
+    The scoring table in these old editions always assigns 50 points to the
+    composition task.  Any other value indicates a parser error or incorrect
+    inflation by ``_repair_composition_points_remainder``.
+    """
+    metadata = output.get("metadata") or {}
+    try:
+        year = int(metadata.get("year") or 0)
+    except (TypeError, ValueError):
+        year = 0
+    if not (2008 <= year <= 2014):
+        return
+
+    composition = next((q for q in questions if q.get("groupId") == "grupo_iii"), None)
+    if not composition:
+        return  # absence is caught by _audit_groups
+
+    try:
+        pts = int(composition.get("points") or 0)
+    except (TypeError, ValueError):
+        pts = 0
+
+    if pts != 50:
+        issues.append(Issue(
+            root, "HIGH", "PORTUGUESE_LEGACY_GRUPO_III_POINTS_INVALID",
+            f"year {year}: Grupo III (composition) has {pts} pts — must be exactly 50 for 2008-2014 exams",
+            expected="50",
+            actual=str(pts),
+        ))
+
+
+def _audit_recovered_without_source_page(
+    root: str,
+    questions: list[dict],
+    issues: list[Issue],
+) -> None:
+    """Flag recovered questions that have no known source page.
+
+    A question whose ID contains ``_recovered`` was not found by the LLM and
+    was reconstructed from the PDF text layer.  If we also could not determine
+    which page it belongs to, the question's placement and context are unknown —
+    the exam must be reviewed by a human before it can be marked complete.
+    """
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        qid = str(q.get("questionId") or "")
+        if "_recovered" not in qid:
+            continue
+        if q.get("sourcePage"):
+            continue  # has a page — lower risk, covered elsewhere
+        # MEDIUM, not HIGH: when the exam's overall scoring is internally
+        # consistent (total == 200, groups correct), a recovered question
+        # without a page is a metadata gap, not a correctness error.  Genuinely
+        # broken exams are already blocked by the TOTAL_POINTS / SCORING_POLICY
+        # HIGH checks, so this stays a review flag (→ completed_with_warnings).
+        issues.append(Issue(
+            root, "MEDIUM", "PORTUGUESE_RECOVERED_WITHOUT_SOURCE_PAGE",
+            f"question {qid!r} was recovered from PDF text but has no known sourcePage",
+            expected="sourcePage set",
+            actual="null",
+            question_id=qid,
+        ))
