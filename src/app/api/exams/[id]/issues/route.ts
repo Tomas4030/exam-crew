@@ -2,13 +2,7 @@ import { NextResponse } from 'next/server';
 import { readFile } from 'fs/promises';
 import path from 'path';
 import { getJob } from '@/lib/storage';
-
-interface RawWarning {
-  type?: string;
-  message?: string;
-  severity?: string;
-  questionId?: string;
-}
+import { makeIsInfoWarning, type RawWarning } from '@/lib/warningsReport';
 
 interface IssueSummary {
   type: string;
@@ -30,61 +24,6 @@ const SEVERITY_BY_TYPE: Record<string, string> = {
   invalid_page: 'low',
   recovered_questions_without_source_page: 'low',
 };
-
-// Pipeline repair/cleanup operations that succeeded — informational only.
-// These are NOT problems; the pipeline handled them automatically.
-// Displayed separately as "Notas do pipeline" so they don't inflate the warning count.
-const INFO_TYPES = new Set([
-  'portuguese_points_repaired',
-  'portuguese_text_sources_repaired',
-  'portuguese_legacy_duplicates_removed',
-  'portuguese_group_iii_duplicates_removed',
-  'portuguese_group_iii_observations_removed',
-  'portuguese_inline_options_stripped',
-  'portuguese_composition_visual_attached',
-  'portuguese_choice_options_repaired',
-  'portuguese_multiblank_repaired',
-  'portuguese_embedded_group_iii_removed',
-  'portuguese_group_iii_recovered',
-  'portuguese_multiple_compositions_collapsed',
-  'portuguese_missing_questions_recovered',
-  'portuguese_grupo_i_b_reconstructed',
-  'portuguese_grupo_i_b_injected',
-  'portuguese_recovered_from_pdf_text',
-  'instruction_questions_removed',
-  'recovered_questions_present',
-  'partial_text_fallback_used',
-  'text_fallback_used',
-  'history_question_cleanup',
-  'history_points_repaired',
-  'history_points_repaired_from_scoring_text',
-  'history_multi_select_repaired',
-  'history_multiblank_repaired',
-  'history_interaction_type_repaired',
-  'history_false_interaction_type_repaired',
-  'history_line_number_artifact_removed',
-  'cross_group_ref_stripped',
-  'multi_select_max_inferred',
-]);
-
-function makeIsInfoWarning(allWarnings: RawWarning[]) {
-  // When the exam has a grupo_ii_points_rescaled warning, suspicious_points with low values
-  // are artifacts of the rescaling algorithm (minimum 1-2 pts per item), not real issues.
-  const hasRescaling = allWarnings.some((w) => w.type === 'grupo_ii_points_rescaled');
-
-  return function isInfoWarning(w: RawWarning): boolean {
-    if (w.severity === 'info') return true;
-    if (INFO_TYPES.has(w.type || '')) return true;
-    if (w.type === 'suspicious_points') {
-      const match = /low points: (\d+)/.exec(w.message || '');
-      const pts = match ? parseInt(match[1], 10) : 0;
-      // Old threshold (< 8) produced many false positives; pipeline now uses < 3.
-      // Filter as info: pts >= 3 always, or any pts when caused by rescaling.
-      return pts >= 3 || hasRescaling;
-    }
-    return false;
-  };
-}
 
 export async function GET(_request: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;

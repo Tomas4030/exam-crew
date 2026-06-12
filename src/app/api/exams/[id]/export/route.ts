@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import archiver from 'archiver';
 import { buildExamExportName, normalizeExamForExport } from '@/lib/examExport';
+import { buildWarningsReport } from '@/lib/warningsReport';
 
 export async function GET(
   request: NextRequest,
@@ -37,9 +38,18 @@ export async function GET(
 
     // Include criteria.json if it has been built
     const criteriaJsonPath = path.join(outputDir, `${id}.criteria.json`);
+    let criteriaDoc: Record<string, unknown> | null = null;
     if (fs.existsSync(criteriaJsonPath)) {
       archive.file(criteriaJsonPath, { name: 'criteria.json' });
+      try {
+        criteriaDoc = JSON.parse(fs.readFileSync(criteriaJsonPath, 'utf-8'));
+      } catch {
+        criteriaDoc = null;
+      }
     }
+
+    // Human-readable summary of every warning (extraction + criteria)
+    archive.append(buildWarningsReport(id, examData, criteriaDoc), { name: 'warnings.txt' });
 
     // Add only used assets
     for (const relPath of usedFiles) {

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import path from "path";
 import fs from "fs";
 import archiver from "archiver";
+import { buildWarningsReport } from "@/lib/warningsReport";
 
 export const runtime = "nodejs";
 
@@ -53,7 +54,17 @@ export async function GET(_request: NextRequest, context: RouteContext) {
     const criteriaFilePath = path.join(OUTPUT_DIR, `${safeId}.criteria.json`);
     const resolvedCriteriaPath = fs.existsSync(criteriaFilePath) ? criteriaFilePath : null;
 
-    const zipBuffer = await createZipBuffer(clientData, assetState.usedAssets, resolvedCriteriaPath);
+    let criteriaDoc: AnyObj | null = null;
+    if (resolvedCriteriaPath) {
+      try {
+        criteriaDoc = readJson(resolvedCriteriaPath);
+      } catch {
+        criteriaDoc = null;
+      }
+    }
+    const warningsTxt = buildWarningsReport(safeId, examData, criteriaDoc);
+
+    const zipBuffer = await createZipBuffer(clientData, assetState.usedAssets, resolvedCriteriaPath, warningsTxt);
 
     return new NextResponse(zipBuffer as unknown as BodyInit, {
       headers: {
@@ -375,6 +386,7 @@ async function createZipBuffer(
   clientData: AnyObj,
   usedAssets: Map<string, string>,
   criteriaJsonPath: string | null = null,
+  warningsTxt: string | null = null,
 ) {
   const archive = archiver("zip", { zlib: { level: 6 } });
   const chunks: Buffer[] = [];
@@ -405,6 +417,10 @@ async function createZipBuffer(
         `window.CRITERIA_DATA = ${safeJsonForScript(JSON.parse(criteriaRaw))};`,
         { name: "criteria.js" },
       );
+    }
+
+    if (warningsTxt) {
+      archive.append(warningsTxt, { name: "warnings.txt" });
     }
 
     for (const [zipPath, absPath] of usedAssets) {

@@ -40,9 +40,15 @@ def _load_exam(exam_id: str) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _is_portuguese(exam: dict) -> bool:
+# Subjects whose criteria PDFs follow the Grupo I/II/III prose+chave layout that
+# the deterministic parser understands. Other subjects (math, sciences, languages)
+# fall back to vision OCR, which is structure-agnostic.
+_DETERMINISTIC_PARSER_SUBJECTS = ("portug", "histor", "filosofia", "geografia", "literatura")
+
+
+def _supports_deterministic_parser(exam: dict) -> bool:
     subj = str((exam.get("metadata") or {}).get("subject") or "").lower()
-    return "portug" in subj
+    return any(s in subj for s in _DETERMINISTIC_PARSER_SUBJECTS)
 
 
 def _vision_items_to_struct(raw_items: list[dict], default_page: int) -> list[dict[str, Any]]:
@@ -53,8 +59,13 @@ def _vision_items_to_struct(raw_items: list[dict], default_page: int) -> list[di
     for it in raw_items or []:
         grp = str(it.get("grupo") or "").strip().upper()
         gid = roman.get(grp) or roman.get(grp.replace("GRUPO ", "").strip()) or ""
+        # Exams without group structure (Matemática, FQ, línguas) use a single
+        # implicit group; keep the item rather than dropping it.
         if not gid:
-            continue
+            number = str(it.get("numero") or "").strip().rstrip(".")
+            if not number:
+                continue
+            gid = ""
         ca = it.get("correctAnswer")
         correct = None
         if isinstance(ca, dict):
@@ -129,9 +140,6 @@ def build_criteria(
     metadata = exam.get("metadata") or {}
     questions = exam.get("questions") or []
 
-    if not _is_portuguese(exam):
-        raise ValueError(f"Criteria pipeline currently supports Portuguese only (got subject={metadata.get('subject')!r}).")
-
     year, phase = urls.parse_year_phase(metadata)
     report_progress("criteria_resolve", f"Resolving criteria PDF for {year} fase {phase}")
 
@@ -152,14 +160,24 @@ def build_criteria(
     report_progress("criteria_extract", "Extracting criteria text")
     extracted = extract_pdf_text(pdf_path)
 
-    if extracted.text_quality == "native":
+    use_deterministic = _supports_deterministic_parser(exam)
+    if extracted.text_quality == "native" and use_deterministic:
         report_progress("criteria_parse", "Parsing native-text criteria")
         parsed = parse_criteria_text(extracted)
         extraction_mode = "native_text"
+        # If the Grupo-structured parser found nothing usable (layout drift or a
+        # subject misclassification), fall back to vision OCR rather than failing.
+        if not parsed.get("items"):
+            if not OPENROUTER_API_KEY:
+                raise RuntimeError("Deterministic criteria parse found 0 items and OPENROUTER_API_KEY is not set for vision fallback.")
+            report_progress("criteria_vision", "Deterministic parse empty — running vision OCR fallback")
+            parsed = _extract_via_vision(pdf_path, exam_id)
+            extraction_mode = "vision_ocr"
     else:
         if not OPENROUTER_API_KEY:
-            raise RuntimeError("Criteria PDF is scanned and needs vision OCR, but OPENROUTER_API_KEY is not set.")
-        report_progress("criteria_vision", "Scanned PDF — running vision OCR fallback")
+            raise RuntimeError("Criteria PDF needs vision OCR, but OPENROUTER_API_KEY is not set.")
+        reason = "Scanned PDF" if extracted.text_quality != "native" else "Subject without deterministic parser"
+        report_progress("criteria_vision", f"{reason} — running vision OCR")
         parsed = _extract_via_vision(pdf_path, exam_id)
         extraction_mode = "vision_ocr"
 

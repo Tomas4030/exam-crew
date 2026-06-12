@@ -23,11 +23,13 @@ def _norm_num(value: Any) -> str:
 
 
 def _question_index(questions: list[dict]) -> dict[tuple[str, str], dict]:
+    """Index by (groupId, number). Ungrouped exams (Matemática, FQ, línguas)
+    use the empty string as a shared implicit group on both sides."""
     idx: dict[tuple[str, str], dict] = {}
     for q in questions:
         gid = str(q.get("groupId") or "").strip().lower()
         num = _norm_num(q.get("number") or q.get("displayNumber"))
-        if gid and num:
+        if num:
             idx[(gid, num)] = q
     return idx
 
@@ -105,8 +107,7 @@ def match_criteria_to_questions(
         if q.get("questionId") in matched_question_ids:
             continue
         g = str(q.get("groupId") or "").strip().lower()
-        if g:
-            unmatched_questions_by_group.setdefault(g, []).append(q)
+        unmatched_questions_by_group.setdefault(g, []).append(q)
 
     for gid, crit_items in unmatched_criteria_by_group.items():
         exam_qs = unmatched_questions_by_group.get(gid, [])

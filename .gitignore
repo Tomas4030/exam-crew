@@ -11,3 +11,8 @@ __pycache__/
 *docs
 *patched_exports
 *tmp_portugues_selected_11
+
+
+*golden
+batch_ids_clean.txt
+batch_ids.txt

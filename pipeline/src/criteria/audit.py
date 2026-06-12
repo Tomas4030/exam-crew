@@ -44,11 +44,15 @@ def audit_criteria(
         for q in questions
         if q.get("questionId") not in set(unmatched_question_ids)
     }
+    # When the exam has no group structure at all (Matemática, FQ, línguas),
+    # a missing groupId is normal — don't treat it as an extraction artifact.
+    exam_is_ungrouped = not exam_groups
+
     for qid in unmatched_question_ids:
         q = q_by_id.get(qid) or {}
         gid = str(q.get("groupId") or "").strip().lower()
         num = str(q.get("number") or "").strip().rstrip(".")
-        if not gid:
+        if not gid and not exam_is_ungrouped:
             issues.append({
                 "code": "CRITERIA_QUESTION_NOT_GROUPED",
                 "severity": "medium",

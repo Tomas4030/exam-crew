@@ -10,18 +10,72 @@ from ..config import OPENROUTER_BASE_URL, OPENROUTER_API_KEY, OPENROUTER_MODEL
 from ..utils.token_usage import record_usage
 
 
+# Transient HTTP statuses worth retrying (rate limits and server-side errors).
+_RETRYABLE_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
+_MAX_API_ATTEMPTS = 4  # 1 original + 3 retries
+_BACKOFF_BASE_SECONDS = 3.0
+
+
+def _post_with_retries(payload: dict, timeout: float) -> dict | None:
+    """POST to the chat-completions endpoint with exponential backoff.
+
+    Retries on network errors, timeouts, retryable HTTP statuses, and malformed
+    JSON bodies. Returns the parsed response dict, or None after all attempts.
+    """
+    last_error: str | None = None
+    for attempt in range(_MAX_API_ATTEMPTS):
+        if attempt:
+            # 3s, 6s, 12s — honour Retry-After if the server sent one.
+            time.sleep(_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)))
+        try:
+            response = httpx.post(
+                f"{OPENROUTER_BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=timeout,
+            )
+        except httpx.HTTPError as exc:
+            last_error = f"network:{exc}"
+            continue
+
+        if response.status_code in _RETRYABLE_STATUSES:
+            last_error = f"http:{response.status_code}"
+            retry_after = response.headers.get("retry-after")
+            if retry_after:
+                try:
+                    time.sleep(min(float(retry_after), 30.0))
+                except ValueError:
+                    pass
+            continue
+        if response.status_code != 200:
+            last_error = f"http:{response.status_code}"
+            break  # non-retryable (401/403/404/422…)
+
+        try:
+            data = response.json()
+            # A success body without choices (provider hiccup) is retryable.
+            if not data.get("choices"):
+                last_error = "empty_choices"
+                continue
+            return data
+        except json.JSONDecodeError:
+            last_error = "bad_json_body"
+            continue
+
+    print(f"[vision_tool] API call failed after {_MAX_API_ATTEMPTS} attempt(s): {last_error}")
+    return None
+
+
 def _call_vision(image_path: str, prompt: str, max_tokens: int = 2048) -> str | None:
     """Send image + prompt to vision model. Returns content or None."""
     with open(image_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode()
 
-    response = httpx.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
+    data = _post_with_retries(
+        {
             "model": OPENROUTER_MODEL,
             "messages": [{
                 "role": "user",
@@ -36,23 +90,16 @@ def _call_vision(image_path: str, prompt: str, max_tokens: int = 2048) -> str | 
         },
         timeout=180,
     )
-
-    if response.status_code != 200:
+    if data is None:
         return None
-    data = response.json()
     record_usage(data, OPENROUTER_MODEL)
     return data["choices"][0]["message"]["content"] or None
 
 
 def _call_text(prompt: str, max_tokens: int = 2048) -> str | None:
     """Send text-only prompt as fallback."""
-    response = httpx.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
+    data = _post_with_retries(
+        {
             "model": OPENROUTER_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
@@ -61,9 +108,8 @@ def _call_text(prompt: str, max_tokens: int = 2048) -> str | None:
         },
         timeout=120,
     )
-    if response.status_code != 200:
+    if data is None:
         return None
-    data = response.json()
     record_usage(data, OPENROUTER_MODEL)
     return data["choices"][0]["message"]["content"] or None
 

@@ -589,6 +589,23 @@ Text:
             report_progress("error", message)
             raise RuntimeError(message)
 
+        # Step 4.94b: Generic audit gate for subjects with no dedicated audit
+        # (Matemática, FQ, Biologia, línguas, …). Never aborts — downgrades to
+        # needs_review so the exam still reaches the UI with a verdict.
+        if (
+            history_audit_summary.get("verdict") == "SKIPPED"
+            and portuguese_audit_summary.get("verdict") == "SKIPPED"
+        ):
+            from .utils.generic_audit import apply_generic_audit_gate
+
+            report_progress("audit", "Running generic quality audit")
+            output, _generic_issues, generic_summary = apply_generic_audit_gate(output)
+            report_progress(
+                "audit",
+                f"Generic audit verdict: {generic_summary.get('verdict')} "
+                f"({generic_summary.get('high', 0)} high, {generic_summary.get('medium', 0)} medium)",
+            )
+
         # Step 4.95: Final quality gate
         question_count = len(output.get("questions") or [])
 
