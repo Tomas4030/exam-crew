@@ -613,6 +613,11 @@ def _repair_portuguese_text_sources(
             # Extract the text content from this page so the frontend can render
             # the source even when the crop image is unavailable.
             page_text = _extract_source_page_text(pages.get(page_num), pdf_blocks.get(page_num, []))
+            # A page whose text is dominated by question statements (numbered
+            # items, option lists) would render as garbage in the preview —
+            # only the image is trustworthy in that case.
+            if page_text and len(re.findall(r"(?m)^\s*\d{1,2}\.\s+\S", page_text)) >= 2:
+                page_text = ""
 
             if not crop and not page_text:
                 continue
@@ -1531,11 +1536,14 @@ def _create_portuguese_text_source_crop(
         return None
 
     crop_box = _portuguese_text_crop_box(img.size, page_info or {}, top_pdf=top_pdf, bottom_pdf=bottom_pdf)
-    if crop_box is None:
-        return None
-    cropped = img.crop(crop_box)
-    if cropped.width < 120 or cropped.height < 120:
-        return None
+    cropped = img.crop(crop_box) if crop_box is not None else None
+    if cropped is None or cropped.width < 120 or cropped.height < 120:
+        # Fallback: ship the whole page (minus margins) — a full-page image is
+        # always better than dumping raw extracted text into the preview.
+        w, h = img.size
+        cropped = img.crop((int(w * 0.03), int(h * 0.03), int(w * 0.97), int(h * 0.97)))
+        if cropped.width < 120 or cropped.height < 120:
+            return None
 
     filename = f"{source_id}_full.png"
     path = sources_dir / filename

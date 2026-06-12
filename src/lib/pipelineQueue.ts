@@ -76,6 +76,20 @@ export function enqueuePipeline(item: QueueItem) {
   void runNext();
 }
 
+/** Drop queued items for exams that were deleted in the UI. */
+export function removeFromQueue(examIds: string[]): number {
+  const ids = new Set(examIds);
+  let removed = 0;
+  for (let i = queue.length - 1; i >= 0; i--) {
+    if (ids.has(queue[i].examId)) {
+      queue.splice(i, 1);
+      removed++;
+    }
+  }
+  if (removed > 0) persistQueue();
+  return removed;
+}
+
 export function getQueueState() {
   return { running, queued: queue.map((i) => i.examId) };
 }
@@ -88,6 +102,11 @@ async function runNext() {
     while (queue.length > 0) {
       const item = queue.shift()!;
       persistQueue();
+      // The exam (and its PDF) may have been deleted while waiting in the queue.
+      if (!existsSync(item.pdfPath)) {
+        console.warn(`[Queue] Skipping ${item.examId}: PDF no longer exists (exam deleted?)`);
+        continue;
+      }
       const startedAt = new Date().toISOString();
       await updateJob(item.examId, { status: "processing", startedAt });
       const result = await runPipeline(item.pdfPath, item.examId, item.sourceUrl);
