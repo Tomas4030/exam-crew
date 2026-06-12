@@ -14,6 +14,42 @@ Rules:
 """
 import re
 
+# Warning types that are purely informational — the pipeline repaired or cleaned
+# something automatically and the exam is fine.  These are tagged severity="info"
+# so the UI can hide them from the warning count/badge without losing the audit trail.
+_INFO_WARNING_TYPES = frozenset({
+    "portuguese_points_repaired",
+    "portuguese_text_sources_repaired",
+    "portuguese_legacy_duplicates_removed",
+    "portuguese_group_iii_duplicates_removed",
+    "portuguese_group_iii_observations_removed",
+    "portuguese_inline_options_stripped",
+    "portuguese_composition_visual_attached",
+    "portuguese_choice_options_repaired",
+    "portuguese_multiblank_repaired",
+    "portuguese_embedded_group_iii_removed",
+    "portuguese_group_iii_recovered",
+    "portuguese_multiple_compositions_collapsed",
+    "portuguese_missing_questions_recovered",
+    "portuguese_grupo_i_b_reconstructed",
+    "portuguese_grupo_i_b_injected",
+    "instruction_questions_removed",
+    "recovered_questions_present",
+    "partial_text_fallback_used",
+    "text_fallback_used",
+    "history_question_cleanup",
+    "history_points_repaired",
+    "history_points_repaired_from_scoring_text",
+    "history_multi_select_repaired",
+    "history_multiblank_repaired",
+    "history_interaction_type_repaired",
+    "history_false_interaction_type_repaired",
+    "history_line_number_artifact_removed",
+    "cross_group_ref_stripped",
+    "multi_select_max_inferred",
+    "portuguese_recovered_from_pdf_text",
+})
+
 
 def _looks_corrupt_math_text(text: str) -> bool:
     suspicious = ("□", "�", "\u001f", "\u001e", "^ h", "] g", " b l", "[45::47;5u")
@@ -263,9 +299,11 @@ def validate_and_fix(output: dict, extraction: dict = None) -> dict:
                 })
 
     # ── Rule 10d: Suspicious points for open questions ──────────
+    # Only flag genuinely suspicious values (1-2 pts for an open question).
+    # Portuguese exams routinely use 5-7 pts for open answers — not suspicious.
     for q in questions:
         pts = q.get("points")
-        if pts and pts < 8 and q.get("type") not in ("multiple_choice", "group"):
+        if pts and pts < 3 and q.get("type") not in ("multiple_choice", "group"):
             q.setdefault("warnings", []).append({
                 "type": "suspicious_points",
                 "message": f"Q{q['number']} is {q.get('type', 'open')} but has only {pts} points — verify scoring"
@@ -388,6 +426,13 @@ def validate_and_fix(output: dict, extraction: dict = None) -> dict:
         output["needsHumanReview"] = has_severe
     else:
         output["needsHumanReview"] = False
+
+    # ── Tag informational warnings ──────────────────────────────
+    # Repair/cleanup warnings are successes, not problems. Mark them severity="info"
+    # so the UI can hide them from the visible warning count without losing audit trail.
+    for w in warnings:
+        if w.get("severity") is None and w.get("type") in _INFO_WARNING_TYPES:
+            w["severity"] = "info"
 
     output["warnings"] = warnings
 

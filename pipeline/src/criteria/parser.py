@@ -24,6 +24,11 @@ _GROUP_HEADER = re.compile(r"^GRUPO\s+(III|II|I)(?![IVX])", re.IGNORECASE)
 _ITEM_LINE = re.compile(r"^(\d{1,2})\.\s")
 # A prose item anchor: "N." (bare, legacy split items) or "N. ...".
 _ITEM_ANCHOR = re.compile(r"^(\d{1,2})\.(\s|$)")
+# Letter item anchor for the legacy Grupo I "B" mini-composition (2008-2017):
+# "B. [dots] 30 pontos". Only valid when points follow (filtered by points_near).
+_LETTER_ANCHOR = re.compile(r"^([A-E])\.(\s|$)")
+# Legacy MC answer in prose criteria (2008-2010): "1. Resposta correcta: C ... 5 pontos"
+_RESPOSTA_CORRECTA = re.compile(r"Resposta\s+correc?ta\s*:\s*\(?([A-D])\)?", re.IGNORECASE)
 # Sub-item anchor for legacy pre-2015 format: "1.1. ..." (N.M. decimal notation).
 # After _flatten(), lines like "1.1.\t......\t5 pontos" collapse to "1.1. 5 pontos".
 _SUBITEM_ANCHOR = re.compile(r"^(\d{1,2}\.\d{1,2})\.")
@@ -86,16 +91,38 @@ def _flatten(extracted: ExtractedCriteria) -> list[tuple[int, str]]:
     return out
 
 
+_SPECIFIC_CRITERIA_MARKER = re.compile(r"CRIT[ÉE]RIOS\s+ESPEC[ÍI]FICOS", re.IGNORECASE)
+
+
 def _section_bounds(lines: list[tuple[int, str]]) -> dict[str, tuple[int, int]]:
-    """Map groupId -> (start_idx, end_idx) over the flat line list."""
-    marks: list[tuple[int, str]] = []
+    """Map groupId -> (start_idx, end_idx) over the flat line list.
+
+    2008-2010 PDFs open with a COTAÇÕES table that repeats the GRUPO headers
+    (with distribution values, no answers) BEFORE the real criteria sections.
+    The real sections always follow the "CRITÉRIOS ESPECÍFICOS DE CLASSIFICAÇÃO"
+    marker, so group headers before that marker are ignored whenever headers
+    exist after it.
+    """
+    marker_idx = 0
     for idx, (_, line) in enumerate(lines):
-        m = _GROUP_HEADER.match(line)
-        if m:
-            roman = m.group(1).upper()
-            gid = _ROMAN_TO_GID.get(roman)
-            if gid and (not marks or marks[-1][1] != gid):
-                marks.append((idx, gid))
+        if _SPECIFIC_CRITERIA_MARKER.search(line):
+            marker_idx = idx
+            break
+
+    def collect(from_idx: int) -> list[tuple[int, str]]:
+        marks: list[tuple[int, str]] = []
+        for idx in range(from_idx, len(lines)):
+            m = _GROUP_HEADER.match(lines[idx][1])
+            if m:
+                gid = _ROMAN_TO_GID.get(m.group(1).upper())
+                if gid and (not marks or marks[-1][1] != gid):
+                    marks.append((idx, gid))
+        return marks
+
+    marks = collect(marker_idx)
+    if not marks:
+        marks = collect(0)  # no headers after the marker — fall back to the whole doc
+
     bounds: dict[str, tuple[int, int]] = {}
     for i, (start, gid) in enumerate(marks):
         end = marks[i + 1][0] if i + 1 < len(marks) else len(lines)
@@ -148,7 +175,7 @@ def _parse_grupo_i_style(lines: list[tuple[int, str]], start: int, end: int, gid
         if _SUBITEM_ANCHOR.match(line):
             if points_near(idx, end) is not None:
                 subitem_anchors.append(idx)
-        elif _ITEM_ANCHOR.match(line):
+        elif _ITEM_ANCHOR.match(line) or _LETTER_ANCHOR.match(line):
             if points_near(idx, end) is not None:
                 anchors.append(idx)
 
@@ -164,8 +191,8 @@ def _parse_grupo_i_style(lines: list[tuple[int, str]], start: int, end: int, gid
             num_m_s = _SUBITEM_ANCHOR.match(line)
             number = num_m_s.group(1) if num_m_s else line.split(".")[0].strip()
         else:
-            num_m = _ITEM_ANCHOR.match(line)
-            number = num_m.group(1)
+            num_m = _ITEM_ANCHOR.match(line) or _LETTER_ANCHOR.match(line)
+            number = num_m.group(1) if num_m else line.split(".")[0].strip()
 
         block_end = anchors[a_i + 1] if a_i + 1 < len(anchors) else end
         points = points_near(idx, block_end)
@@ -176,8 +203,12 @@ def _parse_grupo_i_style(lines: list[tuple[int, str]], start: int, end: int, gid
         correct = None
         item_type = "open_answer"
         two = _INLINE_TWO_VERSIONS.search(line)
+        resposta = _RESPOSTA_CORRECTA.search(line)
         if two:
             correct = {"v1": two.group(1).upper(), "v2": two.group(2).upper()}
+            item_type = "multiple_choice"
+        elif resposta:
+            correct = {"v1": resposta.group(1).upper()}
             item_type = "multiple_choice"
         else:
             single = _INLINE_SINGLE.match(line)
@@ -295,8 +326,21 @@ def _parse_chave_table(lines: list[tuple[int, str]], start: int, end: int, gid: 
                 j += 1
                 continue
             if re.match(r"^\d{1,3}$", tok):
+                if points is not None:
+                    break  # already have points — bare digit belongs to what follows
                 points = int(tok)
                 j += 1
+                break
+            # "N pontos" alone right after the item number (2019+ open items inside
+            # the chave: "6." / "8 pontos" / answer text / "Níveis" rubric table).
+            pa = _POINTS_ALONE.match(tok)
+            if pa and points is None and not letters:
+                points = int(pa.group(1))
+                j += 1
+                continue  # keep collecting the answer text that follows
+            # A performance-level rubric ("Níveis / Descritores...") ends the row —
+            # its level numbers (2/1) and per-level scores must NOT become points.
+            if tok.lower() in ("níveis", "niveis", "descritores de desempenho"):
                 break
             # Non-letter, non-number: could be an open-answer text token or
             # the start of the next row / end of table.
@@ -368,7 +412,13 @@ def _parse_grupo_iii(lines: list[tuple[int, str]], start: int, end: int) -> list
     for idx in range(start, real_end):
         line = lines[idx][1]
         low = line.lower()
-        if "(etd)" in low or "(cl)" in low or "estruturação temática" in low or "correção linguística" in low:
+        # Accept both modern ("correção") and pre-1990-agreement ("correcção") spellings,
+        # and the 2008-2010 markers "(C)*" / "(F)**" used instead of (ETD)/(CL).
+        if (
+            "(etd)" in low or "(cl)" in low
+            or "estruturação temática" in low
+            or re.search(r"correc?ção lingu", low)
+        ):
             pm = _POINTS_IN_LINE.search(line)
             if pm:
                 param_points.append(int(pm.group(1)))

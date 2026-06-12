@@ -1788,6 +1788,12 @@ def _recover_missing_questions_from_scoring(output: dict, extraction: dict | Non
             block = _extract_question_block_from_pages(number, extraction, require_options=False)
         if not block or len(block) < 20:
             continue
+        # Reject cotação-table artifacts: lines like "11. .......... 3 pontos" have
+        # no real prose. Strip digits/dots/"pontos" and require actual words left.
+        prose = re.sub(r"\bpontos?\b", "", block, flags=re.IGNORECASE)
+        prose = re.sub(r"[^A-Za-zÀ-ÿ]", "", prose)
+        if len(prose) < 15:
+            continue
 
         # Populate sourcePage so the frontend can order and display the question correctly
         source_page = _find_question_source_page(number, extraction)

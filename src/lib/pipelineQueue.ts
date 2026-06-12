@@ -1,4 +1,5 @@
 import { runPipeline } from "@/lib/process";
+import { runCriteria } from "@/lib/criteriaProcess";
 import { updateJob } from "@/lib/storage";
 
 type QueueItem = { examId: string; pdfPath: string; sourceUrl?: string };
@@ -40,6 +41,21 @@ async function runNext() {
             durationMs,
           }
       );
+
+      // Auto-build the official criteria right after a successful exam run, so the
+      // Critérios badge/panel is populated without the user opening the exam.
+      // Failures are logged but never block the queue — the user can still
+      // trigger/reprocess manually from the CriteriaPanel.
+      if (result.success) {
+        try {
+          const crit = await runCriteria(item.examId);
+          if (!crit.success) {
+            console.warn(`[Criteria:auto] ${item.examId} failed: ${crit.error}`);
+          }
+        } catch (err) {
+          console.warn(`[Criteria:auto] ${item.examId} threw:`, err);
+        }
+      }
     }
   } finally {
     running = false;

@@ -120,6 +120,7 @@ interface AuditIssue {
 }
 interface IssuesResponse {
   items: IssueItem[];
+  pipelineNotes: IssueItem[];
   audit: AuditIssue[];
   auditError: string | null;
 }
@@ -464,6 +465,7 @@ function StatusBadge({ exam }: { exam: Exam }) {
   if (!hoverable) return badge;
 
   const totalWarnings = data?.items?.reduce((sum, it) => sum + it.count, 0) ?? 0;
+  const totalNotes = data?.pipelineNotes?.reduce((sum, it) => sum + it.count, 0) ?? 0;
 
   return (
     <div
@@ -514,7 +516,30 @@ function StatusBadge({ exam }: { exam: Exam }) {
                 </div>
               )}
               {!data.auditError && (data.audit?.length ?? 0) === 0 && (data.items?.length ?? 0) === 0 && (
-                <p className="text-xs text-[#7a87a3]">Sem avisos registados.</p>
+                <p className="text-xs text-[#7a87a3]">
+                  {totalNotes > 0 ? "Sem avisos — o pipeline fez reparações automáticas." : "Sem avisos registados."}
+                </p>
+              )}
+              {(data.pipelineNotes?.length ?? 0) > 0 && (
+                <details className="group">
+                  <summary className="cursor-pointer select-none text-[11px] text-[#7a87a3] hover:text-[#3d4965]">
+                    {totalNotes} reparação{totalNotes !== 1 ? "s" : ""} automática{totalNotes !== 1 ? "s" : ""} do pipeline
+                    <span className="ml-1 opacity-60">▸</span>
+                  </summary>
+                  <div className="mt-1.5 space-y-1 border-t border-[#eef1f6] pt-1.5">
+                    {data.pipelineNotes!.map((it) => (
+                      <div key={it.type} className="flex items-start gap-2 text-xs">
+                        <span className="mt-0.5 shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-500">
+                          info
+                        </span>
+                        <span className="text-[#7a87a3]">
+                          {friendlyIssue(it.type)}
+                          {it.count > 1 && <span className="opacity-70"> ×{it.count}</span>}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </details>
               )}
             </div>
           )}
